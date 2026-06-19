@@ -11,17 +11,15 @@ import (
 
 // HostStateDatum is the on-chain datum carried by the Cardano HostState UTxO.
 //
-// It is encoded as PlutusData (constructor 0) containing four fields:
+// It is encoded as PlutusData (constructor 0) containing two fields:
 // 1) state: HostState
 // 2) nft_policy: PolicyId (bytes)
-// 3) deployer: VerificationKeyHash (bytes)
-// 4) shutdown: ShutdownState
 type HostStateDatum struct {
 	_         struct{}  `cbor:",toarray"`
 	State     HostState `cbor:"0"`
 	NftPolicy []byte    `cbor:"1"`
 	Deployer  []byte    `cbor:"2"`
-	Shutdown  any       `cbor:"3"`
+	Shutdown  cbor.RawMessage
 }
 
 // HostState is the canonical IBC host state committed on Cardano.
