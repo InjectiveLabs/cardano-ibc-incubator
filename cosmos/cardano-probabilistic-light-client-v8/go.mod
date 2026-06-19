@@ -2,6 +2,8 @@ module github.com/cardano-foundation/cardano-ibc-incubator/cosmos/cardano-probab
 
 go 1.26.2
 
+replace github.com/cardano-foundation/cardano-ibc-incubator/cosmos/cardano-probabilistic-light-client-core => ../cardano-probabilistic-light-client-core
+
 require (
 	cosmossdk.io/core v0.12.1-0.20231114100755-569e3ff6a0d7
 	cosmossdk.io/errors v1.0.1
