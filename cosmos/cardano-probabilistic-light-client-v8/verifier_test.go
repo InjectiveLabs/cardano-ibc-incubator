@@ -16,6 +16,7 @@ import (
 	codectypes "github.com/cosmos/cosmos-sdk/codec/types"
 	sdk "github.com/cosmos/cosmos-sdk/types"
 	clienttypes "github.com/cosmos/ibc-go/v8/modules/core/02-client/types"
+	"github.com/cosmos/ibc-go/v8/modules/core/exported"
 	"github.com/stretchr/testify/require"
 
 	"github.com/blinklabs-io/gouroboros/cbor"
@@ -437,6 +438,27 @@ func TestCheckForMisbehaviourDetectsConflictingEpochContextsInMisbehaviourMessag
 
 	msg := NewMisbehaviour("08-cardano-probabilistic-0", header1, header2)
 	require.True(t, cs.CheckForMisbehaviour(sdk.Context{}, nil, nil, msg))
+}
+
+func TestUpdateStateOnMisbehaviourFreezesClient(t *testing.T) {
+	cdc := newProbabilisticTestCodec()
+	ctx, clientStore := newProbabilisticTestClientStore(t, "probabilistic-misbehaviour-freeze")
+
+	cs := newProbabilisticTestClientState()
+	setClientState(clientStore, cdc, cs)
+	setConsensusState(clientStore, cdc, newProbabilisticTestConsensusState("trusted-hash"), cs.LatestHeight)
+
+	header1 := newVerifiedTestHeader(t)
+	header2 := newVerifiedTestHeader(t)
+	header2.AnchorBlock.Hash = "different-anchor"
+	msg := NewMisbehaviour("08-cardano-probabilistic-0", header1, header2)
+
+	cs.UpdateStateOnMisbehaviour(ctx, cdc, clientStore, msg)
+
+	frozenClient, found := getClientState(clientStore, cdc)
+	require.True(t, found)
+	require.Equal(t, FrozenHeight, frozenClient.FrozenHeight)
+	require.Equal(t, exported.Frozen, frozenClient.Status(ctx, clientStore, cdc))
 }
 
 func TestVerifyMisbehaviourDoesNotRequireStoredTargetHeights(t *testing.T) {
