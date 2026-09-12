@@ -8,13 +8,18 @@ pub type ValidatorSet {
   total_voting_power: Int,
 }
 
+/// Validate every validator entry before its fields are hashed or counted.
+pub fn validate_basic(vals: ValidatorSet) -> Bool {
+  list.all(vals.validators, fn(val) { tm_validator.validate_basic(val) })
+}
+
+/// Ensure quorum arithmetic stays within CometBFT's signed 64-bit domain.
+pub fn valid_total_voting_power(total: Int) -> Bool {
+  total >= 0 && total <= tm_validator.max_voting_power
+}
+
 pub fn hash(vals: ValidatorSet) -> ByteArray {
-  let bzs =
-    vals.validators
-      |> list.reduce(
-          [],
-          fn(accum, val) { list.concat(accum, [tm_validator.bytes(val)]) },
-        )
+  let bzs = list.map(vals.validators, fn(val) { tm_validator.bytes(val) })
   tree.hash_from_byte_slices_sha2_256(bzs)
 }
 
@@ -26,14 +31,10 @@ pub fn null_validator_set() -> ValidatorSet {
   }
 }
 
-// TODO: Need recalculation of the set's total voting power 
-// if current total_voting_power is 0
+/// Derive total voting power from the validator entries committed by the
+/// validator-set hash. The relayed aggregate is never a source of truth.
 pub fn total_voting_power(vals: ValidatorSet) -> Int {
-  if vals.total_voting_power == 0 {
-    list.reduce(vals.validators, 0, fn(acc, val) { acc + val.voting_power })
-  } else {
-    vals.total_voting_power
-  }
+  list.reduce(vals.validators, 0, fn(acc, val) { acc + val.voting_power })
 }
 
 pub fn size(vals: ValidatorSet) -> Int {
@@ -71,4 +72,47 @@ test test_validator_set_hash_function() {
       total_voting_power: 383447660407194304,
     }
   hash(not_null_validator_set) == #"f4317dc3e1d3989be7e6d9a687a6a903e1c0678d7122ed6e8f3af725a0726962"
+}
+
+/// Hash-only scaling fixture. Repetition keeps the vector compact; it is not a
+/// valid Tendermint validator set because validator identities must be unique.
+test test_validator_set_hash_45_validators() {
+  let val =
+    Validator {
+      address: #"4ae76aed128636dad8c84f814aff2b5b965a8001",
+      pubkey: #"6210fc94ff775add5fb919f1abbf9eb94aab6c345c334a035f3d4f2ea485ed70",
+      voting_power: 1,
+      proposer_priority: 0,
+    }
+  let validators = list.repeat(val, 45)
+  hash(ValidatorSet { validators, proposer: val, total_voting_power: 45 }) == #"4580cb4ea9e7f279f54ee772a718e14d4ce151e6f3ccd63a40a710d033e40c50"
+}
+
+test test_validator_set_hash_preserves_validator_order() {
+  let first =
+    Validator {
+      address: #"4ae76aed128636dad8c84f814aff2b5b965a8001",
+      pubkey: #"6210fc94ff775add5fb919f1abbf9eb94aab6c345c334a035f3d4f2ea485ed70",
+      voting_power: 1,
+      proposer_priority: 0,
+    }
+  let second =
+    Validator {
+      ..first,
+      pubkey: #"1111111111111111111111111111111111111111111111111111111111111111",
+      voting_power: 2,
+    }
+  let third =
+    Validator {
+      ..first,
+      pubkey: #"2222222222222222222222222222222222222222222222222222222222222222",
+      voting_power: 3,
+    }
+  hash(
+    ValidatorSet {
+      validators: [first, second, third],
+      proposer: first,
+      total_voting_power: 6,
+    },
+  ) == #"500249413fdf36a335aaff208b52143098232aa3f9a2bef0964c026107ec5e38"
 }

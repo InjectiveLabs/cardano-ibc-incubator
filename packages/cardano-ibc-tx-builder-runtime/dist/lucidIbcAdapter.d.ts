@@ -1,4 +1,5 @@
 import { type LucidEvolution, type TxBuilder, type UTxO } from '@lucid-evolution/lucid';
+import type { UnsignedSendPacketEscrowTxInput } from '@cardano-ibc/tx-builder';
 type RefUtxo = {
     txHash: string;
     outputIndex: number;
@@ -54,7 +55,7 @@ type DeploymentConfig = {
         };
     };
 };
-export type CodecType = 'client' | 'connection' | 'channel' | 'transferEscrow' | 'host_state' | 'host_state_redeemer' | 'spendChannelRedeemer' | 'iBCModuleRedeemer' | 'mintVoucherRedeemer' | 'mintPortRedeemer' | 'transferEscrowShardRedeemer';
+export type CodecType = 'client' | 'connection' | 'channel' | 'transferEscrow' | 'transferModule' | 'host_state' | 'host_state_redeemer' | 'spendChannelRedeemer' | 'iBCModuleRedeemer' | 'transferIBCModuleRedeemer' | 'mintVoucherRedeemer' | 'mintPortRedeemer' | 'transferEscrowShardRedeemer';
 export declare class LucidIbcAdapter {
     private readonly lucid;
     private readonly deployment;
@@ -88,8 +89,7 @@ export declare class LucidIbcAdapter {
     getClientTokenUnit(clientId: string): string;
     getConnectionTokenUnit(connectionId: bigint): [string, string];
     getChannelTokenUnit(channelId: bigint): [string, string];
-    private payTransferEscrowDelta;
-    createUnsignedSendPacketEscrowTx(dto: any): TxBuilder;
+    createUnsignedSendPacketEscrowTx(dto: UnsignedSendPacketEscrowTxInput): TxBuilder;
     createUnsignedSendPacketBurnTx(dto: any): TxBuilder;
     private generateTokenName;
 }

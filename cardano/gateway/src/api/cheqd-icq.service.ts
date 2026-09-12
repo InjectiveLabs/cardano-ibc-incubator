@@ -1,7 +1,7 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { ResponseDeliverTx } from '@plus/proto-types/build/ibc/core/types/v1/block';
+import { ResponseDeliverTx } from '@cardano-ibc/proto-types/build/ibc/core/types/v1/block';
 import { QueryService } from '~@/query/services/query.service';
-import { MsgTransferResponse } from '@plus/proto-types/build/ibc/core/channel/v1/tx';
+import { MsgTransferResponse } from '@cardano-ibc/proto-types/build/ibc/core/channel/v1/tx';
 import { ATTRIBUTE_KEY_PACKET, EVENT_TYPE_PACKET } from '~@/constant/packet';
 import { GrpcInvalidArgumentException, GrpcNotFoundException } from '~@/exception/grpc_exceptions';
 import { PacketService } from '~@/tx/packet.service';
@@ -380,7 +380,7 @@ export class CheqdIcqService {
     dto: Pick<AsyncIcqResultRequestDto, 'packet_data_hex' | 'source_channel' | 'packet_sequence'>,
   ): Promise<Array<{ packetSequence: string; sourceChannel: string }>> {
     const blockResult = await this.queryService.queryBlockResults({ height: txHeight });
-    return this.findMatchingSendPacketEvents(blockResult.block_results.txs_results ?? [], dto);
+    return this.findMatchingSendPacketEvents(blockResult.block_results?.txs_results ?? [], dto);
   }
 
   private findAcknowledgementEvent(

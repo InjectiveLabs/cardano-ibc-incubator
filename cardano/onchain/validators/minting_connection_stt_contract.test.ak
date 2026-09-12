@@ -35,7 +35,8 @@ use ibc/core/ics_023_vector_commitments/merkle_prefix
 use ibc/core/ics_024_host_requirements/client_keys as host_client_keys
 use ibc/core/ics_024_host_requirements/connection_keys as host_connection_keys
 use ibc/core/ics_025_handler_interface/host_state.{
-  Active, HostState, HostStateDatum, empty_ibc_state_root, host_state_token_name,
+  Active, HostState, HostStateControl, HostStateDatum, empty_ibc_state_root,
+  host_state_token_name,
 }
 use ibc/core/ics_025_handler_interface/host_state_redeemer.{
   CreateConnection, HostStateRedeemer,
@@ -143,7 +144,7 @@ fn host_state_datum(
     },
     nft_policy,
     deployer: trusted_deployer,
-    shutdown: Active,
+    control: HostStateControl { port_registry: [], shutdown: Active },
   }
 }
 
@@ -428,6 +429,9 @@ fn run_conn_open_try_transition(
           "client script hash",
           fixture.spend_connection_script_hash,
           "channel script hash",
+          fixture.client_minting_policy_id,
+          fixture.connection_minting_policy_id,
+          "unused channel minting policy",
           None,
           fixture.host_redeemer,
           fixture.host_input.output_reference,
@@ -444,7 +448,7 @@ fn run_conn_open_try_transition(
 }
 
 test prop_tx_conn_open_try_accepts_valid_full_transition(_seed via fuzz.int()) {
-  fuzz.label(@"regression.tx.conn.open_try.valid_full_transition")
+  fuzz.label(@"regression.contract.conn.open_try.valid_full_transition")
 
   // tx.* depth: the same ConnOpenTry transaction is checked by connection
   // minting, HostState CreateConnection, and the connection datum transition.
@@ -454,13 +458,15 @@ test prop_tx_conn_open_try_accepts_valid_full_transition(_seed via fuzz.int()) {
     fuzz_dsl.no_mutation(),
   )
     |> run_conn_open_try_transition
-    |> fuzz_dsl.assert_protocol_valid
+    |> fuzz_dsl.assert_protocol_checks_accept
 }
 
 test prop_conn_open_try_rejects_wrong_counterparty_client_state(
   _seed via fuzz.int(),
 ) {
-  fuzz.label(@"regression.tx.conn.open_try.invalid_wrong_client_state_proof")
+  fuzz.label(
+    @"regression.contract.conn.open_try.invalid_wrong_client_state_proof",
+  )
 
   // Near-valid ConnOpenTry: the local connection datum and proof plumbing are
   // valid, but the counterparty client state bytes differ from the proof value.
@@ -470,5 +476,5 @@ test prop_conn_open_try_rejects_wrong_counterparty_client_state(
     fuzz_dsl.mutation("wrong_counterparty_client_state"),
   )
     |> run_conn_open_try_transition
-    |> fuzz_dsl.assert_protocol_rejected
+    |> fuzz_dsl.assert_protocol_checks_reject
 }

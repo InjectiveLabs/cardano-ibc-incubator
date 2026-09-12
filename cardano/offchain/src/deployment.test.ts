@@ -1,11 +1,27 @@
-import { assertEquals } from "@std/assert";
-import { Data, type Script } from "@lucid-evolution/lucid";
+import { assertEquals, assertNotEquals } from "@std/assert";
+import {
+  Data,
+  fromText,
+  type LucidEvolution,
+  type Script,
+} from "@lucid-evolution/lucid";
+import blueprint from "../../onchain/plutus.json" with { type: "json" };
 
 import {
+  buildChannelValidators,
   buildReferenceValidatorBatches,
   buildReferenceValidatorSizeReport,
   DeploymentIbcTree,
+  GENERIC_MODULE_SPEND_VALIDATOR_TITLE,
+  loadHostStateValidator,
+  loadTransferModuleValidator,
+  sortPortRegistrations,
 } from "./deployment.ts";
+import {
+  generateIdentifierTokenName,
+  generatePortTokenName,
+  readValidator,
+} from "./utils.ts";
 
 const makeValidator = (byteLength: number): Script => ({
   type: "PlutusV3",
@@ -13,6 +29,214 @@ const makeValidator = (byteLength: number): Script => ({
 });
 
 const EMPTY_HASH = "00".repeat(32);
+
+Deno.test("generatePortTokenName matches the cross-language transfer vector", () => {
+  assertEquals(
+    generatePortTokenName(fromText("transfer")),
+    "04c1bb73a4a1a77a59b16e461d6ea244bac88d36050557ba026d36f46dd0f873",
+  );
+});
+
+Deno.test("generic module deployments pin the spend handler from the blueprint", () => {
+  const genericModuleSpendHandler = blueprint.validators.find(
+    ({ title }) => title === GENERIC_MODULE_SPEND_VALIDATOR_TITLE,
+  ) as { title: string; parameters?: Array<{ title: string }> } | undefined;
+
+  assertEquals(
+    genericModuleSpendHandler?.title,
+    GENERIC_MODULE_SPEND_VALIDATOR_TITLE,
+  );
+  assertEquals(
+    genericModuleSpendHandler?.parameters?.map(({ title }) => title) ?? [],
+    ["host_state_nft_policy_id"],
+  );
+});
+
+Deno.test("every deployed channel operation is a mint-only policy", () => {
+  const lucid = {
+    config: () => ({ network: "Preview" }),
+  } as unknown as LucidEvolution;
+  const { referredScripts } = buildChannelValidators(
+    lucid,
+    "11".repeat(28),
+    "22".repeat(28),
+    "33".repeat(28),
+    "44".repeat(28),
+    "55".repeat(28),
+  );
+  assertEquals(Object.keys(referredScripts).length, 9);
+  for (const name of Object.keys(referredScripts)) {
+    const prefix = `spending_channel/${name}.${name}`;
+    assertEquals(
+      blueprint.validators
+        .map(({ title }) => title)
+        .filter((title) => title.startsWith(prefix + "."))
+        .sort(),
+      [prefix + ".else", prefix + ".mint"],
+    );
+  }
+});
+
+Deno.test("client deployment pins the recovery withdrawal validator", () => {
+  const recoveryValidator = blueprint.validators.find(
+    ({ title }) => title === "recover_client.recover_client.withdraw",
+  ) as { title: string; parameters?: Array<{ title: string }> } | undefined;
+  const spendClientValidator = blueprint.validators.find(
+    ({ title }) => title === "spending_client.spend_client.spend",
+  ) as { title: string; parameters?: Array<{ title: string }> } | undefined;
+
+  assertEquals(
+    recoveryValidator?.parameters?.map(({ title }) => title) ?? [],
+    ["host_state_nft_policy_id"],
+  );
+  assertEquals(
+    spendClientValidator?.parameters?.map(({ title }) => title) ?? [],
+    ["host_state_nft_policy_id", "recover_client_credential"],
+  );
+});
+
+Deno.test("HostState deployment pins the state-token minting policies", () => {
+  const hostStateValidator = blueprint.validators.find(
+    ({ title }) => title === "host_state_stt.host_state_stt.spend",
+  ) as { title: string; parameters?: Array<{ title: string }> } | undefined;
+
+  assertEquals(
+    hostStateValidator?.parameters?.map(({ title }) => title) ?? [],
+    [
+      "nft_policy",
+      "spend_client_script_hash",
+      "spend_connection_script_hash",
+      "spend_channel_script_hash",
+      "client_policy_id",
+      "connection_policy_id",
+      "channel_policy_id",
+    ],
+  );
+});
+
+Deno.test("applied client validator fits a mainnet reference-script transaction", () => {
+  const lucid = {
+    config: () => ({ network: "Preview" }),
+  } as unknown as LucidEvolution;
+  const hostPolicy = "11".repeat(28);
+  const [recoveryValidator, recoveryScriptHash] = readValidator(
+    "recover_client.recover_client.withdraw",
+    lucid,
+    [hostPolicy],
+    Data.Tuple([Data.Bytes()]) as unknown as [string],
+  );
+  const [spendClientValidator, spendClientScriptHash] = readValidator(
+    "spending_client.spend_client.spend",
+    lucid,
+    [hostPolicy, { Script: [recoveryScriptHash] }],
+    Data.Tuple([
+      Data.Bytes(),
+      Data.Enum([
+        Data.Object({ VerificationKey: Data.Tuple([Data.Bytes()]) }),
+        Data.Object({ Script: Data.Tuple([Data.Bytes()]) }),
+      ]),
+    ]) as unknown as [string, { Script: [string] }],
+  );
+  const report = buildReferenceValidatorSizeReport(
+    [recoveryValidator, spendClientValidator],
+    16_384,
+  );
+  const spendClientReport = report.find(
+    ({ scriptHash }) => scriptHash === spendClientScriptHash,
+  );
+
+  assertEquals(spendClientReport?.oversized, false);
+});
+
+Deno.test("fully applied production HostState fits the reference publication guard", () => {
+  const lucid = {
+    config: () => ({ network: "Preview" }),
+  } as unknown as LucidEvolution;
+  const [validator] = loadHostStateValidator(
+    lucid,
+    "11".repeat(28),
+    "22".repeat(28),
+    "33".repeat(28),
+    "44".repeat(28),
+    "55".repeat(28),
+    "66".repeat(28),
+    "77".repeat(28),
+  );
+  const [report] = buildReferenceValidatorSizeReport([validator], 16_384);
+  assertEquals(report.oversized, false, JSON.stringify(report));
+});
+
+Deno.test("fully applied production transfer module fits the reference publication guard", async () => {
+  const lucid = {
+    config: () => ({ network: "Preview" }),
+  } as unknown as LucidEvolution;
+  const portId = fromText("transfer");
+  const [validator] = loadTransferModuleValidator(
+    lucid,
+    { policy_id: "11".repeat(28), name: generatePortTokenName(portId) },
+    {
+      policy_id: "22".repeat(28),
+      name: await generateIdentifierTokenName({
+        transaction_id: "aa".repeat(32),
+        output_index: 0n,
+      }),
+    },
+    portId,
+    "33".repeat(28),
+    "44".repeat(28),
+    "55".repeat(28),
+    "66".repeat(28),
+  );
+  const [report] = buildReferenceValidatorSizeReport([validator], 16_384);
+  assertEquals(report.oversized, false, JSON.stringify(report));
+});
+
+Deno.test("mock and icq share the host-policy-bound generic module hash", () => {
+  const lucid = {
+    config: () => ({ network: "Preview" }),
+  } as unknown as LucidEvolution;
+  const parameterSchema = Data.Tuple([Data.Bytes()]) as unknown as [string];
+  const hostPolicy = "11".repeat(28);
+  const [, mockHash] = readValidator(
+    GENERIC_MODULE_SPEND_VALIDATOR_TITLE,
+    lucid,
+    [hostPolicy],
+    parameterSchema,
+  );
+  const [, icqHash] = readValidator(
+    GENERIC_MODULE_SPEND_VALIDATOR_TITLE,
+    lucid,
+    [hostPolicy],
+    parameterSchema,
+  );
+  const [, otherHostHash] = readValidator(
+    GENERIC_MODULE_SPEND_VALIDATOR_TITLE,
+    lucid,
+    ["22".repeat(28)],
+    parameterSchema,
+  );
+
+  assertEquals(mockHash, icqHash);
+  assertNotEquals(mockHash, otherHostHash);
+});
+
+Deno.test("sortPortRegistrations uses canonical bytes-key ordering", () => {
+  const registration = {
+    module_script_hash: "00".repeat(28),
+    port_token: { policy_id: "11".repeat(28), name: "22" },
+    module_token: { policy_id: "33".repeat(28), name: "44" },
+  };
+  const registrations = new Map([
+    [fromText("transfer"), registration],
+    [fromText("icqhost"), registration],
+    [fromText("mock"), registration],
+  ]);
+
+  assertEquals(
+    [...sortPortRegistrations(registrations).keys()],
+    [fromText("mock"), fromText("icqhost"), fromText("transfer")],
+  );
+});
 
 const concatBytes = (...parts: Uint8Array[]): Uint8Array => {
   const length = parts.reduce((sum, part) => sum + part.length, 0);
@@ -141,7 +365,7 @@ Deno.test("buildReferenceValidatorSizeReport flags validators that cannot fit al
 
 Deno.test("DeploymentIbcTree commits leaves with key hash included", async () => {
   const tree = new DeploymentIbcTree();
-  const key = "ports/port-100";
+  const key = "ports/transfer";
   const value = Data.to(100n as never, Data.Integer() as never, {
     canonical: true,
   });

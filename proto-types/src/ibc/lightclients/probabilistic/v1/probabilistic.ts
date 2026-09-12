@@ -22,6 +22,12 @@ export interface StakeDistributionEntry {
   stake: bigint;
   vrf_key_hash: Uint8Array;
   first_registration_slot: bigint;
+  /**
+   * Exact relative active stake used for Praos leader eligibility. The
+   * existing stake field remains the weight used by settlement scoring.
+   */
+  relative_stake_numerator: bigint;
+  relative_stake_denominator: bigint;
 }
 /**
  * @name EpochContext
@@ -35,6 +41,15 @@ export interface EpochContext {
   slots_per_kes_period: bigint;
   epoch_start_slot: bigint;
   epoch_end_slot_exclusive: bigint;
+}
+/**
+ * @name OperationalCertificateCounter
+ * @package ibc.lightclients.probabilistic.v1
+ * @see proto type: ibc.lightclients.probabilistic.v1.OperationalCertificateCounter
+ */
+export interface OperationalCertificateCounter {
+  pool_id: Uint8Array;
+  sequence_number: bigint;
 }
 /**
  * @name ClientState
@@ -58,6 +73,40 @@ export interface ClientState {
   system_start_unix_ns: bigint;
   slot_length_ns: bigint;
   epoch_contexts: EpochContext[];
+  /**
+   * The latest authenticated Cardano block, which may be newer than
+   * latest_height when rootless checkpoint updates are used for catch-up.
+   */
+  latest_checkpoint_height?: Height;
+  latest_checkpoint_block_hash: string;
+  latest_checkpoint_epoch: bigint;
+  max_kes_evolutions: bigint;
+  /**
+   * Operational-certificate counters at latest_checkpoint_height.
+   */
+  latest_checkpoint_operational_certificate_counters: OperationalCertificateCounter[];
+  /**
+   * Oldest height whose counter state can be reconstructed from the current
+   * snapshot and the light client's private rollback history.
+   */
+  operational_certificate_counter_history_start_height?: Height;
+  /**
+   * Shelley-genesis activeSlotsCoefficient, kept as an exact rational.
+   */
+  active_slot_coefficient_numerator: bigint;
+  active_slot_coefficient_denominator: bigint;
+  /**
+   * Maximum amount by which an authenticated Cardano block may be ahead of
+   * the Cosmos host chain's current block time.
+   */
+  max_clock_drift: Duration;
+  /**
+   * Slot and derived Unix-nanosecond timestamp of latest_checkpoint_height.
+   * Both are retained because rootless checkpoints do not create an IBC
+   * consensus state.
+   */
+  latest_checkpoint_slot: bigint;
+  latest_checkpoint_timestamp: bigint;
 }
 /**
  * @name ConsensusState
@@ -97,7 +146,16 @@ export interface ProbabilisticBlock {
   hash: string;
   epoch: bigint;
   timestamp: bigint;
+  /**
+   * Full block CBOR. A root-bearing anchor requires this representation so
+   * its HostState transaction can be authenticated against the signed body.
+   */
   block_cbor: Uint8Array;
+  /**
+   * Raw Cardano header CBOR. This compact representation is sufficient for
+   * bridge blocks, descendant blocks, and rootless checkpoint anchors.
+   */
+  header_cbor: Uint8Array;
 }
 /**
  * @name ProbabilisticHeader
@@ -112,6 +170,11 @@ export interface ProbabilisticHeader {
   host_state_tx_output_index: number;
   bridge_blocks: ProbabilisticBlock[];
   new_epoch_context?: EpochContext;
+  /**
+   * Checkpoints authenticate Cardano chain progression without creating an
+   * IBC consensus state or renewing the trusting period.
+   */
+  is_checkpoint: boolean;
 }
 function createBaseHeight(): Height {
   return {
@@ -186,6 +249,8 @@ function createBaseStakeDistributionEntry(): StakeDistributionEntry {
     stake: BigInt(0),
     vrf_key_hash: new Uint8Array(),
     first_registration_slot: BigInt(0),
+    relative_stake_numerator: BigInt(0),
+    relative_stake_denominator: BigInt(0),
   };
 }
 /**
@@ -208,6 +273,12 @@ export const StakeDistributionEntry = {
     if (message.first_registration_slot !== BigInt(0)) {
       writer.uint32(32).uint64(message.first_registration_slot);
     }
+    if (message.relative_stake_numerator !== BigInt(0)) {
+      writer.uint32(40).uint64(message.relative_stake_numerator);
+    }
+    if (message.relative_stake_denominator !== BigInt(0)) {
+      writer.uint32(48).uint64(message.relative_stake_denominator);
+    }
     return writer;
   },
   decode(input: BinaryReader | Uint8Array, length?: number): StakeDistributionEntry {
@@ -229,6 +300,12 @@ export const StakeDistributionEntry = {
         case 4:
           message.first_registration_slot = reader.uint64();
           break;
+        case 5:
+          message.relative_stake_numerator = reader.uint64();
+          break;
+        case 6:
+          message.relative_stake_denominator = reader.uint64();
+          break;
         default:
           reader.skipType(tag & 7);
           break;
@@ -243,6 +320,10 @@ export const StakeDistributionEntry = {
     if (isSet(object.vrf_key_hash)) obj.vrf_key_hash = bytesFromBase64(object.vrf_key_hash);
     if (isSet(object.first_registration_slot))
       obj.first_registration_slot = BigInt(object.first_registration_slot.toString());
+    if (isSet(object.relative_stake_numerator))
+      obj.relative_stake_numerator = BigInt(object.relative_stake_numerator.toString());
+    if (isSet(object.relative_stake_denominator))
+      obj.relative_stake_denominator = BigInt(object.relative_stake_denominator.toString());
     return obj;
   },
   toJSON(message: StakeDistributionEntry): unknown {
@@ -255,6 +336,10 @@ export const StakeDistributionEntry = {
       ));
     message.first_registration_slot !== undefined &&
       (obj.first_registration_slot = (message.first_registration_slot || BigInt(0)).toString());
+    message.relative_stake_numerator !== undefined &&
+      (obj.relative_stake_numerator = (message.relative_stake_numerator || BigInt(0)).toString());
+    message.relative_stake_denominator !== undefined &&
+      (obj.relative_stake_denominator = (message.relative_stake_denominator || BigInt(0)).toString());
     return obj;
   },
   fromPartial<I extends Exact<DeepPartial<StakeDistributionEntry>, I>>(object: I): StakeDistributionEntry {
@@ -266,6 +351,12 @@ export const StakeDistributionEntry = {
     message.vrf_key_hash = object.vrf_key_hash ?? new Uint8Array();
     if (object.first_registration_slot !== undefined && object.first_registration_slot !== null) {
       message.first_registration_slot = BigInt(object.first_registration_slot.toString());
+    }
+    if (object.relative_stake_numerator !== undefined && object.relative_stake_numerator !== null) {
+      message.relative_stake_numerator = BigInt(object.relative_stake_numerator.toString());
+    }
+    if (object.relative_stake_denominator !== undefined && object.relative_stake_denominator !== null) {
+      message.relative_stake_denominator = BigInt(object.relative_stake_denominator.toString());
     }
     return message;
   },
@@ -395,6 +486,73 @@ export const EpochContext = {
     return message;
   },
 };
+function createBaseOperationalCertificateCounter(): OperationalCertificateCounter {
+  return {
+    pool_id: new Uint8Array(),
+    sequence_number: BigInt(0),
+  };
+}
+/**
+ * @name OperationalCertificateCounter
+ * @package ibc.lightclients.probabilistic.v1
+ * @see proto type: ibc.lightclients.probabilistic.v1.OperationalCertificateCounter
+ */
+export const OperationalCertificateCounter = {
+  typeUrl: "/ibc.lightclients.probabilistic.v1.OperationalCertificateCounter",
+  encode(message: OperationalCertificateCounter, writer: BinaryWriter = BinaryWriter.create()): BinaryWriter {
+    if (message.pool_id.length !== 0) {
+      writer.uint32(10).bytes(message.pool_id);
+    }
+    if (message.sequence_number !== BigInt(0)) {
+      writer.uint32(16).uint64(message.sequence_number);
+    }
+    return writer;
+  },
+  decode(input: BinaryReader | Uint8Array, length?: number): OperationalCertificateCounter {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    let end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseOperationalCertificateCounter();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1:
+          message.pool_id = reader.bytes();
+          break;
+        case 2:
+          message.sequence_number = reader.uint64();
+          break;
+        default:
+          reader.skipType(tag & 7);
+          break;
+      }
+    }
+    return message;
+  },
+  fromJSON(object: any): OperationalCertificateCounter {
+    const obj = createBaseOperationalCertificateCounter();
+    if (isSet(object.pool_id)) obj.pool_id = bytesFromBase64(object.pool_id);
+    if (isSet(object.sequence_number)) obj.sequence_number = BigInt(object.sequence_number.toString());
+    return obj;
+  },
+  toJSON(message: OperationalCertificateCounter): unknown {
+    const obj: any = {};
+    message.pool_id !== undefined &&
+      (obj.pool_id = base64FromBytes(message.pool_id !== undefined ? message.pool_id : new Uint8Array()));
+    message.sequence_number !== undefined &&
+      (obj.sequence_number = (message.sequence_number || BigInt(0)).toString());
+    return obj;
+  },
+  fromPartial<I extends Exact<DeepPartial<OperationalCertificateCounter>, I>>(
+    object: I,
+  ): OperationalCertificateCounter {
+    const message = createBaseOperationalCertificateCounter();
+    message.pool_id = object.pool_id ?? new Uint8Array();
+    if (object.sequence_number !== undefined && object.sequence_number !== null) {
+      message.sequence_number = BigInt(object.sequence_number.toString());
+    }
+    return message;
+  },
+};
 function createBaseClientState(): ClientState {
   return {
     chain_id: "",
@@ -413,6 +571,17 @@ function createBaseClientState(): ClientState {
     system_start_unix_ns: BigInt(0),
     slot_length_ns: BigInt(0),
     epoch_contexts: [],
+    latest_checkpoint_height: undefined,
+    latest_checkpoint_block_hash: "",
+    latest_checkpoint_epoch: BigInt(0),
+    max_kes_evolutions: BigInt(0),
+    latest_checkpoint_operational_certificate_counters: [],
+    operational_certificate_counter_history_start_height: undefined,
+    active_slot_coefficient_numerator: BigInt(0),
+    active_slot_coefficient_denominator: BigInt(0),
+    max_clock_drift: Duration.fromPartial({}),
+    latest_checkpoint_slot: BigInt(0),
+    latest_checkpoint_timestamp: BigInt(0),
   };
 }
 /**
@@ -471,6 +640,42 @@ export const ClientState = {
     for (const v of message.epoch_contexts) {
       EpochContext.encode(v!, writer.uint32(138).fork()).ldelim();
     }
+    if (message.latest_checkpoint_height !== undefined) {
+      Height.encode(message.latest_checkpoint_height, writer.uint32(154).fork()).ldelim();
+    }
+    if (message.latest_checkpoint_block_hash !== "") {
+      writer.uint32(162).string(message.latest_checkpoint_block_hash);
+    }
+    if (message.latest_checkpoint_epoch !== BigInt(0)) {
+      writer.uint32(168).uint64(message.latest_checkpoint_epoch);
+    }
+    if (message.max_kes_evolutions !== BigInt(0)) {
+      writer.uint32(176).uint64(message.max_kes_evolutions);
+    }
+    for (const v of message.latest_checkpoint_operational_certificate_counters) {
+      OperationalCertificateCounter.encode(v!, writer.uint32(186).fork()).ldelim();
+    }
+    if (message.operational_certificate_counter_history_start_height !== undefined) {
+      Height.encode(
+        message.operational_certificate_counter_history_start_height,
+        writer.uint32(194).fork(),
+      ).ldelim();
+    }
+    if (message.active_slot_coefficient_numerator !== BigInt(0)) {
+      writer.uint32(200).uint64(message.active_slot_coefficient_numerator);
+    }
+    if (message.active_slot_coefficient_denominator !== BigInt(0)) {
+      writer.uint32(208).uint64(message.active_slot_coefficient_denominator);
+    }
+    if (message.max_clock_drift !== undefined) {
+      Duration.encode(message.max_clock_drift, writer.uint32(218).fork()).ldelim();
+    }
+    if (message.latest_checkpoint_slot !== BigInt(0)) {
+      writer.uint32(224).uint64(message.latest_checkpoint_slot);
+    }
+    if (message.latest_checkpoint_timestamp !== BigInt(0)) {
+      writer.uint32(232).uint64(message.latest_checkpoint_timestamp);
+    }
     return writer;
   },
   decode(input: BinaryReader | Uint8Array, length?: number): ClientState {
@@ -528,6 +733,44 @@ export const ClientState = {
         case 17:
           message.epoch_contexts.push(EpochContext.decode(reader, reader.uint32()));
           break;
+        case 19:
+          message.latest_checkpoint_height = Height.decode(reader, reader.uint32());
+          break;
+        case 20:
+          message.latest_checkpoint_block_hash = reader.string();
+          break;
+        case 21:
+          message.latest_checkpoint_epoch = reader.uint64();
+          break;
+        case 22:
+          message.max_kes_evolutions = reader.uint64();
+          break;
+        case 23:
+          message.latest_checkpoint_operational_certificate_counters.push(
+            OperationalCertificateCounter.decode(reader, reader.uint32()),
+          );
+          break;
+        case 24:
+          message.operational_certificate_counter_history_start_height = Height.decode(
+            reader,
+            reader.uint32(),
+          );
+          break;
+        case 25:
+          message.active_slot_coefficient_numerator = reader.uint64();
+          break;
+        case 26:
+          message.active_slot_coefficient_denominator = reader.uint64();
+          break;
+        case 27:
+          message.max_clock_drift = Duration.decode(reader, reader.uint32());
+          break;
+        case 28:
+          message.latest_checkpoint_slot = reader.uint64();
+          break;
+        case 29:
+          message.latest_checkpoint_timestamp = reader.uint64();
+          break;
         default:
           reader.skipType(tag & 7);
           break;
@@ -564,6 +807,32 @@ export const ClientState = {
     if (isSet(object.slot_length_ns)) obj.slot_length_ns = BigInt(object.slot_length_ns.toString());
     if (Array.isArray(object?.epoch_contexts))
       obj.epoch_contexts = object.epoch_contexts.map((e: any) => EpochContext.fromJSON(e));
+    if (isSet(object.latest_checkpoint_height))
+      obj.latest_checkpoint_height = Height.fromJSON(object.latest_checkpoint_height);
+    if (isSet(object.latest_checkpoint_block_hash))
+      obj.latest_checkpoint_block_hash = String(object.latest_checkpoint_block_hash);
+    if (isSet(object.latest_checkpoint_epoch))
+      obj.latest_checkpoint_epoch = BigInt(object.latest_checkpoint_epoch.toString());
+    if (isSet(object.max_kes_evolutions))
+      obj.max_kes_evolutions = BigInt(object.max_kes_evolutions.toString());
+    if (Array.isArray(object?.latest_checkpoint_operational_certificate_counters))
+      obj.latest_checkpoint_operational_certificate_counters =
+        object.latest_checkpoint_operational_certificate_counters.map((e: any) =>
+          OperationalCertificateCounter.fromJSON(e),
+        );
+    if (isSet(object.operational_certificate_counter_history_start_height))
+      obj.operational_certificate_counter_history_start_height = Height.fromJSON(
+        object.operational_certificate_counter_history_start_height,
+      );
+    if (isSet(object.active_slot_coefficient_numerator))
+      obj.active_slot_coefficient_numerator = BigInt(object.active_slot_coefficient_numerator.toString());
+    if (isSet(object.active_slot_coefficient_denominator))
+      obj.active_slot_coefficient_denominator = BigInt(object.active_slot_coefficient_denominator.toString());
+    if (isSet(object.max_clock_drift)) obj.max_clock_drift = Duration.fromJSON(object.max_clock_drift);
+    if (isSet(object.latest_checkpoint_slot))
+      obj.latest_checkpoint_slot = BigInt(object.latest_checkpoint_slot.toString());
+    if (isSet(object.latest_checkpoint_timestamp))
+      obj.latest_checkpoint_timestamp = BigInt(object.latest_checkpoint_timestamp.toString());
     return obj;
   },
   toJSON(message: ClientState): unknown {
@@ -620,6 +889,43 @@ export const ClientState = {
     } else {
       obj.epoch_contexts = [];
     }
+    message.latest_checkpoint_height !== undefined &&
+      (obj.latest_checkpoint_height = message.latest_checkpoint_height
+        ? Height.toJSON(message.latest_checkpoint_height)
+        : undefined);
+    message.latest_checkpoint_block_hash !== undefined &&
+      (obj.latest_checkpoint_block_hash = message.latest_checkpoint_block_hash);
+    message.latest_checkpoint_epoch !== undefined &&
+      (obj.latest_checkpoint_epoch = (message.latest_checkpoint_epoch || BigInt(0)).toString());
+    message.max_kes_evolutions !== undefined &&
+      (obj.max_kes_evolutions = (message.max_kes_evolutions || BigInt(0)).toString());
+    if (message.latest_checkpoint_operational_certificate_counters) {
+      obj.latest_checkpoint_operational_certificate_counters =
+        message.latest_checkpoint_operational_certificate_counters.map((e) =>
+          e ? OperationalCertificateCounter.toJSON(e) : undefined,
+        );
+    } else {
+      obj.latest_checkpoint_operational_certificate_counters = [];
+    }
+    message.operational_certificate_counter_history_start_height !== undefined &&
+      (obj.operational_certificate_counter_history_start_height =
+        message.operational_certificate_counter_history_start_height
+          ? Height.toJSON(message.operational_certificate_counter_history_start_height)
+          : undefined);
+    message.active_slot_coefficient_numerator !== undefined &&
+      (obj.active_slot_coefficient_numerator = (
+        message.active_slot_coefficient_numerator || BigInt(0)
+      ).toString());
+    message.active_slot_coefficient_denominator !== undefined &&
+      (obj.active_slot_coefficient_denominator = (
+        message.active_slot_coefficient_denominator || BigInt(0)
+      ).toString());
+    message.max_clock_drift !== undefined &&
+      (obj.max_clock_drift = message.max_clock_drift ? Duration.toJSON(message.max_clock_drift) : undefined);
+    message.latest_checkpoint_slot !== undefined &&
+      (obj.latest_checkpoint_slot = (message.latest_checkpoint_slot || BigInt(0)).toString());
+    message.latest_checkpoint_timestamp !== undefined &&
+      (obj.latest_checkpoint_timestamp = (message.latest_checkpoint_timestamp || BigInt(0)).toString());
     return obj;
   },
   fromPartial<I extends Exact<DeepPartial<ClientState>, I>>(object: I): ClientState {
@@ -662,6 +968,51 @@ export const ClientState = {
       message.slot_length_ns = BigInt(object.slot_length_ns.toString());
     }
     message.epoch_contexts = object.epoch_contexts?.map((e) => EpochContext.fromPartial(e)) || [];
+    if (object.latest_checkpoint_height !== undefined && object.latest_checkpoint_height !== null) {
+      message.latest_checkpoint_height = Height.fromPartial(object.latest_checkpoint_height);
+    }
+    message.latest_checkpoint_block_hash = object.latest_checkpoint_block_hash ?? "";
+    if (object.latest_checkpoint_epoch !== undefined && object.latest_checkpoint_epoch !== null) {
+      message.latest_checkpoint_epoch = BigInt(object.latest_checkpoint_epoch.toString());
+    }
+    if (object.max_kes_evolutions !== undefined && object.max_kes_evolutions !== null) {
+      message.max_kes_evolutions = BigInt(object.max_kes_evolutions.toString());
+    }
+    message.latest_checkpoint_operational_certificate_counters =
+      object.latest_checkpoint_operational_certificate_counters?.map((e) =>
+        OperationalCertificateCounter.fromPartial(e),
+      ) || [];
+    if (
+      object.operational_certificate_counter_history_start_height !== undefined &&
+      object.operational_certificate_counter_history_start_height !== null
+    ) {
+      message.operational_certificate_counter_history_start_height = Height.fromPartial(
+        object.operational_certificate_counter_history_start_height,
+      );
+    }
+    if (
+      object.active_slot_coefficient_numerator !== undefined &&
+      object.active_slot_coefficient_numerator !== null
+    ) {
+      message.active_slot_coefficient_numerator = BigInt(object.active_slot_coefficient_numerator.toString());
+    }
+    if (
+      object.active_slot_coefficient_denominator !== undefined &&
+      object.active_slot_coefficient_denominator !== null
+    ) {
+      message.active_slot_coefficient_denominator = BigInt(
+        object.active_slot_coefficient_denominator.toString(),
+      );
+    }
+    if (object.max_clock_drift !== undefined && object.max_clock_drift !== null) {
+      message.max_clock_drift = Duration.fromPartial(object.max_clock_drift);
+    }
+    if (object.latest_checkpoint_slot !== undefined && object.latest_checkpoint_slot !== null) {
+      message.latest_checkpoint_slot = BigInt(object.latest_checkpoint_slot.toString());
+    }
+    if (object.latest_checkpoint_timestamp !== undefined && object.latest_checkpoint_timestamp !== null) {
+      message.latest_checkpoint_timestamp = BigInt(object.latest_checkpoint_timestamp.toString());
+    }
     return message;
   },
 };
@@ -886,6 +1237,7 @@ function createBaseProbabilisticBlock(): ProbabilisticBlock {
     epoch: BigInt(0),
     timestamp: BigInt(0),
     block_cbor: new Uint8Array(),
+    header_cbor: new Uint8Array(),
   };
 }
 /**
@@ -914,6 +1266,9 @@ export const ProbabilisticBlock = {
     if (message.block_cbor.length !== 0) {
       writer.uint32(74).bytes(message.block_cbor);
     }
+    if (message.header_cbor.length !== 0) {
+      writer.uint32(82).bytes(message.header_cbor);
+    }
     return writer;
   },
   decode(input: BinaryReader | Uint8Array, length?: number): ProbabilisticBlock {
@@ -941,6 +1296,9 @@ export const ProbabilisticBlock = {
         case 9:
           message.block_cbor = reader.bytes();
           break;
+        case 10:
+          message.header_cbor = reader.bytes();
+          break;
         default:
           reader.skipType(tag & 7);
           break;
@@ -956,6 +1314,7 @@ export const ProbabilisticBlock = {
     if (isSet(object.epoch)) obj.epoch = BigInt(object.epoch.toString());
     if (isSet(object.timestamp)) obj.timestamp = BigInt(object.timestamp.toString());
     if (isSet(object.block_cbor)) obj.block_cbor = bytesFromBase64(object.block_cbor);
+    if (isSet(object.header_cbor)) obj.header_cbor = bytesFromBase64(object.header_cbor);
     return obj;
   },
   toJSON(message: ProbabilisticBlock): unknown {
@@ -968,6 +1327,10 @@ export const ProbabilisticBlock = {
     message.block_cbor !== undefined &&
       (obj.block_cbor = base64FromBytes(
         message.block_cbor !== undefined ? message.block_cbor : new Uint8Array(),
+      ));
+    message.header_cbor !== undefined &&
+      (obj.header_cbor = base64FromBytes(
+        message.header_cbor !== undefined ? message.header_cbor : new Uint8Array(),
       ));
     return obj;
   },
@@ -987,6 +1350,7 @@ export const ProbabilisticBlock = {
       message.timestamp = BigInt(object.timestamp.toString());
     }
     message.block_cbor = object.block_cbor ?? new Uint8Array();
+    message.header_cbor = object.header_cbor ?? new Uint8Array();
     return message;
   },
 };
@@ -999,6 +1363,7 @@ function createBaseProbabilisticHeader(): ProbabilisticHeader {
     host_state_tx_output_index: 0,
     bridge_blocks: [],
     new_epoch_context: undefined,
+    is_checkpoint: false,
   };
 }
 /**
@@ -1030,6 +1395,9 @@ export const ProbabilisticHeader = {
     if (message.new_epoch_context !== undefined) {
       EpochContext.encode(message.new_epoch_context, writer.uint32(90).fork()).ldelim();
     }
+    if (message.is_checkpoint === true) {
+      writer.uint32(96).bool(message.is_checkpoint);
+    }
     return writer;
   },
   decode(input: BinaryReader | Uint8Array, length?: number): ProbabilisticHeader {
@@ -1060,6 +1428,9 @@ export const ProbabilisticHeader = {
         case 11:
           message.new_epoch_context = EpochContext.decode(reader, reader.uint32());
           break;
+        case 12:
+          message.is_checkpoint = reader.bool();
+          break;
         default:
           reader.skipType(tag & 7);
           break;
@@ -1080,6 +1451,7 @@ export const ProbabilisticHeader = {
       obj.bridge_blocks = object.bridge_blocks.map((e: any) => ProbabilisticBlock.fromJSON(e));
     if (isSet(object.new_epoch_context))
       obj.new_epoch_context = EpochContext.fromJSON(object.new_epoch_context);
+    if (isSet(object.is_checkpoint)) obj.is_checkpoint = Boolean(object.is_checkpoint);
     return obj;
   },
   toJSON(message: ProbabilisticHeader): unknown {
@@ -1107,6 +1479,7 @@ export const ProbabilisticHeader = {
       (obj.new_epoch_context = message.new_epoch_context
         ? EpochContext.toJSON(message.new_epoch_context)
         : undefined);
+    message.is_checkpoint !== undefined && (obj.is_checkpoint = message.is_checkpoint);
     return obj;
   },
   fromPartial<I extends Exact<DeepPartial<ProbabilisticHeader>, I>>(object: I): ProbabilisticHeader {
@@ -1124,6 +1497,7 @@ export const ProbabilisticHeader = {
     if (object.new_epoch_context !== undefined && object.new_epoch_context !== null) {
       message.new_epoch_context = EpochContext.fromPartial(object.new_epoch_context);
     }
+    message.is_checkpoint = object.is_checkpoint ?? false;
     return message;
   },
 };

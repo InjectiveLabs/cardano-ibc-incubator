@@ -12,13 +12,15 @@ import {
   QueryLatestHeightResponse,
   QueryNewClientRequest,
   QueryNewClientResponse,
-} from '@plus/proto-types/build/ibc/core/client/v1/query';
+} from '@cardano-ibc/proto-types/build/ibc/core/client/v1/query';
 import {
+  QueryClientConnectionsRequest,
+  QueryClientConnectionsResponse,
   QueryConnectionRequest,
   QueryConnectionResponse,
   QueryConnectionsRequest,
   QueryConnectionsResponse,
-} from '@plus/proto-types/build/ibc/core/connection/v1/query';
+} from '@cardano-ibc/proto-types/build/ibc/core/connection/v1/query';
 
 import {
   QueryChannelRequest,
@@ -45,7 +47,7 @@ import {
   QueryProofUnreceivedPacketsResponse,
   QueryNextSequenceReceiveRequest,
   QueryNextSequenceReceiveResponse,
-} from '@plus/proto-types/build/ibc/core/channel/v1/query';
+} from '@cardano-ibc/proto-types/build/ibc/core/channel/v1/query';
 import {
   QueryBlockResultsRequest,
   QueryBlockResultsResponse,
@@ -55,19 +57,19 @@ import {
   QueryTransactionByHashResponse,
   QueryIBCHeaderRequest,
   QueryIBCHeaderResponse,
-} from '@plus/proto-types/build/ibc/core/types/v1/query';
+} from '@cardano-ibc/proto-types/build/ibc/core/types/v1/query';
 import {
   QueryBridgeManifestRequest,
   QueryBridgeManifestResponse,
   QueryEventsRequest,
   QueryEventsResponse,
-} from '@plus/proto-types/build/ibc/cardano/v1/query';
+} from '@cardano-ibc/proto-types/build/ibc/cardano/v1/query';
 import {
   QueryDenomRequest,
   QueryDenomResponse,
   QueryDenomsRequest,
   QueryDenomsResponse,
-} from '@plus/proto-types/build/ibc/applications/transfer/v1/query';
+} from '@cardano-ibc/proto-types/build/ibc/applications/transfer/v1/query';
 import { QueryService } from './services/query.service';
 import { ConnectionService } from './services/connection.service';
 import { ChannelService } from './services/channel.service';
@@ -138,6 +140,12 @@ export class QueryController {
   async queryConnections(request: QueryConnectionsRequest): Promise<QueryConnectionsResponse> {
     const response: QueryConnectionsResponse = await this.connectionService.queryConnections(request);
     return response as unknown as QueryConnectionsResponse;
+  }
+
+  @GrpcMethod('Query', 'ClientConnections')
+  async queryClientConnections(request: QueryClientConnectionsRequest): Promise<QueryClientConnectionsResponse> {
+    const response: QueryClientConnectionsResponse = await this.connectionService.queryClientConnections(request);
+    return response as unknown as QueryClientConnectionsResponse;
   }
 
   @GrpcMethod('Query', 'Connection')

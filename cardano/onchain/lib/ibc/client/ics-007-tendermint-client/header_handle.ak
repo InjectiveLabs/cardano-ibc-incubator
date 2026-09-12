@@ -1,5 +1,4 @@
 use aiken/collection/pairs
-use aiken/primitive/bytearray
 use ibc/client/ics_007_tendermint_client/client_state.{ClientState}
 use ibc/client/ics_007_tendermint_client/cometbft/block/commit
 use ibc/client/ics_007_tendermint_client/cometbft/block/header as tm_header
@@ -40,6 +39,10 @@ pub fn verify_header(
     check_trusted_header(header, cons_state),
     header_mod.get_height(header).revision_number == header.trusted_height.revision_number,
     height.compare(header_mod.get_height(header), header.trusted_height) == Greater,
+    // Submission order is the retention order in the bounded client datum.
+    // Requiring monotonic updates therefore preserves the latest consensus
+    // state and its processed metadata.
+    height.compare(header_mod.get_height(header), cs.latest_height) == Greater,
     verifier.verify(
       trusted_header,
       header.trusted_validators,
@@ -55,8 +58,9 @@ pub fn verify_header(
 
 /// check_trusted_header() checks that consensus state matches trusted fields of Header
 pub fn check_trusted_header(header: Header, cons_state: ConsensusState) {
-  bytearray.compare(
-    cons_state.next_validators_hash,
-    validator_set.hash(header.trusted_validators),
-  ) == Equal
+  expect validator_set.validate_basic(header.trusted_validators)
+
+  cons_state.next_validators_hash == validator_set.hash(
+    header.trusted_validators,
+  )
 }

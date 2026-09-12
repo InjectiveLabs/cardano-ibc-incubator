@@ -10,8 +10,9 @@ depending on a Gateway database. However, that lookup data is still not part of
 the IBC proof root exposed to counterparties.
 
 `HostState` remains reserved for consensus-relevant IBC state: clients,
-connections, channels, packet commitments, and the commitment root proven with
-Mithril and ICS-23. Voucher trace mappings are Cardano-local lookup metadata.
+connections, channels, packet commitments, and the commitment root selected by
+the active Cardano light client and used for ICS-23 verification. Voucher trace
+mappings are Cardano-local lookup metadata.
 Keeping them in a separate registry avoids bloating the IBC proof root and avoids
 making counterparties care about local voucher reverse-lookup state.
 
@@ -34,6 +35,32 @@ registry or consume metadata derived from it. Our dapps and SDKs can do that, bu
 third-party wallets will only show better names if they choose to integrate that
 resolution path.
 
-## Why is Mithril slow? What determines its speed?
+## Why can finalized packet history be pruned without keeping an off-chain copy?
 
-Mithril’s original motivation is safe checkpointing for bootstrapping nodes. So a new node can jump close to the chain tip using a certificate and then sync the remaining few blocks normally which is pretty fast. That biases the protocol toward issuing certificates periodically rather than per block, and toward staying some distance behind the tip (a finality buffer) so certificates are anchored in history that is not expected to be displaced by short-range chain reorganizations. Those choices look slow from an IBC perspective but they are safety and performance tradeoffs that are deliberately made by the Mithril team, they are not arbitrary delays or some computation time for example.  In local development we can tune Mithril aggressively because we control the local signers and aggregator, but in production the certificate cadence and finality buffer are properties of the network’s Mithril configuration and cannot be unilaterally sped up by the relayer or the Gateway. We are exploring other options to get transaction times on the order of seconds or less for the production implementation. 
+Pruning removes only finalized destination history: a receipt and
+acknowledgement pair from an unordered channel, or an acknowledgement from an
+ordered channel. Ordered channels do not store receipt entries; their monotonic
+`next_sequence_recv` counter prevents the same sequence from being received
+again. Unresolved outbound packet commitments remain on-chain. Before allowing
+deletion, Cardano verifies at a sufficiently new authenticated counterparty
+height that the corresponding source commitment no longer exists, then
+atomically raises the channel's on-chain receive-proof floor so an older
+membership proof cannot replay the packet.
+
+Packet sequences advance monotonically, so a resolved commitment for that
+sequence cannot later be recreated. The proof floor, sequence counters,
+remaining commitments, and commitment root all remain in live on-chain datums,
+which means a fresh Gateway can reconstruct the current proof tree from chain
+state alone without relying on a unique Gateway database, relayer, or historical
+off-chain copy.
+
+## Why was Mithril removed from the maintained path?
+
+The retired Mithril client used periodic transaction-snapshot certificates as a
+portable trust anchor. Certificate cadence and distance from the chain tip made
+that design unsuitable for the latency expected from the maintained bridge
+path. New deployments use the experimental `08-cardano-probabilistic` client,
+which trades the portable Mithril certificate chain for configurable settlement
+heuristics and stronger observer/data-source assumptions. The old design and
+its operational tradeoffs remain in
+[Mithril Light Client Design](mithril-light-client.md) as historical reference.

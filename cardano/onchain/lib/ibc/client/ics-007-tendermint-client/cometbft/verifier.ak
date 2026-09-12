@@ -1,6 +1,5 @@
 use aiken/collection/list
 use aiken/math/rational.{Rational}
-use aiken/primitive/bytearray
 use ibc/client/ics_007_tendermint_client/cometbft/signed_header.{SignedHeader}
 use ibc/client/ics_007_tendermint_client/cometbft/validation
 use ibc/client/ics_007_tendermint_client/cometbft/validator_set.{ValidatorSet}
@@ -59,10 +58,7 @@ pub fn verify_adjacent(
       tx_time.valid_from,
       max_clock_drift,
     ),
-    bytearray.compare(
-      untrusted_header.header.validators_hash,
-      trusted_header.header.next_validators_hash,
-    ) == Equal,
+    untrusted_header.header.validators_hash == trusted_header.header.next_validators_hash,
     validation.verify_commit_light(
       trusted_header.header.chain_id,
       untrusted_vals,
@@ -85,13 +81,13 @@ pub fn verify_non_adjacent(
   trust_level: Rational,
 ) -> Bool {
   let list_vote_sign_bytes =
-    list.indexed_map(
+    list.map(
       untrusted_header.commit.signatures,
-      fn(idx, _sig) {
-        vote.vote_sign_bytes_for_commit(
+      fn(commit_sig) {
+        vote.vote_sign_bytes_for_commit_sig(
           untrusted_header.commit,
           trusted_header.header.chain_id,
-          idx,
+          commit_sig,
         )
       },
     )
@@ -136,6 +132,8 @@ fn verify_new_header_and_vals(
   now: Time,
   max_clock_drift: Duration,
 ) -> Bool {
+  expect validator_set.validate_basic(untrusted_vals)
+
   and {
     untrusted_header
       |> signed_header.validate_basic(trusted_header.header.chain_id),

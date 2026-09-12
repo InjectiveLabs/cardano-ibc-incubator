@@ -2,13 +2,69 @@ syntax = "proto3";
 
 package ibc.cardano.v1;
 
+import "google/protobuf/any.proto";
+import "ibc/core/client/v1/client.proto";
+
 option go_package = "github.com/cosmos/ibc-go/v7/modules/cardano/types";
 
 // CardanoMsg defines the Cardano-specific transaction submission service.
 // This service is used by the Hermes relayer to submit signed Cardano transactions.
 service CardanoMsg {
+  // BuildHostStateHeartbeat builds a HostState-only transaction when the
+  // current Cardano epoch does not yet contain a HostState anchor.
+  rpc BuildHostStateHeartbeat(BuildHostStateHeartbeatRequest) returns (BuildHostStateHeartbeatResponse);
+
+  // PrunePacketHistory builds a Cardano transaction which removes finalized
+  // destination packet history: the receipt and acknowledgement on unordered
+  // channels, or only the acknowledgement on ordered channels. Safety is
+  // authorized by a counterparty proof that the source commitment is absent.
+  rpc PrunePacketHistory(MsgPrunePacketHistory) returns (MsgPrunePacketHistoryResponse);
+
   // SubmitSignedTx submits a signed Cardano transaction.
   rpc SubmitSignedTx(SubmitSignedTxRequest) returns (SubmitSignedTxResponse);
+
+  // ObserveTx waits for a transaction submitted directly by Hermes to be
+  // indexed, then finalizes the Gateway's pending IBC state update. The
+  // signed transaction is deliberately never sent to the Gateway.
+  rpc ObserveTx(ObserveTxRequest) returns (ObserveTxResponse);
+}
+
+message BuildHostStateHeartbeatRequest {
+  // Cardano address whose UTxOs fund and sign the heartbeat transaction.
+  string signer = 1;
+}
+
+message BuildHostStateHeartbeatResponse {
+  // False when an ordinary IBC transaction or heartbeat has already refreshed
+  // HostState in the current epoch.
+  bool heartbeat_required = 1;
+
+  uint64 current_epoch = 2;
+  uint64 host_state_epoch = 3;
+
+  // Present only when heartbeat_required is true. The value contains the
+  // unsigned Cardano transaction CBOR encoded as UTF-8 hex.
+  google.protobuf.Any unsigned_tx = 4;
+}
+
+message MsgPrunePacketHistory {
+  // Cardano address whose UTxOs fund and sign the pruning transaction.
+  string signer = 1;
+
+  // Local Cardano channel identifiers whose retained history is pruned.
+  string port_id = 2;
+  string channel_id = 3;
+  uint64 sequence = 4;
+
+  // ICS-23 non-membership proof for the corresponding source-chain packet
+  // commitment, evaluated at proof_height.
+  bytes proof_commitment_absence = 5;
+  ibc.core.client.v1.Height proof_height = 6;
+}
+
+message MsgPrunePacketHistoryResponse {
+  // Unsigned Cardano transaction CBOR encoded as UTF-8 hex.
+  google.protobuf.Any unsigned_tx = 1;
 }
 
 // SubmitSignedTxRequest contains a signed Cardano transaction in CBOR format.
@@ -33,6 +89,25 @@ message SubmitSignedTxResponse {
   repeated Event events = 3;
 }
 
+// ObserveTxRequest identifies a transaction that Hermes already submitted
+// through its trusted Cardano node connection.
+message ObserveTxRequest {
+  // Blake2b-256 hash of the Cardano transaction body, encoded as 64 hex digits.
+  string tx_hash = 1;
+}
+
+// ObserveTxResponse contains the confirmed inclusion height and IBC events.
+message ObserveTxResponse {
+  // Canonical Blake2b-256 transaction body hash.
+  string tx_hash = 1;
+
+  // Confirmed block height in IBC revision-number/revision-height form.
+  string height = 2;
+
+  // Raw transaction events for IBC event parsing.
+  repeated Event events = 3;
+}
+
 // Event represents a transaction event with type and attributes.
 message Event {
   string type = 1;
@@ -44,4 +119,3 @@ message EventAttribute {
   string key = 1;
   string value = 2;
 }
-

@@ -1,3 +1,5 @@
+use aiken/collection/pairs
+use aiken/primitive/int
 use ibc/auth.{AuthToken}
 use ibc/client/ics_007_tendermint_client/height as height_mod
 use ibc/core/ics_004/channel_datum.{ChannelDatum,
@@ -7,6 +9,21 @@ use ibc/core/ics_004/types/counterparty.{ChannelCounterparty}
 use ibc/core/ics_004/types/order.{Unordered}
 use ibc/core/ics_004/types/packet.{Packet} as packet_mod
 use ibc/core/ics_004/types/state.{Open}
+
+fn packet_entries(
+  sequence: Int,
+  last_sequence: Int,
+  value: ByteArray,
+) -> Pairs<Int, ByteArray> {
+  if sequence > last_sequence {
+    []
+  } else {
+    [
+      Pair(sequence, value),
+      ..packet_entries(sequence + 1, last_sequence, value)
+    ]
+  }
+}
 
 fn setup() -> (ChannelDatum, ChannelDatum, Packet, ByteArray) {
   let mock_auth_token =
@@ -41,6 +58,8 @@ fn setup() -> (ChannelDatum, ChannelDatum, Packet, ByteArray) {
   let input_channel_datum =
     ChannelDatum {
       state: ChannelDatumState {
+        maximum_receive_proof_height: height_mod.zero_height(),
+        minimum_receive_proof_height: height_mod.zero_height(),
         channel: input_channel,
         next_sequence_send: 1,
         next_sequence_recv: 1,
@@ -56,6 +75,8 @@ fn setup() -> (ChannelDatum, ChannelDatum, Packet, ByteArray) {
   let output_channel_datum =
     ChannelDatum {
       state: ChannelDatumState {
+        maximum_receive_proof_height: height_mod.zero_height(),
+        minimum_receive_proof_height: height_mod.zero_height(),
         channel: input_channel,
         next_sequence_send: input_channel_datum.state.next_sequence_send + 1,
         next_sequence_recv: 1,
@@ -75,6 +96,8 @@ test succeed() {
   let input_datum_2 =
     ChannelDatum {
       state: ChannelDatumState {
+        maximum_receive_proof_height: height_mod.zero_height(),
+        minimum_receive_proof_height: height_mod.zero_height(),
         channel: channel_mod.new(
           Open,
           Unordered,
@@ -102,6 +125,8 @@ test succeed() {
   let output_datum_2 =
     ChannelDatum {
       state: ChannelDatumState {
+        maximum_receive_proof_height: height_mod.zero_height(),
+        minimum_receive_proof_height: height_mod.zero_height(),
         channel: channel_mod.new(
           Open,
           Unordered,
@@ -188,6 +213,45 @@ test fail_if_packet_commitment_not_updated() {
     }
 
   !channel_datum_mod.validate_send_packet(
+    input_datum,
+    output_datum,
+    packet,
+    commitment,
+  )
+}
+
+test succeed_at_packet_commitment_capacity() {
+  let (base_input_datum, _, base_packet, _) = setup()
+  let sequence = channel_datum_mod.max_packet_entries_per_channel
+  let packet = Packet { ..base_packet, sequence }
+  let existing_commitments =
+    packet_entries(1, sequence - 1, "existing commitment")
+  let commitment = packet_mod.commit_packet(packet)
+  let input_datum =
+    ChannelDatum {
+      ..base_input_datum,
+      state: ChannelDatumState {
+        ..base_input_datum.state,
+        next_sequence_send: sequence,
+        packet_commitment: existing_commitments,
+      },
+    }
+  let output_datum =
+    ChannelDatum {
+      ..input_datum,
+      state: ChannelDatumState {
+        ..input_datum.state,
+        next_sequence_send: sequence + 1,
+        packet_commitment: pairs.insert_by_ascending_key(
+          existing_commitments,
+          sequence,
+          commitment,
+          int.compare,
+        ),
+      },
+    }
+
+  channel_datum_mod.validate_send_packet(
     input_datum,
     output_datum,
     packet,

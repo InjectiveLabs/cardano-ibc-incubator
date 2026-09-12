@@ -6,15 +6,15 @@ import {
   DEFAULT_FEATURES_VERSION_ORDER_UNORDERED,
   DEFAULT_IDENTIFIER_VERSION,
 } from 'src/constant';
-import { MerkleProof as MerkleProofMsg } from '@plus/proto-types/build/ibc/core/commitment/v1/commitment';
+import { MerkleProof as MerkleProofMsg } from '@cardano-ibc/proto-types/build/ibc/core/commitment/v1/commitment';
 import {
   MsgConnectionOpenAck,
   MsgConnectionOpenConfirm,
   MsgConnectionOpenInit,
   MsgConnectionOpenTry,
-} from '@plus/proto-types/build/ibc/core/connection/v1/tx';
+} from '@cardano-ibc/proto-types/build/ibc/core/connection/v1/tx';
 import { ConnectionOpenInitOperator } from '../dto/connection/connection-open-init-operator.dto';
-import { Any } from '@plus/proto-types/build/google/protobuf/any';
+import { Any } from '@cardano-ibc/proto-types/build/google/protobuf/any';
 import { convertString2Hex, toHex } from '@shared/helpers/hex';
 import { ConnectionOpenTryOperator } from '../dto/connection/connection-open-try-operator.dto';
 import { initializeMerkleProof } from '@shared/helpers/merkle-proof';
@@ -80,6 +80,9 @@ export function validateAndFormatConnectionOpenTryParams(data: MsgConnectionOpen
       `Invalid argument: "client_id". Please use the prefix "${CLIENT_ID_PREFIX}-"`,
     );
   const clientSequence: string = data.client_id.replaceAll(`${CLIENT_ID_PREFIX}-`, '');
+  if (!data.client_state) {
+    throw new GrpcInvalidArgumentException('Invalid argument: "client_state" is required');
+  }
   const decodedProofInitMsg: MerkleProofMsg = MerkleProofMsg.decode(data.proof_init);
   const decodedProofClientMsg: MerkleProofMsg = MerkleProofMsg.decode(data.proof_client);
   const clientStateAnyHex = Buffer.from(Any.encode(data.client_state).finish()).toString('hex');
@@ -124,6 +127,9 @@ export function validateAndFormatConnectionOpenAckParams(data: MsgConnectionOpen
     );
 
   const connectionSequence = data.connection_id.replaceAll(`${CONNECTION_ID_PREFIX}-`, '');
+  if (!data.client_state) {
+    throw new GrpcInvalidArgumentException('Invalid argument: "client_state" is required');
+  }
   const decodedProofTryMsg: MerkleProofMsg = decodeMerkleProof(data.proof_try);
   const decodedProofClientMsg: MerkleProofMsg = decodeMerkleProof(data.proof_client);
 

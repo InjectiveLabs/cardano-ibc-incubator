@@ -2,6 +2,8 @@ package probabilisticcore
 
 import (
 	"bytes"
+	"crypto/ed25519"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"strings"
@@ -11,6 +13,20 @@ import (
 	fxcbor "github.com/fxamacker/cbor/v2"
 	"golang.org/x/crypto/blake2b"
 )
+
+const maxSupportedKesEvolutions = uint64(1 << 6)
+
+type NativeBlockVerificationResult struct {
+	VrfKey                               []byte
+	OperationalCertificateSequenceNumber uint64
+}
+
+type PraosLeaderEligibilityParameters struct {
+	StakeNumerator        uint64
+	StakeDenominator      uint64
+	ActiveSlotNumerator   uint64
+	ActiveSlotDenominator uint64
+}
 
 type rawBlockBodyFields struct {
 	transactionBodies      []byte
@@ -62,6 +78,41 @@ func DecodeLedgerBlock(blockCbor []byte) (ledger.Block, error) {
 	}
 
 	return nil, fmt.Errorf("%w; raw block fallback failed: %v", err, fallbackErr)
+}
+
+// DecodeLedgerHeader decodes the exact signed Praos header used by both
+// Babbage and Conway blocks. Cardano does not include the surrounding era in
+// the header itself, and both eras share this header layout.
+func DecodeLedgerHeader(headerCbor []byte) (*ledger.BabbageBlockHeader, error) {
+	var header ledger.BabbageBlockHeader
+	decodedBytes, err := cbor.Decode(headerCbor, &header)
+	if err != nil {
+		return nil, fmt.Errorf("Cardano block header decode error: %w", err)
+	}
+	if decodedBytes != len(headerCbor) {
+		return nil, fmt.Errorf(
+			"Cardano block header contains trailing bytes: decoded %d of %d",
+			decodedBytes,
+			len(headerCbor),
+		)
+	}
+	return &header, nil
+}
+
+func HeaderPrevHash(header *ledger.BabbageBlockHeader) string {
+	return header.Body.PrevHash.String()
+}
+
+func HeaderBodyHash(header *ledger.BabbageBlockHeader) string {
+	return header.Body.BlockBodyHash.String()
+}
+
+func BlockBodyHash(decodedBlock ledger.Block) (string, error) {
+	header, err := nativeBabbageHeader(decodedBlock)
+	if err != nil {
+		return "", err
+	}
+	return HeaderBodyHash(header), nil
 }
 
 func wrapRawBodyFields(decodedBlock ledger.Block, bodyFields rawBlockBodyFields) ledger.Block {
@@ -137,44 +188,206 @@ func BuildBlockVerificationArtifacts(decodedBlock ledger.Block) (string, string,
 	}
 }
 
-func VerifyNativeBlock(decodedBlock ledger.Block, epochNonce []byte, slotsPerKesPeriod int) (bool, []byte, error) {
+func VerifyNativeBlock(
+	decodedBlock ledger.Block,
+	epochNonce []byte,
+	slotsPerKesPeriod uint64,
+	maxKesEvolutions uint64,
+	leaderParameters PraosLeaderEligibilityParameters,
+) (valid bool, result NativeBlockVerificationResult, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			valid = false
+			result = NativeBlockVerificationResult{}
+			err = fmt.Errorf("native block verification panicked: %v", recovered)
+		}
+	}()
+
 	header, err := nativeBabbageHeader(decodedBlock)
 	if err != nil {
-		return false, nil, err
+		return false, NativeBlockVerificationResult{}, err
 	}
 
-	isKesValid, err := ledger.VerifyKes(header, uint64(slotsPerKesPeriod))
+	isHeaderValid, result, err := verifyNativeHeader(
+		header,
+		epochNonce,
+		slotsPerKesPeriod,
+		maxKesEvolutions,
+		leaderParameters,
+	)
 	if err != nil {
-		return false, nil, fmt.Errorf("KES invalid: %w", err)
+		return false, NativeBlockVerificationResult{}, err
+	}
+
+	isBodyValid, err := verifyNativeBlockBody(decodedBlock, header.Body.BlockBodyHash.String())
+	if err != nil {
+		return false, NativeBlockVerificationResult{}, err
+	}
+
+	return isHeaderValid && isBodyValid, result, nil
+}
+
+// VerifyNativeHeader authenticates the signed Cardano header without requiring
+// the body preimage. The signed body hash remains available through
+// HeaderBodyHash, while callers that consume body data must use VerifyNativeBlock.
+func VerifyNativeHeader(
+	header *ledger.BabbageBlockHeader,
+	epochNonce []byte,
+	slotsPerKesPeriod uint64,
+	maxKesEvolutions uint64,
+	leaderParameters PraosLeaderEligibilityParameters,
+) (valid bool, result NativeBlockVerificationResult, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			valid = false
+			result = NativeBlockVerificationResult{}
+			err = fmt.Errorf("native header verification panicked: %v", recovered)
+		}
+	}()
+
+	return verifyNativeHeader(header, epochNonce, slotsPerKesPeriod, maxKesEvolutions, leaderParameters)
+}
+
+func verifyNativeHeader(
+	header *ledger.BabbageBlockHeader,
+	epochNonce []byte,
+	slotsPerKesPeriod uint64,
+	maxKesEvolutions uint64,
+	leaderParameters PraosLeaderEligibilityParameters,
+) (bool, NativeBlockVerificationResult, error) {
+	opCertSequenceNumber, err := verifyOperationalCertificate(
+		header,
+		slotsPerKesPeriod,
+		maxKesEvolutions,
+	)
+	if err != nil {
+		return false, NativeBlockVerificationResult{}, err
+	}
+
+	isKesValid, err := ledger.VerifyKes(header, slotsPerKesPeriod)
+	if err != nil {
+		return false, NativeBlockVerificationResult{}, fmt.Errorf("KES invalid: %w", err)
 	}
 
 	vrfResult, ok := header.Body.VrfResult.([]interface{})
 	if !ok || len(vrfResult) < 2 {
-		return false, nil, fmt.Errorf("invalid VRF result shape")
+		return false, NativeBlockVerificationResult{}, fmt.Errorf("invalid VRF result shape")
 	}
 	vrfOutputBytes, ok := vrfResult[0].([]byte)
 	if !ok {
-		return false, nil, fmt.Errorf("invalid VRF output shape")
+		return false, NativeBlockVerificationResult{}, fmt.Errorf("invalid VRF output shape")
 	}
 	vrfProofBytes, ok := vrfResult[1].([]byte)
 	if !ok {
-		return false, nil, fmt.Errorf("invalid VRF proof shape")
+		return false, NativeBlockVerificationResult{}, fmt.Errorf("invalid VRF proof shape")
 	}
 
 	vrfKeyBytes := append([]byte(nil), header.Body.VrfKey...)
 	seed := ledger.MkInputVrf(int64(header.Body.Slot), epochNonce)
 	output, err := ledger.VrfVerifyAndHash(vrfKeyBytes, vrfProofBytes, seed)
 	if err != nil {
-		return false, nil, fmt.Errorf("VRF invalid: %w", err)
+		return false, NativeBlockVerificationResult{}, fmt.Errorf("VRF invalid: %w", err)
 	}
 	isVrfValid := bytes.Equal(output, vrfOutputBytes)
-
-	isBodyValid, err := verifyNativeBlockBody(decodedBlock, header.Body.BlockBodyHash.String())
-	if err != nil {
-		return false, nil, err
+	if !isVrfValid {
+		return false, NativeBlockVerificationResult{}, nil
 	}
 
-	return isKesValid && isVrfValid && isBodyValid, vrfKeyBytes, nil
+	isLeaderEligible, err := IsPraosLeaderEligible(
+		vrfOutputBytes,
+		leaderParameters.StakeNumerator,
+		leaderParameters.StakeDenominator,
+		leaderParameters.ActiveSlotNumerator,
+		leaderParameters.ActiveSlotDenominator,
+	)
+	if err != nil {
+		return false, NativeBlockVerificationResult{}, fmt.Errorf("Praos leader eligibility invalid: %w", err)
+	}
+	if !isLeaderEligible {
+		return false, NativeBlockVerificationResult{}, fmt.Errorf("Praos leadership threshold not met")
+	}
+
+	return isKesValid, NativeBlockVerificationResult{
+		VrfKey:                               vrfKeyBytes,
+		OperationalCertificateSequenceNumber: opCertSequenceNumber,
+	}, nil
+}
+
+func verifyOperationalCertificate(
+	header *ledger.BabbageBlockHeader,
+	slotsPerKesPeriod uint64,
+	maxKesEvolutions uint64,
+) (uint64, error) {
+	if header == nil {
+		return 0, fmt.Errorf("operational certificate header is nil")
+	}
+	if slotsPerKesPeriod == 0 {
+		return 0, fmt.Errorf("slots per KES period must be greater than zero")
+	}
+	if maxKesEvolutions == 0 || maxKesEvolutions > maxSupportedKesEvolutions {
+		return 0, fmt.Errorf(
+			"max KES evolutions must be between 1 and %d",
+			maxSupportedKesEvolutions,
+		)
+	}
+
+	opCert := header.Body.OpCert
+	if len(opCert.HotVkey) != ed25519.PublicKeySize {
+		return 0, fmt.Errorf(
+			"operational certificate hot KES key must be %d bytes, got %d",
+			ed25519.PublicKeySize,
+			len(opCert.HotVkey),
+		)
+	}
+	if len(opCert.Signature) != ed25519.SignatureSize {
+		return 0, fmt.Errorf(
+			"operational certificate signature must be %d bytes, got %d",
+			ed25519.SignatureSize,
+			len(opCert.Signature),
+		)
+	}
+
+	currentKesPeriod := header.Body.Slot / slotsPerKesPeriod
+	startKesPeriod := uint64(opCert.KesPeriod)
+	if currentKesPeriod < startKesPeriod {
+		return 0, fmt.Errorf(
+			"operational certificate starts at KES period %d after current KES period %d",
+			startKesPeriod,
+			currentKesPeriod,
+		)
+	}
+	if currentKesPeriod-startKesPeriod >= maxKesEvolutions {
+		return 0, fmt.Errorf(
+			"operational certificate expired at current KES period %d (start %d, max evolutions %d)",
+			currentKesPeriod,
+			startKesPeriod,
+			maxKesEvolutions,
+		)
+	}
+
+	sequenceNumber := uint64(opCert.SequenceNumber)
+	signable := operationalCertificateSignableBytes(
+		opCert.HotVkey,
+		sequenceNumber,
+		startKesPeriod,
+	)
+	if !ed25519.Verify(header.Body.IssuerVkey[:], signable, opCert.Signature) {
+		return 0, fmt.Errorf("operational certificate cold-key signature is invalid")
+	}
+
+	return sequenceNumber, nil
+}
+
+func operationalCertificateSignableBytes(
+	hotVkey []byte,
+	sequenceNumber uint64,
+	startKesPeriod uint64,
+) []byte {
+	signable := make([]byte, ed25519.PublicKeySize+8+8)
+	copy(signable, hotVkey)
+	binary.BigEndian.PutUint64(signable[ed25519.PublicKeySize:], sequenceNumber)
+	binary.BigEndian.PutUint64(signable[ed25519.PublicKeySize+8:], startKesPeriod)
+	return signable
 }
 
 func nativeBabbageHeader(decodedBlock ledger.Block) (*ledger.BabbageBlockHeader, error) {
@@ -534,22 +747,65 @@ func cloneRawMessage(raw fxcbor.RawMessage) []byte {
 }
 
 func ExtractHostStateTxBodyCborFromAnchorBlock(anchorBlockCbor []byte, hostStateTxHash string) ([]byte, error) {
-	decodedBlock, err := DecodeLedgerBlock(anchorBlockCbor)
+	tx, _, err := findValidHostStateTransaction(anchorBlockCbor, hostStateTxHash)
 	if err != nil {
-		return nil, fmt.Errorf("failed to decode anchor block: %w", err)
+		return nil, err
 	}
 
-	for _, tx := range decodedBlock.Transactions() {
+	txBodyCbor, err := ExtractTransactionBodyCbor(tx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode host state tx body: %w", err)
+	}
+	return txBodyCbor, nil
+}
+
+func findValidHostStateTransaction(
+	anchorBlockCbor []byte,
+	hostStateTxHash string,
+) (ledger.Transaction, int, error) {
+	if hostStateTxHash == "" {
+		return nil, 0, fmt.Errorf("missing HostState transaction hash")
+	}
+	decodedBlock, err := DecodeLedgerBlock(anchorBlockCbor)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to decode anchor block: %w", err)
+	}
+
+	for txIndex, tx := range decodedBlock.Transactions() {
 		if strings.EqualFold(tx.Hash(), hostStateTxHash) {
-			txBodyCbor, bodyErr := ExtractTransactionBodyCbor(tx)
-			if bodyErr != nil {
-				return nil, fmt.Errorf("failed to decode host state tx body: %w", bodyErr)
+			if transactionIndexIsInvalid(decodedBlock, uint(txIndex)) || !tx.IsValid() {
+				return nil, 0, fmt.Errorf(
+					"host state tx %s at block index %d is phase-2 invalid",
+					hostStateTxHash,
+					txIndex,
+				)
 			}
-			return txBodyCbor, nil
+			return tx, txIndex, nil
 		}
 	}
 
-	return nil, fmt.Errorf("host state tx %s not found in authenticated anchor block", hostStateTxHash)
+	return nil, 0, fmt.Errorf("host state tx %s not found in authenticated anchor block", hostStateTxHash)
+}
+
+func transactionIndexIsInvalid(decodedBlock ledger.Block, txIndex uint) bool {
+	var invalidTransactions []uint
+	switch block := decodedBlock.(type) {
+	case *rawBabbageBlock:
+		invalidTransactions = block.InvalidTransactions
+	case *rawConwayBlock:
+		invalidTransactions = block.InvalidTransactions
+	case *ledger.BabbageBlock:
+		invalidTransactions = block.InvalidTransactions
+	case *ledger.ConwayBlock:
+		invalidTransactions = block.InvalidTransactions
+	}
+
+	for _, invalidTxIndex := range invalidTransactions {
+		if invalidTxIndex == txIndex {
+			return true
+		}
+	}
+	return false
 }
 
 func ExtractTransactionBodyCbor(tx ledger.Transaction) ([]byte, error) {

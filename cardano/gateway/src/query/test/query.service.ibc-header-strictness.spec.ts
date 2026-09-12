@@ -1,3 +1,4 @@
+import { createTestTreeStore } from '../../shared/testing/ibc-tree-test-store';
 import { Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { status } from '@grpc/grpc-js';
@@ -11,8 +12,8 @@ import { HistoryService } from '../services/history.service';
 
 // We only care that queryIBCHeader reaches "header build" paths.
 // The exact protobuf bytes are not relevant for these failure-path regressions.
-jest.mock('@plus/proto-types/build/ibc/lightclients/mithril/v1/mithril', () => {
-  const actual = jest.requireActual('@plus/proto-types/build/ibc/lightclients/mithril/v1/mithril');
+jest.mock('@cardano-ibc/proto-types/build/ibc/lightclients/mithril/v1/mithril', () => {
+  const actual = jest.requireActual('@cardano-ibc/proto-types/build/ibc/lightclients/mithril/v1/mithril');
   return {
     ...actual,
     MithrilHeader: {
@@ -204,6 +205,7 @@ describe('QueryService IBC header strictness regressions', () => {
       mithrilServiceMock as unknown as MithrilService,
       {} as DenomTraceService,
       {} as any,
+      createTestTreeStore(),
     );
   });
 

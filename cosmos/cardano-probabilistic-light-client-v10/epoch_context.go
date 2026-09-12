@@ -2,6 +2,7 @@ package probabilistic
 
 import (
 	"bytes"
+	"math/big"
 	"slices"
 	"strings"
 
@@ -30,10 +31,12 @@ func cloneEpochContext(ctx *EpochContext) *EpochContext {
 				continue
 			}
 			cloned.StakeDistribution = append(cloned.StakeDistribution, &StakeDistributionEntry{
-				PoolId:                entry.PoolId,
-				Stake:                 entry.Stake,
-				VrfKeyHash:            bytes.Clone(entry.VrfKeyHash),
-				FirstRegistrationSlot: entry.FirstRegistrationSlot,
+				PoolId:                   entry.PoolId,
+				Stake:                    entry.Stake,
+				VrfKeyHash:               bytes.Clone(entry.VrfKeyHash),
+				FirstRegistrationSlot:    entry.FirstRegistrationSlot,
+				RelativeStakeNumerator:   entry.RelativeStakeNumerator,
+				RelativeStakeDenominator: entry.RelativeStakeDenominator,
 			})
 		}
 	}
@@ -58,10 +61,12 @@ func cloneStakeDistributionEntries(entries []*StakeDistributionEntry) []*StakeDi
 			continue
 		}
 		cloned = append(cloned, &StakeDistributionEntry{
-			PoolId:                entry.PoolId,
-			Stake:                 entry.Stake,
-			VrfKeyHash:            bytes.Clone(entry.VrfKeyHash),
-			FirstRegistrationSlot: entry.FirstRegistrationSlot,
+			PoolId:                   entry.PoolId,
+			Stake:                    entry.Stake,
+			VrfKeyHash:               bytes.Clone(entry.VrfKeyHash),
+			FirstRegistrationSlot:    entry.FirstRegistrationSlot,
+			RelativeStakeNumerator:   entry.RelativeStakeNumerator,
+			RelativeStakeDenominator: entry.RelativeStakeDenominator,
 		})
 	}
 	return cloned
@@ -85,6 +90,7 @@ func validateEpochContext(ctx *EpochContext) error {
 	}
 
 	totalStake := uint64(0)
+	totalRelativeStake := new(big.Rat)
 	seenPools := make(map[string]struct{}, len(ctx.StakeDistribution))
 	for _, entry := range ctx.StakeDistribution {
 		if entry == nil {
@@ -96,15 +102,34 @@ func validateEpochContext(ctx *EpochContext) error {
 		if len(entry.VrfKeyHash) != 32 {
 			return errorsmod.Wrapf(ErrInvalidCurrentEpoch, "epoch %d vrf_key_hash for pool %s must be 32 bytes", ctx.Epoch, entry.PoolId)
 		}
+		if entry.RelativeStakeNumerator == 0 {
+			return errorsmod.Wrapf(ErrInvalidCurrentEpoch, "epoch %d relative stake numerator for pool %s must be greater than zero", ctx.Epoch, entry.PoolId)
+		}
+		if entry.RelativeStakeDenominator == 0 {
+			return errorsmod.Wrapf(ErrInvalidCurrentEpoch, "epoch %d relative stake denominator for pool %s must be greater than zero", ctx.Epoch, entry.PoolId)
+		}
+		if entry.RelativeStakeNumerator > entry.RelativeStakeDenominator {
+			return errorsmod.Wrapf(ErrInvalidCurrentEpoch, "epoch %d relative stake for pool %s must not exceed one", ctx.Epoch, entry.PoolId)
+		}
 		poolKey := strings.ToLower(entry.PoolId)
 		if _, exists := seenPools[poolKey]; exists {
 			return errorsmod.Wrapf(ErrInvalidCurrentEpoch, "duplicate epoch %d stake distribution pool id %s", ctx.Epoch, entry.PoolId)
 		}
 		seenPools[poolKey] = struct{}{}
+		if ^uint64(0)-totalStake < entry.Stake {
+			return errorsmod.Wrapf(ErrInvalidCurrentEpoch, "epoch %d stake distribution total overflows uint64", ctx.Epoch)
+		}
 		totalStake += entry.Stake
+		totalRelativeStake.Add(totalRelativeStake, new(big.Rat).SetFrac(
+			new(big.Int).SetUint64(entry.RelativeStakeNumerator),
+			new(big.Int).SetUint64(entry.RelativeStakeDenominator),
+		))
 	}
 	if totalStake == 0 {
 		return errorsmod.Wrapf(ErrInvalidCurrentEpoch, "epoch %d stake distribution must have positive total stake", ctx.Epoch)
+	}
+	if totalRelativeStake.Cmp(big.NewRat(1, 1)) != 0 {
+		return errorsmod.Wrapf(ErrInvalidCurrentEpoch, "epoch %d relative stake fractions must sum to one", ctx.Epoch)
 	}
 
 	return nil
@@ -139,7 +164,32 @@ func normalizeEpochContexts(contexts []*EpochContext) ([]*EpochContext, error) {
 }
 
 func (cs ClientState) normalizedEpochContexts() ([]*EpochContext, error) {
-	return normalizeEpochContexts(cs.EpochContexts)
+	contexts, err := normalizeEpochContexts(cs.EpochContexts)
+	if err != nil {
+		return nil, err
+	}
+	if err := cs.validateEpochContextParameters(contexts); err != nil {
+		return nil, err
+	}
+	return contexts, nil
+}
+
+func (cs ClientState) validateEpochContextParameters(contexts []*EpochContext) error {
+	if cs.SlotsPerKesPeriod == 0 {
+		return errorsmod.Wrapf(ErrInvalidCurrentEpoch, "client slots per KES period must be greater than zero")
+	}
+	for _, ctx := range contexts {
+		if ctx != nil && ctx.SlotsPerKesPeriod != cs.SlotsPerKesPeriod {
+			return errorsmod.Wrapf(
+				ErrInvalidCurrentEpoch,
+				"epoch %d slots per KES period %d must match immutable client value %d",
+				ctx.Epoch,
+				ctx.SlotsPerKesPeriod,
+				cs.SlotsPerKesPeriod,
+			)
+		}
+	}
+	return nil
 }
 
 func mergeEpochContexts(base []*EpochContext, candidate *EpochContext) ([]*EpochContext, error) {
@@ -215,6 +265,9 @@ func epochContextsEqual(left, right *EpochContext) bool {
 		rightEntry := rightByPool[strings.ToLower(leftEntry.PoolId)]
 		if rightEntry == nil ||
 			leftEntry.Stake != rightEntry.Stake ||
+			leftEntry.FirstRegistrationSlot != rightEntry.FirstRegistrationSlot ||
+			leftEntry.RelativeStakeNumerator != rightEntry.RelativeStakeNumerator ||
+			leftEntry.RelativeStakeDenominator != rightEntry.RelativeStakeDenominator ||
 			!bytes.Equal(leftEntry.VrfKeyHash, rightEntry.VrfKeyHash) {
 			return false
 		}
@@ -227,12 +280,14 @@ func syncCurrentEpochFields(cs *ClientState, contexts []*EpochContext, currentEp
 	if currentCtx == nil {
 		return errorsmod.Wrapf(ErrInvalidCurrentEpoch, "missing epoch context for current epoch %d", currentEpoch)
 	}
+	if err := cs.validateEpochContextParameters(contexts); err != nil {
+		return err
+	}
 
 	cs.CurrentEpoch = currentEpoch
 	cs.EpochContexts = cloneEpochContexts(contexts)
 	cs.EpochStakeDistribution = cloneStakeDistributionEntries(currentCtx.StakeDistribution)
 	cs.EpochNonce = bytes.Clone(currentCtx.EpochNonce)
-	cs.SlotsPerKesPeriod = currentCtx.SlotsPerKesPeriod
 	cs.CurrentEpochStartSlot = currentCtx.EpochStartSlot
 	cs.CurrentEpochEndSlotExclusive = currentCtx.EpochEndSlotExclusive
 	return nil

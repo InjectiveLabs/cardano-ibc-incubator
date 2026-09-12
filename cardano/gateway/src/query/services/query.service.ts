@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/no-unused-vars */
-import { Inject, Injectable, Logger } from '@nestjs/common';
+import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import {
   QueryClientStateRequest,
   QueryClientStateResponse,
@@ -11,27 +11,28 @@ import {
   QueryLatestHeightResponse,
   QueryNewClientRequest,
   QueryNewClientResponse,
-} from '@plus/proto-types/build/ibc/core/client/v1/query';
+} from '@cardano-ibc/proto-types/build/ibc/core/client/v1/query';
 import {
   ClientState as ClientStateTendermint,
   ConsensusState as ConsensusStateTendermint,
-} from '@plus/proto-types/build/ibc/lightclients/tendermint/v1/tendermint';
+} from '@cardano-ibc/proto-types/build/ibc/lightclients/tendermint/v1/tendermint';
 import {
   ClientState as ClientStateMithril,
   ConsensusState as ConsensusStateMithril,
   MithrilCertificate,
   MithrilHeader,
-} from '@plus/proto-types/build/ibc/lightclients/mithril/v1/mithril';
+} from '@cardano-ibc/proto-types/build/ibc/lightclients/mithril/v1/mithril';
 import {
   ClientState as ClientStateProbabilistic,
   ConsensusState as ConsensusStateProbabilistic,
   EpochContext as ProbabilisticEpochContext,
+  OperationalCertificateCounter,
   ProbabilisticBlock,
   ProbabilisticHeader,
   StakeDistributionEntry,
-} from '@plus/proto-types/build/ibc/lightclients/probabilistic/v1/probabilistic';
-import { Any } from '@plus/proto-types/build/google/protobuf/any';
-import { IdentifiedClientState } from '@plus/proto-types/build/ibc/core/client/v1/client';
+} from '@cardano-ibc/proto-types/build/ibc/lightclients/probabilistic/v1/probabilistic';
+import { Any } from '@cardano-ibc/proto-types/build/google/protobuf/any';
+import { IdentifiedClientState } from '@cardano-ibc/proto-types/build/ibc/core/client/v1/client';
 import { LucidService } from '@shared/modules/lucid/lucid.service';
 import { KupoService } from '@shared/modules/kupo/kupo.service';
 import { ConfigService } from '@nestjs/config';
@@ -56,7 +57,7 @@ import {
   QueryTransactionByHashResponse,
   QueryIBCHeaderRequest,
   QueryIBCHeaderResponse,
-} from '@plus/proto-types/build/ibc/core/types/v1/query';
+} from '@cardano-ibc/proto-types/build/ibc/core/types/v1/query';
 import { UtxoDto } from '../dtos/utxo.dto';
 import {
   CHANNEL_ID_PREFIX,
@@ -83,56 +84,66 @@ import {
   normalizeTxsResultFromRecvPacketSuccessAcknowledgement,
 } from '@shared/helpers/block-results';
 import {
+  Event,
   ResponseDeliverTx,
   ResultBlockResults,
   ResultBlockSearch,
-} from '@plus/proto-types/build/ibc/core/types/v1/block';
+} from '@cardano-ibc/proto-types/build/ibc/core/types/v1/block';
 import { ChannelDatum, decodeChannelDatum } from '@shared/types/channel/channel-datum';
 import { getChannelIdByTokenName, getConnectionIdFromConnectionHops } from '@shared/helpers/channel';
 import { getConnectionIdByTokenName } from '@shared/helpers/connection';
 import { UTxO } from '@lucid-evolution/lucid';
-import { bytesFromBase64 } from '@plus/proto-types/build/helpers';
+import { bytesFromBase64 } from '@cardano-ibc/proto-types/build/helpers';
 import { getIdByTokenName } from '@shared/helpers/helper';
-import { decodeMintChannelRedeemer, decodeSpendChannelRedeemer } from '../../shared/types/channel/channel-redeemer';
+import {
+  decodeMintChannelRedeemer,
+  decodeSpendChannelRedeemer,
+  SpendChannelRedeemer,
+} from '../../shared/types/channel/channel-redeemer';
 import {
   decodeMintConnectionRedeemer,
   decodeSpendConnectionRedeemer,
 } from '../../shared/types/connection/connection-redeemer';
 import { decodeIBCModuleRedeemer } from '../../shared/types/port/ibc_module_redeemer';
 import { Packet } from '@shared/types/channel/packet';
-import { decodeMintClientRedeemer, decodeSpendClientRedeemer } from '@shared/types/client-redeemer';
+import { decodeMintClientRedeemer, findSpendClientRedeemer } from '@shared/types/client-redeemer';
 import { validQueryClientStateParam, validQueryConsensusStateParam } from '../helpers/client.validate';
 import { MiniProtocalsService } from '../../shared/modules/mini-protocals/mini-protocals.service';
 import { MithrilService } from '../../shared/modules/mithril/mithril.service';
 import { getNanoseconds } from '../../shared/helpers/time';
+import { operationalCertificatePoolIdBytes } from '../../shared/helpers/ogmios';
 import { doubleToFraction } from '../../shared/helpers/number';
 import {
   normalizeMithrilStakeDistribution,
   normalizeMithrilStakeDistributionCertificate,
 } from '../../shared/helpers/mithril-header';
-import { getCurrentTree, isTreeAligned, alignTreeWithChain } from '../../shared/helpers/ibc-state-root';
+import { IbcTreeStateStore } from '../../shared/helpers/ibc-state-root';
 import { serializeExistenceProof } from '../../shared/helpers/ics23-proof-serialization';
 import {
   QueryDenomRequest,
   QueryDenomResponse,
   QueryDenomsRequest,
   QueryDenomsResponse,
-} from '@plus/proto-types/build/ibc/applications/transfer/v1/query';
-import { Denom, Hop } from '@plus/proto-types/build/ibc/applications/transfer/v1/token';
+} from '@cardano-ibc/proto-types/build/ibc/applications/transfer/v1/query';
+import { Denom, Hop } from '@cardano-ibc/proto-types/build/ibc/applications/transfer/v1/token';
 import { DenomTraceService } from './denom-trace.service';
 import { convertHex2String } from '@shared/helpers/hex';
 import { HISTORY_SERVICE, HistoryBlock, HistoryService } from './history.service';
 import {
   resolveCurrentLiveHostStateTxHeight,
+  assertProofContextHostState,
   resolveProofContextForQuery,
   resolveProofHeightForCurrentRoot,
 } from './proof-context';
 import {
   loadStakeWeightedStabilityEvidenceByHeight,
   loadStakeWeightedStabilityHeaderEvidence,
+  StakeWeightedStabilityHeaderEvidence,
 } from './stability-evidence';
 import { IbcTreeCacheService } from '../../shared/services/ibc-tree-cache.service';
 import { ProofQueryOptions } from '../helpers/query-height';
+import { BoundedCache } from '../../shared/helpers/bounded-cache';
+import { MetricsService } from '../../health/metrics.service';
 
 type ParsedTxRedeemer = {
   type: string;
@@ -167,8 +178,22 @@ type PacketEventQuery = {
 const STABILITY_LATEST_HEIGHT_MAX_ATTEMPTS = 40;
 const STABILITY_LATEST_HEIGHT_DELAY_MS = 2_000;
 const MAX_PROTO_UINT64 = (1n << 64n) - 1n;
+export const TX_REDEEMER_CACHE_MAX_ENTRIES = 1024;
+export const TX_REDEEMER_CACHE_TTL_MS = 60 * 60 * 1000;
+
+const TX_REDEEMER_CACHE_METRIC = 'tx_redeemers';
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function getPacketFromSpendChannelRedeemer(redeemer: SpendChannelRedeemer): Packet | undefined {
+  if (typeof redeemer === 'string') return undefined;
+  if ('RecvPacket' in redeemer) return redeemer.RecvPacket.packet;
+  if ('AcknowledgePacket' in redeemer) return redeemer.AcknowledgePacket.packet;
+  if ('TimeoutPacket' in redeemer) return redeemer.TimeoutPacket.packet;
+  if ('TimeoutOnClose' in redeemer) return redeemer.TimeoutOnClose.packet;
+  if ('SendPacket' in redeemer) return redeemer.SendPacket.packet;
+  return undefined;
+}
 
 function isNonRetryableStabilityLatestHeightError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
@@ -178,10 +203,9 @@ function isNonRetryableStabilityLatestHeightError(error: unknown): boolean {
     message.includes('stake-weighted stability currently supports only current-epoch anchors')
   );
 }
-
 @Injectable()
 export class QueryService {
-  private readonly txRedeemerCache = new Map<string, Promise<ParsedTxRedeemer[]>>();
+  private readonly txRedeemerCache: BoundedCache<string, Promise<ParsedTxRedeemer[]>>;
 
   constructor(
     private readonly logger: Logger,
@@ -193,90 +217,20 @@ export class QueryService {
     @Inject(MithrilService) private mithrilService: MithrilService,
     @Inject(DenomTraceService) private denomTraceService: DenomTraceService,
     @Inject(IbcTreeCacheService) private ibcTreeCacheService: IbcTreeCacheService,
-  ) {}
-
-  /**
-   * Ensure the in-memory ICS-23 Merkle tree is aligned with on-chain state.
-   *
-   * This is part of the Gateway's selfphealing mechanism. After a crash or restart,
-   * No manual intervention is required - this method automatically detects stale state
-   * and triggers a rebuild from on-chain data.
-   *
-   * The Gateway maintains an in-memory Merkle tree for generating ICS-23 proofs.
-   * This tree can become out of sync in several scenarios:
-   *   1. Gateway restarts - the in-memory tree is lost (most common case)
-   *   2. A transaction fails after we speculatively updated the tree (should not happen
-   *      since we work on a clone and only `commit()` after tx is confirmed)
-   *   3. Another Gateway instance (or direct on-chain interaction) modified state
-   *
-   * HOW IT WORKS:
-   * We query the HostState UTXO (identified by a unique NFT in the STT architecture)
-   * and compare its stored ibc_state_root with our in-memory tree's root.
-   * If they don't match, we call alignTreeWithChain() to rebuild from on-chain UTXOs.
-   *
-   * CRASH RECOVERY FLOW:
-   * 1. Gateway restarts -> in-memory tree is empty
-   * 2. First query arrives (e.g., Hermes calls queryClientState)
-   * 3. This method detects root mismatch (empty tree vs on-chain root)
-   * 4. alignTreeWithChain() queries all IBC UTXOs and rebuilds the tree
-   * 5. Proof generation proceeds normally
-   * 6. Subsequent queries find the tree aligned (cheap root comparison)
-   * SCALING NOTE:
-   * The number of live IBC UTXOs is expected to scale roughly as:
-   *   total_live_ibc_utxos = 1 HostState + numClients + numConnections + numChannels
-   * so the raw UTXO scan is not expected to be the dominant scaling issue by itself.
-   * The more likely long-term pressure is datum growth inside those live UTXOs,
-   * especially client consensus states and channel packet maps
-   * (commitments / receipts / acknowledgements), since rebuild cost scales with the
-   * number of reconstructed ICS-24 tree entries, not just the count of live UTXOs.
-   * PERFORMANCE NOTE:
-   * Tree rebuilding is expensive (queries all IBC UTXOs), but it only happens when
-   * the tree is actually stale. In normal operation, this is a cheap root comparison.
-   *
-   * @returns Promise that resolves when tree is aligned (may trigger rebuild)
-   * @throws GrpcInternalException if HostState UTXO is missing or invalid
-   */
-  private async ensureTreeAligned(): Promise<void> {
-    // Query the HostState UTXO to get the authoritative on-chain root.
-    // The HostState UTXO is identified by a unique NFT (STT architecture)
-    // which guarantees exactly one canonical state exists at any time.
-    const hostStateUtxo = await this.lucidService.findUtxoAtHostStateNFT();
-
-    if (!hostStateUtxo?.datum) {
-      // This should never happen in a properly deployed system.
-      // If it does, there's a fundamental issue with the IBC deployment.
-      this.logger.error('HostState UTXO has no datum - cannot verify tree alignment');
-      throw new GrpcInternalException('IBC infrastructure error: HostState UTXO missing datum');
-    }
-
-    // Decode the datum to extract the committed ibc_state_root.
-    // This root is the Merkle commitment over all IBC state (clients, connections, channels, etc.)
-    const hostStateDatum = await this.lucidService.decodeDatum<HostStateDatum>(hostStateUtxo.datum, 'host_state');
-    const onChainRoot = hostStateDatum.state.ibc_state_root;
-
-    // Check if our in-memory tree matches the on-chain commitment.
-    // If it does, we're good to go - proofs generated from our tree will verify correctly.
-    if (isTreeAligned(onChainRoot)) {
-      this.logger.debug(`Tree aligned with on-chain root ${onChainRoot.substring(0, 16)}...`);
-      return;
-    }
-
-    // Tree is stale. This happens after Gateway restart, failed transactions, etc.
-    // We need to rebuild the tree from on-chain UTXOs before we can generate valid proofs.
-    this.logger.warn(
-      `Tree out of sync with on-chain root ${onChainRoot.substring(0, 16)}..., rebuilding from chain...`,
-    );
-
-    // alignTreeWithChain() queries all IBC UTXOs (clients, connections, channels)
-    // and rebuilds the Merkle tree from scratch. This is expensive but necessary.
-    const result = await alignTreeWithChain();
-
-    this.logger.log(`Tree rebuilt successfully, new root: ${result.root.substring(0, 16)}...`);
+    private readonly ibcTreeStore: IbcTreeStateStore,
+    @Optional() @Inject(MetricsService) metricsService?: MetricsService,
+  ) {
+    this.txRedeemerCache = new BoundedCache({
+      maxEntries: TX_REDEEMER_CACHE_MAX_ENTRIES,
+      ttlMs: TX_REDEEMER_CACHE_TTL_MS,
+      onSizeChange: (size) => metricsService?.setCacheEntries(TX_REDEEMER_CACHE_METRIC, size),
+    });
   }
 
   private async getProofHeight(context: string): Promise<bigint> {
     const lightClientMode =
-      this.configService.get<'mithril' | 'stake-weighted-stability'>('cardanoLightClientMode') || 'mithril';
+      this.configService.get<'mithril' | 'stake-weighted-stability'>('cardanoLightClientMode') ||
+      'stake-weighted-stability';
 
     return resolveProofHeightForCurrentRoot({
       logger: this.logger,
@@ -296,6 +250,7 @@ export class QueryService {
       'stake-weighted-stability';
 
     return resolveProofContextForQuery({
+      ibcTreeStore: this.ibcTreeStore,
       logger: this.logger,
       lucidService: this.lucidService,
       mithrilService: this.mithrilService,
@@ -311,10 +266,18 @@ export class QueryService {
 
   private async getTransactionRedeemers(txHash: string): Promise<ParsedTxRedeemer[]> {
     const cacheKey = txHash.toLowerCase();
-    if (!this.txRedeemerCache.has(cacheKey)) {
-      this.txRedeemerCache.set(cacheKey, this.loadTransactionRedeemers(cacheKey));
+    let lookup = this.txRedeemerCache.get(cacheKey);
+    if (!lookup) {
+      lookup = this.loadTransactionRedeemers(cacheKey);
+      this.txRedeemerCache.set(cacheKey, lookup);
     }
-    return this.txRedeemerCache.get(cacheKey)!;
+
+    try {
+      return await lookup;
+    } catch (error) {
+      this.txRedeemerCache.deleteIfValue(cacheKey, lookup);
+      throw error;
+    }
   }
 
   private async loadTransactionRedeemers(txHash: string): Promise<ParsedTxRedeemer[]> {
@@ -473,6 +436,10 @@ export class QueryService {
     if (!height) {
       throw new GrpcInvalidArgumentException('Invalid argument: "height" must be provided');
     }
+    const cardanoChainId = this.configService.get<string>('cardanoChainId');
+    if (!cardanoChainId) {
+      throw new GrpcInternalException('Cardano chain ID is not configured');
+    }
 
     const stabilityEvidence = await loadStakeWeightedStabilityEvidenceByHeight({
       historyService: this.historyService,
@@ -488,6 +455,10 @@ export class QueryService {
       throw new GrpcInternalException('IBC infrastructure error: HostState UTxO missing datum');
     }
 
+    const operationalCertificateCounters = this.toStabilityOperationalCertificateCounters(
+      await this.historyService.findOperationalCertificateCountersAtBlock(stabilityEvidence.anchorBlock),
+    );
+
     const hostStateDatum = await this.lucidService.decodeDatum<HostStateDatum>(hostStateUtxo.datum, 'host_state');
     const hostStateRootBytes = Buffer.from(hostStateDatum.state.ibc_state_root, 'hex');
     const stabilitySlotTiming = this.getStabilitySlotTiming(stabilityEvidence.anchorBlock);
@@ -498,7 +469,7 @@ export class QueryService {
     );
 
     const clientStateProbabilistic: ClientStateProbabilistic = {
-      chain_id: this.configService.get('cardanoChainId'),
+      chain_id: cardanoChainId,
       latest_height: {
         revision_number: 0n,
         revision_height: stabilityEvidence.anchorHeight,
@@ -510,6 +481,10 @@ export class QueryService {
       current_epoch: BigInt(stabilityEvidence.anchorEpoch),
       trusting_period: {
         seconds: BigInt(this.configService.get<number>('cardanoClientTrustingPeriodSeconds') ?? 86_400),
+        nanos: 0,
+      },
+      max_clock_drift: {
+        seconds: BigInt(this.configService.get<number>('cardanoClientMaxClockDriftSeconds') ?? 10),
         nanos: 0,
       },
       upgrade_path: [],
@@ -525,6 +500,22 @@ export class QueryService {
       system_start_unix_ns: stabilitySlotTiming.systemStartUnixNs,
       slot_length_ns: stabilitySlotTiming.slotLengthNs,
       epoch_contexts: [currentEpochContext],
+      active_slot_coefficient_numerator: stabilityEvidence.epochVerificationContext.activeSlotCoefficientNumerator,
+      active_slot_coefficient_denominator: stabilityEvidence.epochVerificationContext.activeSlotCoefficientDenominator,
+      latest_checkpoint_height: {
+        revision_number: 0n,
+        revision_height: stabilityEvidence.anchorHeight,
+      },
+      latest_checkpoint_block_hash: stabilityEvidence.anchorBlock.hash,
+      latest_checkpoint_epoch: BigInt(stabilityEvidence.anchorEpoch),
+      latest_checkpoint_slot: stabilityEvidence.anchorBlock.slotNo,
+      latest_checkpoint_timestamp: stabilityEvidence.anchorBlock.timestampUnixNs,
+      max_kes_evolutions: BigInt(stabilityEvidence.epochVerificationContext.maxKesEvolutions),
+      latest_checkpoint_operational_certificate_counters: operationalCertificateCounters,
+      operational_certificate_counter_history_start_height: {
+        revision_number: 0n,
+        revision_height: BigInt(stabilityEvidence.anchorHeight),
+      },
     };
 
     const consensusStateProbabilistic: ConsensusStateProbabilistic = {
@@ -607,6 +598,9 @@ export class QueryService {
 
   private async getHostStateDatum(): Promise<HostStateDatum> {
     const hostStateUtxo = await this.lucidService.findUtxoAtHostStateNFT();
+    if (!hostStateUtxo?.datum) {
+      throw new GrpcInternalException('IBC infrastructure error: HostState UTxO missing datum');
+    }
     return decodeHostStateDatum(hostStateUtxo.datum, this.lucidService.LucidImporter);
   }
 
@@ -619,6 +613,9 @@ export class QueryService {
       ? await this.historyService.findUtxoByUnitAtOrBeforeBlockNo(clientAuthTokenUnit, queryHeight)
       : await this.lucidService.findUtxoByUnit(clientAuthTokenUnit);
 
+    if (!spendClientUTXO.datum) {
+      throw new GrpcInternalException(`IBC infrastructure error: client ${clientId} UTxO missing datum`);
+    }
     const clientDatum = await decodeClientDatum(spendClientUTXO.datum, this.lucidService.LucidImporter);
     return [clientDatum, spendClientUTXO];
   }
@@ -640,9 +637,9 @@ export class QueryService {
         const clientId = clientSequence.toString();
         const [clientDatum] = await this.getClientDatum(clientId);
 
-        // At the moment Cardano only hosts Tendermint clients. Mithril clients are
-        // hosted on the Cosmos side, not on Cardano, so the batch response can use
-        // the canonical Tendermint type URL and `07-tendermint-<n>` identifier form.
+        // Cardano currently hosts only Tendermint clients. Cardano-specific clients
+        // (`08-cardano-probabilistic` and the deprecated Mithril type) are hosted on
+        // counterparty chains, so this response uses the canonical Tendermint type URL.
         const clientStateTendermint = normalizeClientStateFromDatum(clientDatum.state.clientState);
         const clientStateAny: Any = {
           type_url: '/ibc.lightclients.tendermint.v1.ClientState',
@@ -690,7 +687,7 @@ export class QueryService {
     const proofContext = await this.getProofContext('queryClientState', options.queryHeight);
     const [clientDatum, spendClientUTXO] = await this.getClientDatum(
       clientId,
-      proofContext.historical ? proofContext.proofHeight : undefined,
+      proofContext.proofHeight,
     );
     this.logger.debug(
       `[queryClientState] loaded client UTxO ${spendClientUTXO.txHash}#${spendClientUTXO.outputIndex} in ${Date.now() - startedAt}ms`,
@@ -707,13 +704,8 @@ export class QueryService {
     // `clientId` here is the sequence number after prefix stripping.
     const ibcPath = `clients/07-tendermint-${clientId}/clientState`;
 
-    if (!proofContext.historical) {
-      const treeAlignmentStartedAt = Date.now();
-      await this.ensureTreeAligned();
-      this.logger.debug(`[queryClientState] tree alignment completed in ${Date.now() - treeAlignmentStartedAt}ms`);
-    }
-
-    const tree = proofContext.historical ? proofContext.tree : getCurrentTree();
+    await assertProofContextHostState(proofContext, this.historyService, this.lucidService);
+    const tree = proofContext.tree;
 
     let clientProof: Buffer;
     try {
@@ -764,7 +756,7 @@ export class QueryService {
     const proofContext = await this.getProofContext('queryConsensusState', options.queryHeight);
     const [clientDatum] = await this.getClientDatum(
       clientId,
-      proofContext.historical ? proofContext.proofHeight : undefined,
+      proofContext.proofHeight,
     );
 
     // Consensus height: identifies which consensus state entry to retrieve
@@ -788,11 +780,8 @@ export class QueryService {
     // Generate ICS-23 proof from the IBC state tree.
     const ibcPath = `clients/07-tendermint-${clientId}/consensusStates/${heightReq}`;
 
-    if (!proofContext.historical) {
-      await this.ensureTreeAligned();
-    }
-
-    const tree = proofContext.historical ? proofContext.tree : getCurrentTree();
+    await assertProofContextHostState(proofContext, this.historyService, this.lucidService);
+    const tree = proofContext.tree;
 
     let consensusProof: Buffer;
     try {
@@ -933,11 +922,12 @@ export class QueryService {
         try {
           // Reuse existing queryBlockResults logic
           const blockResult = await this.queryBlockResults({ height: BigInt(height) });
+          const txResults = blockResult.block_results?.txs_results ?? [];
 
-          if (blockResult.block_results.txs_results.length > 0) {
+          if (txResults.length > 0) {
             blockEvents.push({
               height: BigInt(height),
-              events: blockResult.block_results.txs_results,
+              events: txResults,
             });
           }
         } catch (err) {
@@ -1149,8 +1139,15 @@ export class QueryService {
               }
             }
 
-            const recvPacket = spendRedeemer['RecvPacket']?.packet as Packet | undefined;
-            if (recvPacket && !hasWriteAckEvent && channelDatumDecoded.state.packet_acknowledgement.has(recvPacket.sequence)) {
+            const recvPacket =
+              typeof spendRedeemer !== 'string' && 'RecvPacket' in spendRedeemer
+                ? spendRedeemer.RecvPacket.packet
+                : undefined;
+            if (
+              recvPacket &&
+              !hasWriteAckEvent &&
+              channelDatumDecoded.state.packet_acknowledgement.has(recvPacket.sequence)
+            ) {
               const writeAckTxsResult = normalizeTxsResultFromRecvPacketSuccessAcknowledgement(
                 spendRedeemer,
                 channelDatumDecoded,
@@ -1163,6 +1160,10 @@ export class QueryService {
             txsResult.events = packetEvent.events;
           }
           if (spendRedeemer.hasOwnProperty('TimeoutPacket')) {
+            const packetEvent = normalizeTxsResultFromChannelRedeemer(spendRedeemer, channelDatumDecoded);
+            txsResult.events = packetEvent.events;
+          }
+          if (spendRedeemer.hasOwnProperty('TimeoutOnClose')) {
             const packetEvent = normalizeTxsResultFromChannelRedeemer(spendRedeemer, channelDatumDecoded);
             txsResult.events = packetEvent.events;
           }
@@ -1199,6 +1200,7 @@ export class QueryService {
         .filter((utxo) => [mintClientScriptHash].includes(utxo.assetsPolicy))
         .map(async (clientUtxo) => {
           const clientId = getIdByTokenName(clientUtxo.assetsName, tokenBase, CLIENT_PREFIX);
+          if (!clientUtxo.datum) return null;
           let clientDatum: ClientDatum;
           try {
             clientDatum = await decodeClientDatum(clientUtxo.datum, this.lucidService.LucidImporter);
@@ -1217,24 +1219,18 @@ export class QueryService {
               }
             });
           const eventClient = hasMintClientRedeemer ? EVENT_TYPE_CLIENT.CREATE_CLIENT : EVENT_TYPE_CLIENT.UPDATE_CLIENT;
-          const spendClientRedeemer = redeemers.find((e) => e.type == 'spend');
-          let spendClientRedeemerData = null;
-          if (spendClientRedeemer) {
-            try {
-              spendClientRedeemerData = decodeSpendClientRedeemer(
-                spendClientRedeemer.data,
-                this.lucidService.LucidImporter,
-              );
-            } catch {
-              spendClientRedeemerData = null;
-            }
-          }
+          const spendClientRedeemerData = findSpendClientRedeemer(redeemers, this.lucidService.LucidImporter);
+          const substituteClientId =
+            typeof spendClientRedeemerData === 'object' && 'RecoverClient' in spendClientRedeemerData
+              ? getIdByTokenName(spendClientRedeemerData.RecoverClient.substitute_token.name, tokenBase, CLIENT_PREFIX)
+              : undefined;
 
           const txsResult = normalizeTxsResultFromClientDatum(
             clientDatum,
             eventClient,
             clientId,
             spendClientRedeemerData,
+            substituteClientId,
           );
           return txsResult as unknown as ResponseDeliverTx;
         }),
@@ -1265,13 +1261,13 @@ export class QueryService {
     return Object.values(EVENT_TYPE_PACKET).includes(type);
   }
 
-  private mapPacketEvent(txHash: string, height: number, event: any): IndexedPacketEvent | null {
+  private mapPacketEvent(txHash: string, height: number, event: Event): IndexedPacketEvent | null {
     if (!this.isPacketEventType(event.type)) return null;
 
     // Keep malformed packet events visible while omitting the normalized packet summary.
-    const attributes = (event.event_attribute || []).reduce((acc: Record<string, string>, attr: any) => {
-      if (attr?.key === undefined) return acc;
-      acc[String(attr.key)] = attr?.value === undefined ? '' : String(attr.value);
+    const attributes = (event.event_attribute || []).reduce((acc: Record<string, string>, attr) => {
+      if (attr.key === undefined) return acc;
+      acc[String(attr.key)] = attr.value === undefined ? '' : String(attr.value);
       return acc;
     }, {});
 
@@ -1428,11 +1424,11 @@ export class QueryService {
       const hostStateNFT = deploymentConfig.hostStateNFT as unknown as AuthToken;
       const mintChannelScriptHash = deploymentConfig.validators.mintChannelStt.scriptHash;
       const spendAddress = deploymentConfig.validators.spendChannel.address;
-      if (!request.packet_src_channel.startsWith(`${CHANNEL_ID_PREFIX}-`))
+      if (!srcChannelId?.startsWith(`${CHANNEL_ID_PREFIX}-`))
         throw new GrpcInvalidArgumentException(
           `Invalid argument: "packet_src_channel". Please use the prefix "${CHANNEL_ID_PREFIX}-"`,
         );
-      if (!request.packet_dst_channel.startsWith(`${CHANNEL_ID_PREFIX}-`))
+      if (!dstChannelId?.startsWith(`${CHANNEL_ID_PREFIX}-`))
         throw new GrpcInvalidArgumentException(
           `Invalid argument: "packet_dst_channel". Please use the prefix "${CHANNEL_ID_PREFIX}-"`,
         );
@@ -1461,7 +1457,7 @@ export class QueryService {
       }
 
       const utxosOfChannel = Array.from(utxosByRef.values());
-      let blockResults: ResultBlockSearch[] = await Promise.all(
+      const blockSearchResults = await Promise.all(
         utxosOfChannel.map(async (utxo) => {
           let redeemers = await this.getTransactionRedeemers(utxo.txHash);
           redeemers = redeemers.filter(
@@ -1476,12 +1472,7 @@ export class QueryService {
             } catch {
               continue;
             }
-            let packet: Packet = null;
-            if (spendRedeemer['RecvPacket']) packet = spendRedeemer['RecvPacket']?.packet as unknown as Packet;
-            if (spendRedeemer['AcknowledgePacket'])
-              packet = spendRedeemer['AcknowledgePacket']?.packet as unknown as Packet;
-            if (spendRedeemer['TimeoutPacket']) packet = spendRedeemer['TimeoutPacket']?.packet as unknown as Packet;
-            if (spendRedeemer['SendPacket']) packet = spendRedeemer['SendPacket']?.packet as unknown as Packet;
+            const packet = getPacketFromSpendChannelRedeemer(spendRedeemer);
             if (!packet) continue;
             const packetSourceChannel = convertHex2String(packet.source_channel);
             const packetDestinationChannel = convertHex2String(packet.destination_channel);
@@ -1506,7 +1497,7 @@ export class QueryService {
           } as unknown as ResultBlockSearch;
         }),
       );
-      blockResults = blockResults.filter((e) => e);
+      const blockResults = blockSearchResults.filter((result): result is ResultBlockSearch => result !== null);
       const totalCount = blockResults.length;
       let blockResultsResp = blockResults;
       if (blockResults.length > limit) {
@@ -1829,17 +1820,101 @@ export class QueryService {
     }
     const effectiveTrustedHeight = this.normalizeStabilityTrustedHeight(BigInt(trustedHeight), BigInt(height));
 
-    const stabilityEvidence = await loadStakeWeightedStabilityHeaderEvidence({
-      historyService: this.historyService,
-      height: BigInt(height),
-      trustedHeight: effectiveTrustedHeight,
-      logger: this.logger,
-    });
+    const stabilityHeader = await this.buildBoundedStabilityHeader(effectiveTrustedHeight, BigInt(height));
 
-    const hostStateUtxo = await this.findExactStabilityAnchorHostStateUtxo(
-      stabilityEvidence.anchorHeight,
-      'header generation',
+    return {
+      header: {
+        type_url: '/ibc.lightclients.probabilistic.v1.ProbabilisticHeader',
+        value: ProbabilisticHeader.encode(stabilityHeader).finish(),
+      },
+    };
+  }
+
+  private async buildBoundedStabilityHeader(trustedHeight: bigint, targetHeight: bigint): Promise<ProbabilisticHeader> {
+    const targetDistance = targetHeight - trustedHeight;
+    if (targetDistance <= 0n) {
+      throw new GrpcInvalidArgumentException(
+        `Invalid stability header request: trusted height ${trustedHeight.toString()} must be less than target height ${targetHeight.toString()}`,
+      );
+    }
+
+    const maxBridgeBlocks = this.getStabilityCheckpointMaxBridgeBlocks();
+    const maxHeaderBytes = this.getStabilityCheckpointMaxHeaderBytes();
+    const maxAdvance = BigInt(maxBridgeBlocks) + 1n;
+    let candidateDistance = targetDistance < maxAdvance ? targetDistance : maxAdvance;
+
+    while (candidateDistance >= 1n) {
+      const candidateHeight = trustedHeight + candidateDistance;
+      const isCheckpoint = candidateHeight < targetHeight;
+
+      let stabilityEvidence: StakeWeightedStabilityHeaderEvidence;
+      try {
+        stabilityEvidence = await loadStakeWeightedStabilityHeaderEvidence({
+          historyService: this.historyService,
+          height: candidateHeight,
+          trustedHeight,
+          logger: this.logger,
+        });
+      } catch (error) {
+        if (isCheckpoint && candidateDistance > 1n && this.isRecoverableCheckpointCandidateError(error)) {
+          candidateDistance -= 1n;
+          continue;
+        }
+        throw error;
+      }
+
+      const stabilityHeader = await this.buildStabilityHeader(stabilityEvidence, isCheckpoint);
+      const encodedHeaderBytes = ProbabilisticHeader.encode(stabilityHeader).finish().length;
+      if (encodedHeaderBytes <= maxHeaderBytes) {
+        if (isCheckpoint) {
+          this.logger.log(
+            `Returning rootless stability checkpoint ${trustedHeight.toString()} -> ${stabilityEvidence.anchorHeight.toString()} while catching up to ${targetHeight.toString()} (${encodedHeaderBytes} bytes)`,
+          );
+        }
+        return stabilityHeader;
+      }
+
+      this.logger.warn(
+        `Stability ${isCheckpoint ? 'checkpoint' : 'root-bearing'} header ${trustedHeight.toString()} -> ${stabilityEvidence.anchorHeight.toString()} is ${encodedHeaderBytes} bytes, above the configured ${maxHeaderBytes}-byte limit`,
+      );
+
+      if (candidateDistance === 1n || targetDistance === 1n) {
+        throw new GrpcFailedPreconditionException(
+          gatewayGrpcError(
+            GATEWAY_GRPC_ERROR_CODE.HEIGHT_NOT_ACCEPTED,
+            `Even the smallest stability update from height ${trustedHeight.toString()} is ${encodedHeaderBytes} bytes, above the configured ${maxHeaderBytes}-byte checkpoint limit`,
+            {
+              trustedHeight: trustedHeight.toString(),
+              targetHeight: targetHeight.toString(),
+              encodedHeaderBytes,
+              maxHeaderBytes,
+            },
+          ),
+        );
+      }
+
+      const proportionalDistance = Math.max(
+        1,
+        Math.floor((Number(candidateDistance) * maxHeaderBytes) / encodedHeaderBytes),
+      );
+      candidateDistance = BigInt(Math.min(Number(candidateDistance - 1n), proportionalDistance));
+    }
+
+    throw new GrpcFailedPreconditionException(
+      gatewayGrpcError(
+        GATEWAY_GRPC_ERROR_CODE.HEIGHT_NOT_ACCEPTED,
+        `Unable to construct a bounded stability checkpoint after height ${trustedHeight.toString()}`,
+      ),
     );
+  }
+
+  private async buildStabilityHeader(
+    stabilityEvidence: StakeWeightedStabilityHeaderEvidence,
+    isCheckpoint: boolean,
+  ): Promise<ProbabilisticHeader> {
+    const hostStateUtxo = isCheckpoint
+      ? undefined
+      : await this.findExactStabilityAnchorHostStateUtxo(stabilityEvidence.anchorHeight, 'header generation');
     const requestedBlocks = [
       ...stabilityEvidence.bridgeBlocks,
       stabilityEvidence.anchorBlock,
@@ -1848,6 +1923,18 @@ export class QueryService {
     const blockWitnesses = await this.miniProtocalsService.fetchBlocksCbor(requestedBlocks);
     const blockWitnessByHeight = new Map<number, Buffer>(
       requestedBlocks.map((block, index) => [block.height, blockWitnesses[index]]),
+    );
+    const headerWitnessBlocks = isCheckpoint
+      ? requestedBlocks
+      : [...stabilityEvidence.bridgeBlocks, ...stabilityEvidence.descendantBlocks];
+    const headerWitnessByHeight = new Map<number, Buffer>(
+      headerWitnessBlocks.map((block) => {
+        const blockCbor = blockWitnessByHeight.get(block.height);
+        if (!blockCbor) {
+          throw new GrpcInternalException(`Missing Cardano block witness at height ${block.height}`);
+        }
+        return [block.height, this.miniProtocalsService.extractBlockHeaderCbor(blockCbor, block.hash)];
+      }),
     );
 
     const newEpochContext =
@@ -1866,18 +1953,24 @@ export class QueryService {
       },
       anchor_block: this.toStabilityBlock(
         stabilityEvidence.anchorBlock,
-        blockWitnessByHeight.get(stabilityEvidence.anchorBlock.height),
+        isCheckpoint ? undefined : blockWitnessByHeight.get(stabilityEvidence.anchorBlock.height),
+        isCheckpoint ? headerWitnessByHeight.get(stabilityEvidence.anchorBlock.height) : undefined,
       ),
       bridge_blocks: stabilityEvidence.bridgeBlocks.map((block) =>
-        this.toStabilityBlock(block, blockWitnessByHeight.get(block.height)),
+        this.toStabilityBlock(block, undefined, headerWitnessByHeight.get(block.height)),
       ),
       descendant_blocks: stabilityEvidence.descendantBlocks.map((block) =>
-        this.toStabilityBlock(block, blockWitnessByHeight.get(block.height)),
+        this.toStabilityBlock(block, undefined, headerWitnessByHeight.get(block.height)),
       ),
-      host_state_tx_hash: hostStateUtxo.txHash,
-      host_state_tx_output_index: hostStateUtxo.outputIndex,
+      host_state_tx_hash: hostStateUtxo?.txHash ?? '',
+      host_state_tx_output_index: hostStateUtxo?.outputIndex ?? 0,
       new_epoch_context: newEpochContext,
+      is_checkpoint: isCheckpoint,
     };
+
+    if (isCheckpoint) {
+      stabilityHeader.host_state_tx_hash = '';
+    }
 
     if (newEpochContext) {
       const newEpochContextBytes = ProbabilisticEpochContext.encode(newEpochContext).finish().length;
@@ -1887,12 +1980,32 @@ export class QueryService {
       );
     }
 
-    return {
-      header: {
-        type_url: '/ibc.lightclients.probabilistic.v1.ProbabilisticHeader',
-        value: ProbabilisticHeader.encode(stabilityHeader).finish(),
-      },
-    };
+    return stabilityHeader;
+  }
+
+  private getStabilityCheckpointMaxBridgeBlocks(): number {
+    const value = this.configService.get<number>('cardanoStabilityCheckpointMaxBridgeBlocks') ?? 32;
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new GrpcInternalException('Invalid Cardano stability checkpoint bridge-block limit');
+    }
+    return value;
+  }
+
+  private getStabilityCheckpointMaxHeaderBytes(): number {
+    const value = this.configService.get<number>('cardanoStabilityCheckpointMaxHeaderBytes') ?? 768 * 1024;
+    if (!Number.isSafeInteger(value) || value <= 0) {
+      throw new GrpcInternalException('Invalid Cardano stability checkpoint header-size limit');
+    }
+    return value;
+  }
+
+  private isRecoverableCheckpointCandidateError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    return (
+      message.includes(GATEWAY_GRPC_ERROR_CODE.HEIGHT_NOT_ACCEPTED) ||
+      message.includes('stability thresholds not met') ||
+      message.includes('crosses epoch boundary')
+    );
   }
 
   /**
@@ -1964,8 +2077,12 @@ export class QueryService {
     systemStartUnixNs: bigint;
     slotLengthNs: bigint;
   } {
-    const network = this.configService.get('cardanoNetwork');
-    const slotConfig = this.lucidService.LucidImporter.SLOT_CONFIG_NETWORK?.[network];
+    const network = this.configService.get<string>('cardanoNetwork');
+    const slotConfigs = this.lucidService.LucidImporter.SLOT_CONFIG_NETWORK;
+    const slotConfig =
+      network && slotConfigs && Object.prototype.hasOwnProperty.call(slotConfigs, network)
+        ? slotConfigs[network as keyof typeof slotConfigs]
+        : undefined;
     if (
       !slotConfig ||
       !Number.isFinite(slotConfig.zeroTime) ||
@@ -2003,11 +2120,14 @@ export class QueryService {
       poolId: string;
       stake: bigint;
       vrfKeyHash: string;
+      relativeStakeNumerator: bigint;
+      relativeStakeDenominator: bigint;
       firstRegistrationSlot?: bigint | null;
     }>,
     verificationContext: {
       epochNonce: string;
       slotsPerKesPeriod: number;
+      maxKesEvolutions: number;
       currentEpochStartSlot: bigint;
       currentEpochEndSlotExclusive: bigint;
     },
@@ -2020,6 +2140,14 @@ export class QueryService {
           stake: this.toProtoUint64(entry.stake, `stake_distribution[${entry.poolId}].stake`),
           vrf_key_hash: Buffer.from(entry.vrfKeyHash, 'hex'),
           first_registration_slot: entry.firstRegistrationSlot ?? 0n,
+          relative_stake_numerator: this.toProtoUint64(
+            entry.relativeStakeNumerator,
+            `stake_distribution[${entry.poolId}].relative_stake_numerator`,
+          ),
+          relative_stake_denominator: this.toProtoUint64(
+            entry.relativeStakeDenominator,
+            `stake_distribution[${entry.poolId}].relative_stake_denominator`,
+          ),
         }),
       ),
       epoch_nonce: Buffer.from(verificationContext.epochNonce, 'hex'),
@@ -2029,7 +2157,31 @@ export class QueryService {
     };
   }
 
-  private toStabilityBlock(block: HistoryBlock, blockCbor?: Buffer): ProbabilisticBlock {
+  private toStabilityOperationalCertificateCounters(counters: Map<string, bigint>): OperationalCertificateCounter[] {
+    if (!(counters instanceof Map)) {
+      throw new GrpcInternalException(
+        'IBC infrastructure error: operational certificate counter snapshot is unavailable',
+      );
+    }
+
+    return [...counters.entries()]
+      .filter(([, sequenceNumber]) => sequenceNumber !== 0n)
+      .map(([poolId, sequenceNumber]) => ({
+        poolId,
+        poolIdBytes: operationalCertificatePoolIdBytes(poolId),
+        sequenceNumber,
+      }))
+      .sort((left, right) => Buffer.compare(left.poolIdBytes, right.poolIdBytes))
+      .map(({ poolId, poolIdBytes, sequenceNumber }) => ({
+        pool_id: poolIdBytes,
+        sequence_number: this.toProtoUint64(
+          sequenceNumber,
+          `operational_certificate_counters[${poolId}].sequence_number`,
+        ),
+      }));
+  }
+
+  private toStabilityBlock(block: HistoryBlock, blockCbor?: Buffer, headerCbor?: Buffer): ProbabilisticBlock {
     return {
       height: {
         revision_number: 0n,
@@ -2039,7 +2191,8 @@ export class QueryService {
       hash: block.hash,
       epoch: BigInt(block.epochNo),
       timestamp: block.timestampUnixNs,
-      block_cbor: blockCbor,
+      block_cbor: blockCbor ?? new Uint8Array(),
+      header_cbor: headerCbor ?? new Uint8Array(),
     };
   }
 

@@ -1,8 +1,19 @@
 import * as Lucid from '@lucid-evolution/lucid';
-import { encodeMintChannelRedeemer, encodeSpendChannelRedeemer } from './channel/channel-redeemer';
+import {
+  decodeSpendChannelRedeemer,
+  encodeMintChannelRedeemer,
+  encodeSpendChannelRedeemer,
+} from './channel/channel-redeemer';
 import { encodeMintConnectionRedeemer, encodeSpendConnectionRedeemer } from './connection/connection-redeemer';
 import { encodeVerifyProofRedeemer } from './connection/verify-proof-redeemer';
-import { encodeIBCModuleRedeemer } from './port/ibc_module_redeemer';
+import {
+  decodeTransferIBCModuleRedeemer,
+  encodeTransferIBCModuleRedeemer,
+  TransferIBCModuleRedeemer,
+} from './apps/transfer/transfer-ibc-module-redeemer';
+import { decodeIBCModuleRedeemer, encodeIBCModuleRedeemer } from './port/ibc_module_redeemer';
+import { decodeSpendClientRedeemer, encodeSpendClientRedeemer, findSpendClientRedeemer } from './client-redeemer';
+import { encodeRecoverClientWithdrawalRedeemer } from './recover-client-redeemer';
 
 const EMPTY_PROOF = { proofs: [] } as const;
 const HEIGHT = { revisionNumber: 0n, revisionHeight: 11n } as const;
@@ -21,6 +32,34 @@ const PACKET = {
 const MITHRIL_CLIENT_STATE_HEX = 'aabbccdd';
 
 describe('Redeemer encoding regression', () => {
+  it('keeps client recovery constructors aligned with Aiken', async () => {
+    const subjectToken = { policyId: '11'.repeat(28), name: 'aa' };
+    const substituteToken = { policyId: '22'.repeat(28), name: 'bb' };
+    const spendRedeemer = { RecoverClient: { substitute_token: substituteToken } } as const;
+    const withdrawalRedeemer = {
+      RecoverClientWithdrawal: {
+        subject_token: subjectToken,
+        substitute_token: substituteToken,
+      },
+    } as const;
+
+    const encodedSpend = await encodeSpendClientRedeemer(spendRedeemer, Lucid);
+    const encodedWithdrawal = encodeRecoverClientWithdrawalRedeemer(withdrawalRedeemer, Lucid);
+
+    expect(encodedSpend.startsWith('d87a')).toBe(true);
+    expect(encodedWithdrawal.startsWith('d879')).toBe(true);
+    expect(decodeSpendClientRedeemer(encodedSpend, Lucid)).toEqual(spendRedeemer);
+    expect(
+      findSpendClientRedeemer(
+        [
+          { type: 'spend', data: 'd9050380' },
+          { type: 'spend', data: encodedSpend },
+        ],
+        Lucid,
+      ),
+    ).toEqual(spendRedeemer);
+  });
+
   it('keeps MintChannel redeemer encoding stable', async () => {
     const encoded = await encodeMintChannelRedeemer(
       {
@@ -50,6 +89,40 @@ describe('Redeemer encoding regression', () => {
     );
 
     expect(encoded).toBe('d87d84d8798803487472616e73666572496368616e6e656c2d30487472616e73666572496368616e6e656c2d31427b7dd8798200186300426f6bd8798180d87982000b');
+  });
+
+  it('appends PrunePacketHistory after all existing SpendChannel constructors', async () => {
+    const redeemer = {
+      PrunePacketHistory: {
+        sequence: 3n,
+        proof_commitment_absence: EMPTY_PROOF as any,
+        proof_height: HEIGHT,
+      },
+    } as const;
+
+    const encoded = await encodeSpendChannelRedeemer(redeemer, Lucid);
+
+    expect(encoded).toBe('d905018303d8798180d87982000b');
+    expect(decodeSpendChannelRedeemer(encoded, Lucid)).toEqual(redeemer);
+  });
+
+  it('appends TimeoutOnClose after all existing SpendChannel constructors', async () => {
+    const redeemer = {
+      TimeoutOnClose: {
+        packet: PACKET,
+        proof_unreceived: EMPTY_PROOF,
+        proof_close: EMPTY_PROOF,
+        proof_height: HEIGHT,
+        next_sequence_recv: 2n,
+      },
+    } as const;
+
+    const encoded = await encodeSpendChannelRedeemer(redeemer as any, Lucid);
+
+    expect(encoded).toBe(
+      'd9050285d8798803487472616e73666572496368616e6e656c2d30487472616e73666572496368616e6e656c2d31427b7dd8798200186300d8798180d8798180d87982000b02',
+    );
+    expect(decodeSpendChannelRedeemer(encoded, Lucid)).toEqual(redeemer);
   });
 
   it('keeps MintConnection redeemer encoding stable', async () => {
@@ -116,6 +189,20 @@ describe('Redeemer encoding regression', () => {
     );
   });
 
+  it('appends the mixed proof batch after VerifyOther', () => {
+    const encoded = encodeVerifyProofRedeemer(
+      {
+        BatchVerifyMembershipAndNonMembership: {
+          memberships: [],
+          non_memberships: [],
+        },
+      },
+      Lucid,
+    );
+
+    expect(encoded).toBe('d87d828080');
+  });
+
   it('encodes channel close-confirm module callback with the close-confirm constructor', async () => {
     const encoded = await encodeIBCModuleRedeemer(
       {
@@ -131,5 +218,62 @@ describe('Redeemer encoding regression', () => {
     );
 
     expect(encoded).toBe('d87981d87e81496368616e6e656c2d30');
+  });
+
+  it('round-trips the packet bytes authenticated by a receive callback', async () => {
+    const redeemer = {
+      Callback: [
+        {
+          OnRecvPacket: {
+            channel_id: PACKET.destination_channel,
+            packet_data: PACKET.data,
+            acknowledgement: {
+              response: {
+                AcknowledgementResult: {
+                  result: '01',
+                },
+              },
+            },
+            data: 'OtherModuleData' as const,
+          },
+        },
+      ],
+    };
+
+    const encoded = await encodeIBCModuleRedeemer(redeemer, Lucid);
+
+    expect(decodeIBCModuleRedeemer(encoded, Lucid)).toEqual(redeemer);
+  });
+
+  it('keeps the transfer callback CBOR stable behind the opaque module envelope', async () => {
+    const redeemer: TransferIBCModuleRedeemer = {
+      Callback: [
+        {
+          OnSendPacket: {
+            channel_id: PACKET.source_channel,
+            packet_data: PACKET.data,
+            packet_commitment: 'aabb',
+            data: {
+              ModuleDataV1: [
+                {
+                  denom: '75616461',
+                  amount: '31',
+                  sender: 'aa',
+                  receiver: 'bb',
+                  memo: '',
+                },
+              ],
+            },
+          },
+        },
+      ],
+    };
+
+    const encoded = await encodeTransferIBCModuleRedeemer(redeemer, Lucid);
+
+    expect(encoded).toBe(
+      'd87981d9050284496368616e6e656c2d30427b7d42aabbd87981d879854475616461413141aa41bb40',
+    );
+    expect(decodeTransferIBCModuleRedeemer(encoded, Lucid)).toEqual(redeemer);
   });
 });

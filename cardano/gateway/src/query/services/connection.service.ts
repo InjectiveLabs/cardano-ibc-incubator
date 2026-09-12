@@ -4,7 +4,12 @@ import { ConnectionDatum, decodeConnectionDatum } from 'src/shared/types/connect
 import { LucidService } from 'src/shared/modules/lucid/lucid.service';
 import { KupoService } from '../../shared/modules/kupo/kupo.service';
 
-import { CONNECTION_ID_PREFIX, CONNECTION_TOKEN_PREFIX, STATE_MAPPING_CONNECTION } from '../../constant';
+import {
+  CLIENT_ID_PREFIX,
+  CONNECTION_ID_PREFIX,
+  CONNECTION_TOKEN_PREFIX,
+  STATE_MAPPING_CONNECTION,
+} from '../../constant';
 import {
   QueryClientConnectionsRequest,
   QueryClientConnectionsResponse,
@@ -12,7 +17,7 @@ import {
   QueryConnectionResponse,
   QueryConnectionsRequest,
   QueryConnectionsResponse,
-} from '@plus/proto-types/build/ibc/core/connection/v1/query';
+} from '@cardano-ibc/proto-types/build/ibc/core/connection/v1/query';
 import { decodePaginationKey, generatePaginationKey, getPaginationParams } from '../../shared/helpers/pagination';
 import { PaginationKeyDto } from '../dtos/pagination.dto';
 import { AuthToken } from '../../shared/types/auth-token';
@@ -21,18 +26,21 @@ import {
   IdentifiedConnection,
   State as StateConnectionEnd,
   stateFromJSON,
-} from '@plus/proto-types/build/ibc/core/connection/v1/connection';
+} from '@cardano-ibc/proto-types/build/ibc/core/connection/v1/connection';
 import { getConnectionIdByTokenName } from '../../shared/helpers/connection';
 import { validPagination } from '../helpers/helper';
 import { convertHex2String, fromHex } from '../../shared/helpers/hex';
 import { validQueryConnectionParam } from '../helpers/connection.validate';
 import { MithrilService } from '../../shared/modules/mithril/mithril.service';
-import { GrpcInternalException, GrpcInvalidArgumentException } from '~@/exception/grpc_exceptions';
-import { alignTreeWithChain, getCurrentTree, isTreeAligned } from '../../shared/helpers/ibc-state-root';
+import {
+  GrpcInternalException,
+  GrpcInvalidArgumentException,
+  GrpcNotFoundException,
+} from '~@/exception/grpc_exceptions';
+import { IbcTreeStateStore } from '../../shared/helpers/ibc-state-root';
 import { serializeExistenceProof } from '../../shared/helpers/ics23-proof-serialization';
-import { HostStateDatum } from '../../shared/types/host-state-datum';
 import { HISTORY_SERVICE, HistoryService } from './history.service';
-import { resolveProofContextForQuery, resolveProofHeightForCurrentRoot } from './proof-context';
+import { assertProofContextHostState, resolveProofContextForQuery, resolveProofHeightForCurrentRoot } from './proof-context';
 import { IbcTreeCacheService } from '../../shared/services/ibc-tree-cache.service';
 import { ProofQueryOptions } from '../helpers/query-height';
 
@@ -46,23 +54,8 @@ export class ConnectionService {
     @Inject(MithrilService) private mithrilService: MithrilService,
     @Inject(HISTORY_SERVICE) private historyService: HistoryService,
     @Inject(IbcTreeCacheService) private ibcTreeCacheService: IbcTreeCacheService,
+    private readonly ibcTreeStore: IbcTreeStateStore,
   ) {}
-
-  private async ensureTreeAligned(): Promise<void> {
-    const hostStateUtxo = await this.lucidService.findUtxoAtHostStateNFT();
-    if (!hostStateUtxo?.datum) {
-      throw new GrpcInternalException('IBC infrastructure error: HostState UTxO missing datum');
-    }
-    const hostStateDatum = await this.lucidService.decodeDatum<HostStateDatum>(hostStateUtxo.datum, 'host_state');
-    const onChainRoot = hostStateDatum.state.ibc_state_root;
-
-    if (isTreeAligned(onChainRoot)) return;
-
-    this.logger.warn(
-      `Tree out of sync with on-chain root ${onChainRoot.substring(0, 16)}..., rebuilding from chain...`,
-    );
-    await alignTreeWithChain();
-  }
 
   private async getQueryHeight(): Promise<bigint> {
     try {
@@ -92,6 +85,7 @@ export class ConnectionService {
       'stake-weighted-stability';
 
     return resolveProofContextForQuery({
+      ibcTreeStore: this.ibcTreeStore,
       logger: this.logger,
       lucidService: this.lucidService,
       mithrilService: this.mithrilService,
@@ -103,24 +97,16 @@ export class ConnectionService {
     });
   }
 
-  private async findConnectionUtxo(connectionTokenUnit: string) {
-    const deploymentConfig = this.configService.get('deployment');
-    return this.lucidService.findUtxoAtWithUnit(
-      deploymentConfig.validators.spendConnection.address,
-      connectionTokenUnit,
-    );
-  }
-
   async queryConnections(request: QueryConnectionsRequest): Promise<QueryConnectionsResponse> {
     this.logger.log('', 'queryConnections');
     const pagination = getPaginationParams(validPagination(request.pagination));
     const {
-      'pagination.key': key,
-      'pagination.limit': limit,
-      'pagination.count_total': count_total,
-      'pagination.reverse': reverse,
+      'pagination.key': key = '',
+      'pagination.limit': limit = '100',
+      'pagination.count_total': count_total = false,
+      'pagination.reverse': reverse = false,
     } = pagination;
-    let { 'pagination.offset': offset } = pagination;
+    let { 'pagination.offset': offset = '0' } = pagination;
     if (key) offset = decodePaginationKey(key);
 
     const deploymentConfig = this.configService.get('deployment');
@@ -175,11 +161,14 @@ export class ConnectionService {
       }),
     );
 
-    const connectionFilters = identifiedConnections.reduce((accumulator, currentValue) => {
-      const key = `${currentValue.client_id}_${currentValue.id}`;
-      if (!accumulator[key] || accumulator[key].state < currentValue.state) accumulator[key] = currentValue;
-      return accumulator;
-    }, {});
+    const connectionFilters = identifiedConnections.reduce<Record<string, IdentifiedConnection>>(
+      (accumulator, currentValue) => {
+        const key = `${currentValue.client_id}_${currentValue.id}`;
+        if (!accumulator[key] || accumulator[key].state < currentValue.state) accumulator[key] = currentValue;
+        return accumulator;
+      },
+      {},
+    );
 
     let nextKey = null;
     let connections = reverse ? Object.values(connectionFilters).reverse() : Object.values(connectionFilters);
@@ -202,7 +191,7 @@ export class ConnectionService {
         total: count_total ? Object.values(connectionFilters).length : 0,
       },
       height: {
-        revision_number: BigInt(0), // Cardano uses fixed revision 0; semantic height is Mithril snapshot block_number.
+        revision_number: BigInt(0), // Cardano uses revision 0; revision_height is an accepted anchor block number.
         revision_height: queryHeight,
       },
     } as unknown as QueryConnectionsResponse;
@@ -211,17 +200,50 @@ export class ConnectionService {
   }
 
   async queryClientConnections(request: QueryClientConnectionsRequest): Promise<QueryClientConnectionsResponse> {
-    if (!request.client_id) {
+    const clientId = request.client_id;
+    if (!clientId) {
       throw new GrpcInvalidArgumentException('Invalid argument: "client_id" must be provided');
     }
 
-    const response = await this.queryConnections({ pagination: undefined } as QueryConnectionsRequest);
+    const clientIdPrefix = `${CLIENT_ID_PREFIX}-`;
+    const clientSequence = clientId.startsWith(clientIdPrefix) ? clientId.slice(clientIdPrefix.length) : '';
+    if (!/^\d+$/.test(clientSequence)) {
+      throw new GrpcInvalidArgumentException(
+        `Invalid argument: "client_id". Please use the prefix "${clientIdPrefix}" followed by a numeric sequence`,
+      );
+    }
+
+    this.logger.log(clientId, 'queryClientConnections');
+
+    const clientAuthTokenUnit = this.lucidService.getClientAuthTokenUnit(BigInt(clientSequence));
+    try {
+      await this.lucidService.findUtxoByUnit(clientAuthTokenUnit);
+    } catch (error) {
+      if (error instanceof GrpcNotFoundException) {
+        throw new GrpcNotFoundException(`Not found: client "${clientId}"`);
+      }
+      throw error;
+    }
+
+    // ClientConnections is not paginated, so ask the shared connection listing
+    // for its full result set before selecting the paths owned by this client.
+    const response = await this.queryConnections({
+      pagination: {
+        key: new Uint8Array(),
+        offset: 0n,
+        limit: 18_446_744_073_709_551_615n,
+        count_total: false,
+        reverse: false,
+      },
+    });
     const connectionPaths = (response.connections || [])
-      .filter((connection) => connection.client_id === request.client_id)
+      .filter((connection) => connection.client_id === clientId)
       .map((connection) => connection.id);
 
     return {
       connection_paths: connectionPaths,
+      // ibc-go leaves this field at its protobuf zero value for ClientConnections.
+      // There is no committed clients/{clientId}/connections path to prove on Cardano.
       proof: new Uint8Array(),
       proof_height: response.height,
     } as unknown as QueryClientConnectionsResponse;
@@ -252,9 +274,7 @@ export class ConnectionService {
       const connTokenUnit = mintConnScriptHash + connectionTokenName;
       const proofContext = await this.getProofContext('queryConnection', options.queryHeight);
       const lookupStartedAt = Date.now();
-      const utxo = proofContext.historical
-        ? await this.historyService.findUtxoByUnitAtOrBeforeBlockNo(connTokenUnit, proofContext.proofHeight)
-        : await this.findConnectionUtxo(connTokenUnit);
+      const utxo = await this.historyService.findUtxoByUnitAtOrBeforeBlockNo(connTokenUnit, proofContext.proofHeight);
       this.logger.debug(
         `[queryConnection] loaded connection UTxO ${utxo.txHash}#${utxo.outputIndex} in ${Date.now() - lookupStartedAt}ms`,
       );
@@ -262,19 +282,15 @@ export class ConnectionService {
         utxo.datum!,
         this.lucidService.LucidImporter,
       );
-      if (!proofContext.historical) {
-        const treeAlignmentStartedAt = Date.now();
-        await this.ensureTreeAligned();
-        this.logger.debug(`[queryConnection] tree alignment completed in ${Date.now() - treeAlignmentStartedAt}ms`);
-      }
 
       // Generate ICS-23 proof from the IBC state tree
       //
       // The proof contains sibling hashes that let Cosmos verify this connection state
-      // is authentic by reconstructing the Merkle root (which is certified by Mithril).
+      // is authentic by reconstructing the Merkle root accepted by the active Cardano client.
       // Even if Gateway is compromised, it cannot forge valid proofs.
       const ibcPath = `connections/${CONNECTION_ID_PREFIX}-${connectionId}`;
-      const tree = proofContext.historical ? proofContext.tree : getCurrentTree();
+      await assertProofContextHostState(proofContext, this.historyService, this.lucidService);
+      const tree = proofContext.tree;
       let connectionProof: Buffer;
       try {
         const existenceProof = tree.generateProof(ibcPath);

@@ -146,27 +146,25 @@ fn verify_chained_membership_proof(
       (value, 0),
       fn(accum, ele_proof) {
         when ele_proof.proof is {
-          CommitmentProof_Exist { .. } ->
+          CommitmentProof_Exist { exist } ->
             if accum.2nd < index {
-              (value, index)
+              (value, accum.2nd + 1)
             } else {
-              let temp_accum_subroot = proof.calculate(ele_proof)
               let key =
                 get_key(keys, list.length(keys.key_path) - 1 - accum.2nd)
               expect Some(spec_i) = list.at(specs, accum.2nd)
-              expect
-                ics23.verify_membership(
+              let temp_accum_subroot =
+                proof.calculate_checked_existence_root(
+                  exist,
                   spec_i,
-                  temp_accum_subroot,
-                  ele_proof,
                   key,
                   accum.1st,
                 )
               (temp_accum_subroot, accum.2nd + 1)
             }
           CommitmentProof_Nonexist { .. } ->
-            if accum.2nd == 0 {
-              (value, index)
+            if accum.2nd < index {
+              (value, accum.2nd + 1)
             } else {
               fail
             }

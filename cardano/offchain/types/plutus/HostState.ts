@@ -1,4 +1,15 @@
 import { Data } from "@lucid-evolution/lucid";
+import { AuthTokenSchema } from "./AuthToken.ts";
+
+export const ModuleRegistrationSchema = Data.Object({
+  module_script_hash: Data.Bytes(),
+  port_token: AuthTokenSchema,
+  module_token: AuthTokenSchema,
+});
+
+export type ModuleRegistration = Data.Static<typeof ModuleRegistrationSchema>;
+export const ModuleRegistration =
+  ModuleRegistrationSchema as unknown as ModuleRegistration;
 
 export const ShutdownStateSchema = Data.Enum([
   Data.Literal("Active"),
@@ -29,6 +40,7 @@ export const HostStateSchema = Data.Object({
   next_client_sequence: Data.Integer(),
   next_connection_sequence: Data.Integer(),
   next_channel_sequence: Data.Integer(),
+  // Legacy ABI padding expected by the light client already shipped by Injective.
   bound_port: Data.Array(Data.Integer()),
   last_update_time: Data.Integer(), // Unix epoch milliseconds
 });
@@ -36,12 +48,22 @@ export const HostStateSchema = Data.Object({
 export type HostState = Data.Static<typeof HostStateSchema>;
 export const HostState = HostStateSchema as unknown as HostState;
 
+export const HostStateControlSchema = Data.Object({
+  port_registry: Data.Map(Data.Bytes(), ModuleRegistrationSchema),
+  shutdown: ShutdownStateSchema,
+});
+
+export type HostStateControl = Data.Static<typeof HostStateControlSchema>;
+export const HostStateControl =
+  HostStateControlSchema as unknown as HostStateControl;
+
 // HostStateDatum wraps the state with the NFT policy for verification
 export const HostStateDatumSchema = Data.Object({
   state: HostStateSchema,
   nft_policy: Data.Bytes(), // Policy ID of the IBC Host State NFT
   deployer: Data.Bytes(),
-  shutdown: ShutdownStateSchema,
+  // The fourth field is opaque to Injective's decoder and Cardano-controlled.
+  control: HostStateControlSchema,
 });
 
 export type HostStateDatum = Data.Static<typeof HostStateDatumSchema>;

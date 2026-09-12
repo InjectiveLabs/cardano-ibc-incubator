@@ -1,4 +1,5 @@
 import { Data } from "@lucid-evolution/lucid";
+import { ModuleRegistrationSchema } from "./HostState.ts";
 
 const SiblingHashesSchema = Data.Array(Data.Bytes());
 
@@ -19,7 +20,8 @@ const CreateChannelSchema = Data.Object({
 });
 
 const BindPortSchema = Data.Object({
-  port: Data.Integer(),
+  port_id: Data.Bytes(),
+  registration: ModuleRegistrationSchema,
   port_siblings: SiblingHashesSchema,
 });
 
@@ -58,6 +60,7 @@ export const HostStateRedeemerSchema = Data.Enum([
   Data.Object({ HandlePacket: HandlePacketSchema }),
   Data.Object({ EnterShutdown: EnterShutdownSchema }),
   Data.Literal("FinalizeShutdown"),
+  Data.Literal("Heartbeat"),
 ]);
 
 export type HostStateRedeemer = Data.Static<typeof HostStateRedeemerSchema>;

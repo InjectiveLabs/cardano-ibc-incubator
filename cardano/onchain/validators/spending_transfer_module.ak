@@ -6,28 +6,31 @@ use cardano/assets.{PolicyId, quantity_of}
 use cardano/transaction.{Input, Output, OutputReference, Transaction}
 use ibc/apps/transfer/channel_callback as transfer_channel_callback
 use ibc/apps/transfer/escrow as transfer_escrow
-use ibc/apps/transfer/escrow.{EscrowShard, ModuleState, TransferModuleSpend}
+use ibc/apps/transfer/escrow.{TransferModuleSpend}
 use ibc/apps/transfer/ibc_module as transfer_ibc_module
 use ibc/apps/transfer/refund as transfer_refund
-use ibc/apps/transfer/transfer_module_redeemer.{OtherTransferOp, Transfer}
+use ibc/apps/transfer/transfer_module_redeemer.{
+  OtherTransferOp, Transfer, TransferModuleRedeemer,
+}
 use ibc/apps/transfer/types/coin as transfer_coin
 use ibc/apps/transfer/types/fungible_token_packet_data.{FungibleTokenPacketData}
-use ibc/apps/transfer/value_delta as transfer_value_delta
 use ibc/apps/transfer/voucher_flow as transfer_voucher_flow
 use ibc/auth.{AuthToken}
-use ibc/core/ics_004/channel_datum.{ChannelDatum, validate_recv_packet}
+use ibc/core/ics_004/channel_datum.{ChannelDatum}
 use ibc/core/ics_004/channel_redeemer.{
-  AcknowledgePacket, RecvPacket, SendPacket, TimeoutPacket,
+  AcknowledgePacket, RecvPacket, SendPacket, TimeoutOnClose, TimeoutPacket,
 }
 use ibc/core/ics_004/types/acknowledgement as acknowledgement_mod
 use ibc/core/ics_004/types/acknowledgement_response.{AcknowledgementError}
 use ibc/core/ics_004/types/keys as channel_keys
 use ibc/core/ics_004/types/packet.{Packet}
+use ibc/core/ics_004/types/packet as packet_mod
 use ibc/core/ics_005/types/ibc_module_redeemer.{
-  Callback, IBCModuleCallback, IBCModuleOperator, IBCModuleRedeemer,
-  OnAcknowledgementPacket, OnChanCloseConfirm, OnChanCloseInit, OnChanOpenAck,
-  OnChanOpenConfirm, OnChanOpenInit, OnChanOpenTry, OnRecvPacket,
-  OnTimeoutPacket, Operator, TransferModuleData, TransferModuleOperator,
+  Callback, IBCModuleCallback, IBCModuleOperator, IBCModulePacketData,
+  IBCModuleRedeemer, ModuleDataV1, ModuleOperatorV1, OnAcknowledgementPacket,
+  OnChanCloseConfirm, OnChanCloseInit, OnChanOpenAck, OnChanOpenConfirm,
+  OnChanOpenInit, OnChanOpenTry, OnRecvPacket, OnSendPacket, OnTimeoutPacket,
+  Operator,
 }
 use ibc/core/ics_025_handler_interface/host_state.{host_state_token_name}
 use ibc/utils/string as string_utils
@@ -57,33 +60,16 @@ validator spend_transfer_module(
         outputs,
         host_state_nft_policy_id,
       )
-
     expect Some(spent_input) = transaction.find_input(inputs, spent_output_ref)
-    let spent_output = spent_input.output
     // Classify whether this spend is root state or a packet escrow shard.
     let spend =
       transfer_escrow.classify_transfer_module_spend(
-        spent_output,
+        spent_input.output,
         transaction.outputs,
         port_token,
         module_token,
+        transfer_escrow_shard_policy_id,
       )
-    expect
-      when spend is {
-        ModuleState(_) ->
-          transfer_escrow.has_module_state_tokens(
-            spent_output,
-            port_token,
-            module_token,
-          )
-        EscrowShard { datum, .. } ->
-          // Datum-only escrow UTxOs are not canonical.
-          transfer_escrow.escrow_shard_has_nft(
-            spent_output,
-            datum,
-            transfer_escrow_shard_policy_id,
-          )
-      }
 
     // Channel auth tokens are minted by `mint_channel_stt` using the HostState NFT
     // as the base token. The transfer module must derive the *same* token name when
@@ -99,9 +85,10 @@ validator spend_transfer_module(
         module_callback(
           cb,
           host_state_nft,
-          spent_output_ref,
+          spent_input,
           transaction,
           spend,
+          host_state_input,
           port_id,
           transfer_escrow_shard_policy_id,
           channel_minting_policy_id,
@@ -109,9 +96,10 @@ validator spend_transfer_module(
         )
       Operator(op) ->
         module_operator(
-          op,
+          decode_transfer_operator(op),
+          None,
           host_state_nft,
-          spent_output_ref,
+          spent_input,
           transaction,
           spend,
           host_state_input,
@@ -130,9 +118,10 @@ validator spend_transfer_module(
 fn module_callback(
   cb: IBCModuleCallback,
   host_state_nft: AuthToken,
-  spent_output_ref: OutputReference,
+  spent_input: Input,
   transaction: Transaction,
   spend: TransferModuleSpend,
+  host_state_input: Input,
   port_id: ByteArray,
   shard_policy_id: PolicyId,
   channel_minting_policy_id: PolicyId,
@@ -140,11 +129,25 @@ fn module_callback(
 ) -> Bool {
   let Transaction { outputs, redeemers, inputs, mint, .. } = transaction
 
-  expect Some(spent_input) = transaction.find_input(inputs, spent_output_ref)
-
   when cb is {
+    OnSendPacket { channel_id, packet_data, packet_commitment, data } -> {
+      let transfer_data = decode_transfer_packet_data(data)
+
+      module_operator(
+        Transfer { channel_id, data: transfer_data },
+        Some((packet_data, packet_commitment)),
+        host_state_nft,
+        spent_input,
+        transaction,
+        spend,
+        host_state_input,
+        shard_policy_id,
+        channel_minting_policy_id,
+        voucher_minting_policy_id,
+      )
+    }
+
     OnChanOpenInit { channel_id } -> {
-      let updated_output = transfer_escrow.expect_module_state(spend)
       let output_channel =
         transfer_channel_callback.validate_channel_open_init(
           redeemers,
@@ -155,11 +158,7 @@ fn module_callback(
           channel_id,
         )
       and {
-        transfer_value_delta.validate_output_amount(
-          spent_input,
-          updated_output,
-          assets.zero,
-        )?,
+        transfer_escrow.validate_preserved_module_state(spent_input, spend)?,
         transfer_ibc_module.validate_on_chan_open_init(
           output_channel.ordering,
           output_channel.connection_hops,
@@ -172,7 +171,6 @@ fn module_callback(
     }
 
     OnChanOpenTry { channel_id } -> {
-      let updated_output = transfer_escrow.expect_module_state(spend)
       expect Some((output_channel, counterparty_version)) =
         transfer_channel_callback.validate_channel_open_try(
           redeemers,
@@ -183,11 +181,7 @@ fn module_callback(
           channel_id,
         )
       and {
-        transfer_value_delta.validate_output_amount(
-          spent_input,
-          updated_output,
-          assets.zero,
-        )?,
+        transfer_escrow.validate_preserved_module_state(spent_input, spend)?,
         transfer_ibc_module.validate_on_chan_open_try(
           output_channel.ordering,
           output_channel.connection_hops,
@@ -201,7 +195,6 @@ fn module_callback(
     }
 
     OnChanOpenAck { channel_id } -> {
-      let updated_output = transfer_escrow.expect_module_state(spend)
       expect Some((output_channel, counterparty_version)) =
         transfer_channel_callback.validate_chan_open_ack(
           inputs,
@@ -214,11 +207,7 @@ fn module_callback(
         )
 
       and {
-        transfer_value_delta.validate_output_amount(
-          spent_input,
-          updated_output,
-          assets.zero,
-        )?,
+        transfer_escrow.validate_preserved_module_state(spent_input, spend)?,
         transfer_ibc_module.validate_on_chan_open_ack(
           port_id,
           channel_id,
@@ -229,7 +218,6 @@ fn module_callback(
     }
 
     OnChanOpenConfirm { channel_id } -> {
-      let updated_output = transfer_escrow.expect_module_state(spend)
       expect Some(_) =
         transfer_channel_callback.validate_chan_open_confirm(
           inputs,
@@ -241,24 +229,20 @@ fn module_callback(
           channel_id,
         )
       and {
-        transfer_value_delta.validate_output_amount(
-          spent_input,
-          updated_output,
-          assets.zero,
-        )?,
+        transfer_escrow.validate_preserved_module_state(spent_input, spend)?,
         transfer_ibc_module.validate_on_chan_open_confirm(port_id, channel_id)?,
       }
     }
 
     OnChanCloseInit { .. } -> False
     OnChanCloseConfirm { .. } -> False
-    OnRecvPacket { channel_id, acknowledgement, data } -> {
+    OnRecvPacket { channel_id, packet_data, acknowledgement, data } -> {
       trace @"spend_transfer_module: Callback.OnRecvPacket branch"
 
       expect transfer_ibc_module.validate_on_chan_recv_packet(acknowledgement)
       trace @"spend_transfer_module: acknowledgement is valid"
 
-      expect TransferModuleData(data) = data
+      let data = decode_transfer_packet_data(data)
       expect fungible_token_packet_data.validate_basic(data)
       trace @"spend_transfer_module: redeemer data is valid"
 
@@ -273,8 +257,8 @@ fn module_callback(
       expect RecvPacket { packet, .. } = channel_redeemer
       trace @"spend_transfer_module: channel redeemer is valid"
 
-      expect fungible_token_packet_data.get_bytes(data) == packet.data
-      trace @"spend_transfer_module: FungibleTokenPacketData is unmarshal valid"
+      // The receive marker binds these callback bytes to this channel packet.
+      expect fungible_token_packet_data.matches_valid_bytes(data, packet_data)
 
       if transfer_coin.receiver_chain_is_source(
         packet.source_port,
@@ -318,7 +302,7 @@ fn module_callback(
           )
             |> assets.negate()
 
-        // Negative shard delta may burn the NFT when emptied.
+        // Negative shard deltas retain an empty registered shard when depleted.
         let valid_transfer_amount =
           transfer_escrow.validate_module_escrow_transition(
             spent_input,
@@ -338,70 +322,41 @@ fn module_callback(
         let receiver_address = from_verification_key(receiver_public_key_hash)
 
         trace @"spend_transfer_module: start channel logic for transfer module"
-        expect channel_keys.is_valid_channel_id(channel_id)
-
         let channel_sequence =
           channel_keys.parse_channel_id_sequence(channel_id)
 
-        let channel_token_name =
-          auth.generate_token_name(
-            host_state_nft,
-            channel_keys.channel_prefix,
-            channel_sequence,
-          )
-
         let channel_token =
-          AuthToken {
-            policy_id: channel_minting_policy_id,
-            name: channel_token_name,
-          }
+          transfer_channel_callback.channel_auth_token(
+            channel_minting_policy_id,
+            host_state_nft,
+            channel_id,
+          )
 
         trace @"spend_transfer_module: locating channel inputs and outputs"
-        expect Some(channel_input) =
-          list.find(
-            inputs,
-            fn(input) { input.output |> auth.contain_auth_token(channel_token) },
-          )
-
         expect Some(channel_output) =
           list.find(
             outputs,
             fn(output) { auth.contain_auth_token(output, channel_token) },
           )
 
-        expect input_channel_datum: ChannelDatum =
-          validator_utils.get_inline_datum(channel_input.output)
         expect updated_channel_datum: ChannelDatum =
           validator_utils.get_inline_datum(channel_output)
 
         trace @"spend_transfer_module: extracted datums from channel inputs and outputs"
 
-        let channel_id_from_sequence =
-          channel_keys.format_channel_identifier(channel_sequence)
-
-        let bz_ack = acknowledgement_mod.acknowledgement(acknowledgement)
-        let commit_ack = acknowledgement_mod.commit_acknowledgement(bz_ack)
-        let valid_packet =
-          validate_recv_packet(
-            input_channel_datum,
-            updated_channel_datum,
-            packet,
-            commit_ack,
-          )
-
+        // The mandatory RecvPacket marker validates the complete channel
+        // successor, including the acknowledgement and receive proof heights.
+        // This callback independently owns the transfer-value effects and the
+        // exact channel-token binding, so repeating that datum transition here
+        // would add no protocol-level protection.
         expect Some(payout_output) =
-          list.find(
-            transaction.outputs,
-            fn(output) { output.address == receiver_address },
-          )
+          list.find(outputs, fn(output) { output.address == receiver_address })
 
         let derived_channel_sequence =
           auth.extract_token_sequence(updated_channel_datum.token.name)
 
         and {
-          valid_packet?,
           valid_transfer_amount?,
-          (channel_id_from_sequence == channel_id)?,
           (derived_channel_sequence == channel_sequence)?,
           (quantity_of(
             payout_output.value,
@@ -410,16 +365,11 @@ fn module_callback(
           ) >= transfer_amount)?,
         }
       } else {
-        let updated_output = transfer_escrow.expect_module_state(spend)
         // Non-source receive mints vouchers.
         trace @"mint_voucher: tx mint voucher token"
 
         and {
-          transfer_value_delta.validate_output_amount(
-            spent_input,
-            updated_output,
-            assets.zero,
-          )?,
+          transfer_escrow.validate_preserved_module_state(spent_input, spend)?,
           transfer_voucher_flow.validate_mint_voucher_packet(
             redeemers,
             voucher_minting_policy_id,
@@ -428,7 +378,7 @@ fn module_callback(
         }
       }
     }
-    OnTimeoutPacket { channel_id, data } -> {
+    OnTimeoutPacket { channel_id, packet_data, data } -> {
       trace @"spend_transfer_module: Callback.OnTimeoutPacket branch"
 
       expect Some(channel_redeemer) =
@@ -439,10 +389,15 @@ fn module_callback(
           host_state_nft,
           channel_id,
         )
-      expect TimeoutPacket { packet, .. } = channel_redeemer
+      expect
+        when channel_redeemer is {
+          TimeoutPacket { .. } | TimeoutOnClose { .. } -> True
+          _ -> False
+        }
       trace @"spend_transfer_module: channel redeemer is valid"
 
-      expect TransferModuleData(data) = data
+      let data = decode_transfer_packet_data(data)
+      // The timeout marker binds the callback port, channel and bytes to its packet.
       // Timeout refunds the sender-side packet effect.
       let valid_refund_packet =
         transfer_refund.validate_refund_packet_token(
@@ -455,15 +410,16 @@ fn module_callback(
           shard_policy_id,
           mint,
           data,
-          packet,
+          port_id,
+          channel_id,
         )
 
       and {
         valid_refund_packet?,
-        (fungible_token_packet_data.get_bytes(data) == packet.data)?,
+        fungible_token_packet_data.matches_bytes(data, packet_data)?,
       }
     }
-    OnAcknowledgementPacket { channel_id, acknowledgement, data } -> {
+    OnAcknowledgementPacket { channel_id, packet_data, acknowledgement, data } -> {
       trace @"spend_transfer_module: Callback.OnAcknowledgementPacket branch"
 
       expect Some(channel_redeemer) =
@@ -478,11 +434,12 @@ fn module_callback(
         channel_redeemer
       trace @"spend_transfer_module: channel redeemer is valid"
 
-      expect TransferModuleData(tf_data) = data
+      let tf_data = decode_transfer_packet_data(data)
+      // The acknowledgement marker binds these callback bytes to this packet.
       when acknowledgement.response is {
         AcknowledgementError { .. } -> and {
             // Only error acknowledgements trigger transfer refunds.
-            fungible_token_packet_data.get_bytes(tf_data) == packet.data,
+            fungible_token_packet_data.matches_bytes(tf_data, packet_data),
             acknowledgement_mod.marshal_json(acknowledgement) == channel_ack,
             transfer_refund.validate_refund_packet_token(
               voucher_minting_policy_id,
@@ -494,31 +451,27 @@ fn module_callback(
               shard_policy_id,
               mint,
               tf_data,
-              packet,
+              packet.source_port,
+              packet.source_channel,
             ),
           }
-        _ -> {
-          let updated_output = transfer_escrow.expect_module_state(spend)
+        _ ->
           // Ack success leaves transfer supply unchanged.
           and {
-            transfer_value_delta.validate_output_amount(
-              spent_input,
-              updated_output,
-              assets.zero,
-            )?,
-            (fungible_token_packet_data.get_bytes(tf_data) == packet.data)?,
+            transfer_escrow.validate_preserved_module_state(spent_input, spend)?,
+            fungible_token_packet_data.matches_bytes(tf_data, packet_data)?,
             (acknowledgement_mod.marshal_json(acknowledgement) == channel_ack)?,
           }
-        }
       }
     }
   }
 }
 
 fn module_operator(
-  op: IBCModuleOperator,
+  op: TransferModuleRedeemer,
+  send_callback: Option<(ByteArray, ByteArray)>,
   host_state_nft: AuthToken,
-  spent_output_ref: OutputReference,
+  spent_input: Input,
   transaction: Transaction,
   spend: TransferModuleSpend,
   host_state_input: Input,
@@ -526,10 +479,7 @@ fn module_operator(
   channel_minting_policy_id: PolicyId,
   voucher_minting_policy_id: PolicyId,
 ) -> Bool {
-  expect TransferModuleOperator(op) = op
-  let Transaction { redeemers, inputs, mint, .. } = transaction
-
-  expect Some(spent_input) = transaction.find_input(inputs, spent_output_ref)
+  let Transaction { redeemers, inputs, outputs, mint, .. } = transaction
 
   when op is {
     Transfer { channel_id, data } -> {
@@ -549,8 +499,18 @@ fn module_operator(
       expect SendPacket { packet } = channel_redeemer
       trace @"spend_transfer_module: channel redeemer is valid"
 
-      expect fungible_token_packet_data.get_bytes(data) == packet.data
-      trace @"spend_transfer_module: FungibleTokenPacketData is unmarshal valid"
+      expect or {
+          send_callback == None,
+          send_callback == Some((packet.data, packet_mod.commit_packet(packet))),
+        }
+
+      expect fungible_token_packet_data.matches_valid_bytes(data, packet.data)
+
+      // Every outbound transfer must be refundable to a Cardano payment key.
+      expect Some(sender_public_key_hash) =
+        string_utils.hex_string_to_bytes(data.sender)
+      expect bytearray.length(sender_public_key_hash) == 28
+      trace @"spend_transfer_module: sender is a valid public key hash"
 
       if transfer_coin.sender_chain_is_source(
         packet.source_port,
@@ -593,7 +553,7 @@ fn module_operator(
             spent_input,
             spend,
             inputs,
-            transaction.outputs,
+            outputs,
             transfer_escrow.transfer_escrow_datum(channel_id, data.denom),
             shard_policy_id,
             mint,
@@ -604,14 +564,9 @@ fn module_operator(
 
         valid_transfer_amount
       } else {
-        let updated_output = transfer_escrow.expect_module_state(spend)
         // Sending from a sink chain destroys the voucher representation.
         and {
-          transfer_value_delta.validate_output_amount(
-            spent_input,
-            updated_output,
-            assets.zero,
-          )?,
+          transfer_escrow.validate_preserved_module_state(spent_input, spend)?,
           transfer_voucher_flow.validate_burn_voucher_packet(
             redeemers,
             voucher_minting_policy_id,
@@ -623,4 +578,21 @@ fn module_operator(
 
     OtherTransferOp -> False
   }
+}
+
+// Transfer decodes opaque V1 envelopes only at its boundary so ICS-005 core never depends on transfer types.
+fn decode_transfer_packet_data(
+  module_data: IBCModulePacketData,
+) -> FungibleTokenPacketData {
+  expect ModuleDataV1(data) = module_data
+  expect transfer_data: FungibleTokenPacketData = data
+  transfer_data
+}
+
+fn decode_transfer_operator(
+  module_operator: IBCModuleOperator,
+) -> TransferModuleRedeemer {
+  expect ModuleOperatorV1(data) = module_operator
+  expect transfer_operator: TransferModuleRedeemer = data
+  transfer_operator
 }

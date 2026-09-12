@@ -19,11 +19,13 @@ use ibc/core/ics_003_connection_semantics/verify as verify_mod
 use ibc/core/ics_004/channel_datum.{ChannelDatum,
   ChannelDatumState} as channel_datum_mod
 use ibc/core/ics_004/channel_redeemer.{RecvPacket}
+use ibc/core/ics_004/types/acknowledgement as acknowledgement_mod
 use ibc/core/ics_004/types/channel.{Channel}
 use ibc/core/ics_004/types/counterparty.{ChannelCounterparty}
 use ibc/core/ics_004/types/keys as chan_keys_mod
 use ibc/core/ics_004/types/packet.{Packet} as packet_mod
 use ibc/core/ics_004/types/state as chan_state_mod
+use ibc/core/ics_005/types/ibc_module_redeemer.{Callback, OnRecvPacket}
 use ibc/core/ics_023_vector_commitments/merkle.{MerkleProof}
 use ibc/core/ics_024_host_requirements/packet_keys
 use ibc/utils/validator_utils
@@ -31,8 +33,9 @@ use ibc/utils/validator_utils
 validator recv_packet(
   client_minting_policy_id: PolicyId,
   connection_minting_policy_id: PolicyId,
-  _port_minting_policy_id: PolicyId,
+  port_minting_policy_id: PolicyId,
   verify_proof_policy_id: PolicyId,
+  host_state_nft_policy_id: PolicyId,
 ) {
   mint(
     channel_token: AuthToken,
@@ -66,7 +69,7 @@ validator recv_packet(
         outputs,
         datum.token,
       )
-    expect _updated_datum: ChannelDatum =
+    expect updated_datum: ChannelDatum =
       validator_utils.get_inline_datum(updated_output)
 
     let tx_valid_to = validator_utils.get_tx_valid_to(validity_range)
@@ -94,10 +97,11 @@ validator recv_packet(
     expect cur_channel.state == chan_state_mod.Open
     trace @"recv_packet: channel state is open"
 
-    let connection_datum =
-      validator_utils.validate_referred_connection(
+    let (connection_datum, client_datum) =
+      validator_utils.validate_referred_connection_and_client(
         reference_inputs,
         datum.token.name,
+        client_minting_policy_id,
         connection_minting_policy_id,
         connection_id,
       )
@@ -105,14 +109,6 @@ validator recv_packet(
 
     expect connection_datum.state.state == conn_state_mod.Open
     trace @"recv_packet: Connection is open"
-
-    let client_datum =
-      validator_utils.validate_referred_client(
-        reference_inputs,
-        datum.token.name,
-        client_minting_policy_id,
-        connection_datum.state.client_id,
-      )
     trace @"recv_packet: validator_utils.validate_referred_client"
 
     let client_status =
@@ -138,6 +134,32 @@ validator recv_packet(
         verify_proof_policy_id,
       )
 
+    let module_redeemer =
+      validator_utils.extract_packet_module_redeemer(
+        inputs,
+        reference_inputs,
+        outputs,
+        redeemers,
+        port_minting_policy_id,
+        datum.port_id,
+        host_state_nft_policy_id,
+      )
+    expect Callback(OnRecvPacket {
+      channel_id: callback_channel_id,
+      packet_data,
+      acknowledgement,
+      ..
+    }) = module_redeemer
+    expect and {
+        callback_channel_id == channel_id,
+        packet_data == packet.data,
+      }
+    let acknowledgement_bytes =
+      acknowledgement_mod.acknowledgement(acknowledgement)
+    let acknowledgement_commitment =
+      acknowledgement_mod.commit_acknowledgement(acknowledgement_bytes)
+    trace @"recv_packet: exact application callback matched"
+
     and {
       channel_token == datum.token,
       auth.contain_auth_token(updated_output, datum.token),
@@ -149,8 +171,19 @@ validator recv_packet(
       valid_packet_proof?,
       (!pairs.has_key(cur_packet_receipt, packet.sequence))?,
       (!pairs.has_key(cur_packet_acknowledgement, packet.sequence))?,
+      // Cardano transaction contexts authenticate time through the validity
+      // interval, but do not expose an authenticated destination block height.
+      // Reject height timeouts until that height can be checked safely.
+      height_mod.is_zero(packet.timeout_height)?,
       (packet.timeout_timestamp != 0)?,
       (tx_valid_to * 1_000_000 < packet.timeout_timestamp)?,
+      channel_datum_mod.validate_recv_packet(
+        datum,
+        updated_datum,
+        packet,
+        acknowledgement_commitment,
+        proof_height,
+      )?,
     }
   }
 

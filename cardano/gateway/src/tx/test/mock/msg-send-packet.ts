@@ -1,4 +1,4 @@
-import { MsgTransfer } from '@plus/proto-types/build/ibc/core/channel/v1/tx';
+import { MsgTransfer } from '@cardano-ibc/proto-types/build/ibc/core/channel/v1/tx';
 
 class MsgSendPacketMockBuilder {
   private msgSendPacket: MsgTransfer;
@@ -18,7 +18,7 @@ class MsgSendPacketMockBuilder {
       sender: '247570b8ba7dc725e9ff37e9757b8148b4d5a125958edac2fd4417b8',
       signer: '247570b8ba7dc725e9ff37e9757b8148b4d5a125958edac2fd4417b8',
       receiver: 'cosmos1ycel53a5d9xk89q3vdr7vm839t2vwl08pl6zk6',
-      timeout_height: null,
+      timeout_height: { revision_number: 0n, revision_height: 0n },
       timeout_timestamp: 968124724398584011n,
       memo: '',
     };

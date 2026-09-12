@@ -3,7 +3,7 @@ use aiken/crypto.{Blake2b_224, Hash, Script}
 use aiken/fuzz
 use aiken/interval
 use cardano/address.{from_script}
-use cardano/assets.{PolicyId, Value, from_asset, zero}
+use cardano/assets.{PolicyId, Value, add, from_asset, zero}
 use cardano/transaction.{
   InlineDatum, Input, Mint, Output, OutputReference, Redeemer, ScriptPurpose,
   Spend, Transaction, ValidityRange,
@@ -27,7 +27,8 @@ use ibc/core/ics_004/channel_datum.{ChannelDatum,
   ChannelDatumState} as channel_datum_mod
 use ibc/core/ics_004/channel_redeemer.{
   AcknowledgePacket, ChanCloseConfirm, ChanCloseInit, ChanOpenAck,
-  ChanOpenConfirm, RecvPacket, SendPacket, SpendChannelRedeemer, TimeoutPacket,
+  ChanOpenConfirm, PrunePacketHistory, RecvPacket, SendPacket,
+  SpendChannelRedeemer, TimeoutPacket,
 }
 use ibc/core/ics_004/types/acknowledgement as acknowledgement_mod
 use ibc/core/ics_004/types/channel.{Channel}
@@ -48,7 +49,8 @@ use ibc/core/ics_023_vector_commitments/ics23/proofs.{
 use ibc/core/ics_023_vector_commitments/merkle.{MerkleProof, MerkleRoot}
 use ibc/core/ics_023_vector_commitments/merkle_prefix.{MerklePrefix}
 use ibc/core/ics_025_handler_interface/host_state.{
-  Active, HostState, HostStateDatum, ShutdownState, empty_ibc_state_root,
+  Active, HostState, HostStateControl, HostStateDatum, ShutdownState,
+  empty_ibc_state_root,
 }
 use ibc/core/ics_025_handler_interface/host_state_redeemer as host_state_redeemer
 use ibc/testing/fuzz_dsl
@@ -72,6 +74,7 @@ type MockData {
   send_packet_policy_id: PolicyId,
   timeout_packet_policy_id: PolicyId,
   acknowledge_packet_policy_id: PolicyId,
+  prune_packet_history_policy_id: PolicyId,
   channel_sequence: ByteArray,
   channel_token: AuthToken,
   base_token: AuthToken,
@@ -103,7 +106,7 @@ fn host_state_datum(
     },
     nft_policy,
     deployer: #"00000000000000000000000000000000000000000000000000000000",
-    shutdown,
+    control: HostStateControl { port_registry: [], shutdown },
   }
 }
 
@@ -323,9 +326,7 @@ fn setup() -> MockData {
   let port_minting_policy_id = "mock port_minting_policy_id"
 
   let port_id = "port-1"
-  let port_number = port_keys_mod.parse_port_id_number(port_id)
-  let port_token_name =
-    auth.generate_token_name(base_token, port_keys_mod.port_prefix, port_number)
+  let port_token_name = port_keys_mod.port_token_name(port_id)
   let port_token =
     AuthToken { policy_id: port_minting_policy_id, name: port_token_name }
 
@@ -360,6 +361,7 @@ fn setup() -> MockData {
     send_packet_policy_id: "mock send_packet_policy_id",
     timeout_packet_policy_id: "mock timeout_packet_policy_id",
     acknowledge_packet_policy_id: "mock acknowledge_packet_policy_id",
+    prune_packet_history_policy_id: "mock prune_packet_history_policy_id",
     channel_sequence,
     channel_token,
     base_token,
@@ -423,6 +425,124 @@ fn host_state_handle_packet_redeemer() -> Redeemer {
       packet_acknowledgement_siblings: [],
     }
   redeemer
+}
+
+fn check_prune_spending_channel(
+  include_marker: Bool,
+  use_handle_packet_host_redeemer: Bool,
+) -> Bool {
+  let mock_data = setup()
+  let sequence = 7
+  let proof_height = Height { revision_number: 1, revision_height: 13 }
+  let channel =
+    Channel {
+      state: channel_state.Open,
+      ordering: channel_order.Unordered,
+      counterparty: ChannelCounterparty {
+        port_id: "port-1",
+        channel_id: "channel-0",
+      },
+      connection_hops: [mock_data.connection_id],
+      version: "ics20-1",
+    }
+  let input_channel_datum =
+    ChannelDatum {
+      state: ChannelDatumState {
+        channel,
+        next_sequence_send: 1,
+        next_sequence_recv: 1,
+        next_sequence_ack: 1,
+        packet_commitment: [],
+        packet_receipt: [Pair(sequence, "")],
+        packet_acknowledgement: [Pair(sequence, "ack")],
+        minimum_receive_proof_height: height_mod.zero_height(),
+        maximum_receive_proof_height: Height {
+          revision_number: 1,
+          revision_height: 10,
+        },
+      },
+      port_id: mock_data.port_id,
+      token: mock_data.channel_token,
+    }
+  let output_channel_datum =
+    ChannelDatum {
+      ..input_channel_datum,
+      state: ChannelDatumState {
+        ..input_channel_datum.state,
+        packet_receipt: [],
+        packet_acknowledgement: [],
+        minimum_receive_proof_height: proof_height,
+      },
+    }
+  let channel_input =
+    build_channel_input(input_channel_datum, mock_data.channel_token)
+  let channel_output =
+    build_channel_output(output_channel_datum, mock_data.channel_token)
+  let spend_redeemer =
+    PrunePacketHistory {
+      sequence,
+      proof_commitment_absence: MerkleProof { proofs: [] },
+      proof_height,
+    }
+  let spend_redeemer_data: Redeemer = spend_redeemer
+  let marker_redeemer: Redeemer = mock_data.channel_token
+  let host_redeemer =
+    if use_handle_packet_host_redeemer {
+      host_state_handle_packet_redeemer()
+    } else {
+      host_state_update_channel_redeemer()
+    }
+  let marker_redeemers =
+    if include_marker {
+      [Pair(Mint(mock_data.prune_packet_history_policy_id), marker_redeemer)]
+    } else {
+      []
+    }
+  let transaction =
+    Transaction {
+      ..transaction.placeholder,
+      inputs: [channel_input, mock_data.host_state_input],
+      outputs: [channel_output, mock_data.host_state_output],
+      redeemers: [
+        Pair(Spend(channel_input.output_reference), spend_redeemer_data),
+        Pair(Spend(mock_data.host_state_input.output_reference), host_redeemer),
+        ..marker_redeemers
+      ],
+      mint: if include_marker {
+        operation_marker(mock_data.prune_packet_history_policy_id)
+      } else {
+        zero
+      },
+    }
+
+  spending_channel.spend_channel.spend(
+    mock_data.chan_open_ack_policy_id,
+    mock_data.chan_open_confirm_policy_id,
+    mock_data.chan_close_init_policy_id,
+    mock_data.chan_close_confirm_policy_id,
+    mock_data.recv_packet_policy_id,
+    mock_data.send_packet_policy_id,
+    mock_data.timeout_packet_policy_id,
+    mock_data.acknowledge_packet_policy_id,
+    mock_data.prune_packet_history_policy_id,
+    mock_data.host_state_nft_policy_id,
+    Some(input_channel_datum),
+    spend_redeemer,
+    channel_input.output_reference,
+    transaction,
+  )
+}
+
+test prune_packet_history_succeed() {
+  check_prune_spending_channel(True, True)
+}
+
+test prune_packet_history_rejects_missing_operation_marker() fail {
+  check_prune_spending_channel(False, True)
+}
+
+test prune_packet_history_rejects_wrong_host_state_redeemer() fail {
+  check_prune_spending_channel(True, False)
 }
 
 fn update_client(
@@ -516,6 +636,7 @@ fn run_spending_channel_transition(
           mock_data.send_packet_policy_id,
           mock_data.timeout_packet_policy_id,
           mock_data.acknowledge_packet_policy_id,
+          mock_data.prune_packet_history_policy_id,
           mock_data.host_state_nft_policy_id,
           Some(input_channel_datum),
           spend_channel_redeemer,
@@ -525,9 +646,12 @@ fn run_spending_channel_transition(
       )
 }
 
-fn send_packet_spending_channel_tx_with_marker(
+fn send_packet_spending_channel_tx_with_witness(
   marker_mint: Value,
-  include_marker_redeemer: Bool,
+  marker_policy_id: PolicyId,
+  marker_redeemer: Option<Redeemer>,
+  host_state_redeemer: Redeemer,
+  continuation_count: Int,
   mutation: fuzz_dsl.Mutation,
 ) -> fuzz_dsl.ProtocolTxFixture {
   let mock_data = setup()
@@ -556,6 +680,8 @@ fn send_packet_spending_channel_tx_with_marker(
   let input_channel_datum =
     ChannelDatum {
       state: ChannelDatumState {
+        maximum_receive_proof_height: height_mod.zero_height(),
+        minimum_receive_proof_height: height_mod.zero_height(),
         channel: input_channel,
         next_sequence_send: packet.sequence,
         next_sequence_recv: 1,
@@ -575,15 +701,20 @@ fn send_packet_spending_channel_tx_with_marker(
   let output_channel_datum = send_packet(packet, input_channel_datum)
   let channel_output =
     build_channel_output(output_channel_datum, mock_data.channel_token)
-  let outputs = [channel_output, mock_data.host_state_output]
+  let outputs =
+    if continuation_count == 0 {
+      [mock_data.host_state_output]
+    } else if continuation_count == 1 {
+      [channel_output, mock_data.host_state_output]
+    } else {
+      [channel_output, channel_output, mock_data.host_state_output]
+    }
   let spend_channel_redeemer_in_data: Redeemer = SendPacket { packet }
   let module_redeemer: Redeemer = Operator(OtherModuleOperator)
-  let send_packet_redeemer: Redeemer = mock_data.channel_token
   let marker_redeemers =
-    if include_marker_redeemer {
-      [Pair(Mint(mock_data.send_packet_policy_id), send_packet_redeemer)]
-    } else {
-      []
+    when marker_redeemer is {
+      Some(marker_redeemer) -> [Pair(Mint(marker_policy_id), marker_redeemer)]
+      None -> []
     }
   let redeemers: Pairs<ScriptPurpose, Redeemer> =
     [
@@ -594,7 +725,7 @@ fn send_packet_spending_channel_tx_with_marker(
       ),
       Pair(
         Spend(mock_data.host_state_input.output_reference),
-        host_state_handle_packet_redeemer(),
+        host_state_redeemer,
       ),
       ..marker_redeemers
     ]
@@ -621,43 +752,181 @@ fn send_packet_spending_channel_tx_with_marker(
 
 fn send_packet_spending_channel_tx() -> fuzz_dsl.ProtocolTxFixture {
   let mock_data = setup()
-  send_packet_spending_channel_tx_with_marker(
+  let marker_redeemer: Redeemer = mock_data.channel_token
+  send_packet_spending_channel_tx_with_witness(
     operation_marker(mock_data.send_packet_policy_id),
-    True,
+    mock_data.send_packet_policy_id,
+    Some(marker_redeemer),
+    host_state_handle_packet_redeemer(),
+    1,
     fuzz_dsl.no_mutation(),
   )
 }
 
 fn send_packet_spending_channel_tx_missing_marker() -> fuzz_dsl.ProtocolTxFixture {
-  send_packet_spending_channel_tx_with_marker(
+  let mock_data = setup()
+  send_packet_spending_channel_tx_with_witness(
     zero,
-    False,
+    mock_data.send_packet_policy_id,
+    None,
+    host_state_handle_packet_redeemer(),
+    1,
     fuzz_dsl.mutation("missing_operation_marker"),
+  )
+}
+
+fn send_packet_spending_channel_tx_extra_marker() -> fuzz_dsl.ProtocolTxFixture {
+  let mock_data = setup()
+  let marker_redeemer: Redeemer = mock_data.channel_token
+  let marker_mint =
+    operation_marker(mock_data.send_packet_policy_id)
+      |> add(mock_data.send_packet_policy_id, "junk", 1)
+  send_packet_spending_channel_tx_with_witness(
+    marker_mint,
+    mock_data.send_packet_policy_id,
+    Some(marker_redeemer),
+    host_state_handle_packet_redeemer(),
+    1,
+    fuzz_dsl.mutation("extra_operation_marker"),
+  )
+}
+
+fn send_packet_spending_channel_tx_wrong_policy() -> fuzz_dsl.ProtocolTxFixture {
+  let mock_data = setup()
+  let marker_redeemer: Redeemer = mock_data.channel_token
+  send_packet_spending_channel_tx_with_witness(
+    operation_marker(mock_data.acknowledge_packet_policy_id),
+    mock_data.acknowledge_packet_policy_id,
+    Some(marker_redeemer),
+    host_state_handle_packet_redeemer(),
+    1,
+    fuzz_dsl.mutation("wrong_operation_policy"),
+  )
+}
+
+fn send_packet_spending_channel_tx_wrong_token() -> fuzz_dsl.ProtocolTxFixture {
+  let mock_data = setup()
+  let marker_redeemer: Redeemer =
+    AuthToken { ..mock_data.channel_token, name: "wrong channel token" }
+  send_packet_spending_channel_tx_with_witness(
+    operation_marker(mock_data.send_packet_policy_id),
+    mock_data.send_packet_policy_id,
+    Some(marker_redeemer),
+    host_state_handle_packet_redeemer(),
+    1,
+    fuzz_dsl.mutation("wrong_marker_redeemer"),
+  )
+}
+
+fn send_packet_spending_channel_tx_wrong_host_action() -> fuzz_dsl.ProtocolTxFixture {
+  let mock_data = setup()
+  let marker_redeemer: Redeemer = mock_data.channel_token
+  send_packet_spending_channel_tx_with_witness(
+    operation_marker(mock_data.send_packet_policy_id),
+    mock_data.send_packet_policy_id,
+    Some(marker_redeemer),
+    host_state_update_channel_redeemer(),
+    1,
+    fuzz_dsl.mutation("wrong_host_state_action"),
+  )
+}
+
+fn send_packet_spending_channel_tx_missing_continuation() -> fuzz_dsl.ProtocolTxFixture {
+  let mock_data = setup()
+  let marker_redeemer: Redeemer = mock_data.channel_token
+  send_packet_spending_channel_tx_with_witness(
+    operation_marker(mock_data.send_packet_policy_id),
+    mock_data.send_packet_policy_id,
+    Some(marker_redeemer),
+    host_state_handle_packet_redeemer(),
+    0,
+    fuzz_dsl.mutation("missing_channel_continuation"),
+  )
+}
+
+fn send_packet_spending_channel_tx_duplicate_continuation() -> fuzz_dsl.ProtocolTxFixture {
+  let mock_data = setup()
+  let marker_redeemer: Redeemer = mock_data.channel_token
+  send_packet_spending_channel_tx_with_witness(
+    operation_marker(mock_data.send_packet_policy_id),
+    mock_data.send_packet_policy_id,
+    Some(marker_redeemer),
+    host_state_handle_packet_redeemer(),
+    2,
+    fuzz_dsl.mutation("duplicate_channel_continuation"),
   )
 }
 
 test prop_tx_packet_send_spending_channel_accepts_host_marker(
   _seed via fuzz.int(),
 ) {
-  fuzz.label(@"regression.tx.packet.send.valid_channel_host_marker")
+  fuzz.label(@"regression.contract.packet.send.valid_channel_host_marker")
 
   // This is intentionally tx.* depth: it composes the channel spend with the
   // HostState co-spend and SendPacket operation marker instead of only checking
   // the channel datum transition helper.
   send_packet_spending_channel_tx()
-    |> fuzz_dsl.assert_protocol_valid
+    |> fuzz_dsl.assert_protocol_checks_accept
 }
 
 test prop_tx_packet_send_rejects_missing_operation_marker(
   _seed via fuzz.int(),
 ) fail {
-  fuzz.label(@"regression.tx.packet.send.invalid_missing_operation_marker")
+  fuzz.label(
+    @"regression.contract.packet.send.invalid_missing_operation_marker",
+  )
 
   // tx.* depth for the channel side: the channel spend sees the HostState
   // co-spend redeemer, module co-spend redeemer, and marker mint together. The
   // near-valid mutation removes the exact SendPacket marker mint.
   send_packet_spending_channel_tx_missing_marker()
-    |> fuzz_dsl.assert_protocol_valid
+    |> fuzz_dsl.assert_protocol_checks_accept
+}
+
+test prop_tx_packet_send_rejects_extra_operation_marker(
+  _seed via fuzz.int(),
+) fail {
+  fuzz.label(@"regression.contract.packet.send.invalid_extra_operation_marker")
+  send_packet_spending_channel_tx_extra_marker()
+    |> fuzz_dsl.assert_protocol_checks_accept
+}
+
+test prop_tx_packet_send_rejects_wrong_operation_policy(
+  _seed via fuzz.int(),
+) fail {
+  fuzz.label(@"regression.contract.packet.send.invalid_wrong_operation_policy")
+  send_packet_spending_channel_tx_wrong_policy()
+    |> fuzz_dsl.assert_protocol_checks_accept
+}
+
+test prop_tx_packet_send_rejects_wrong_marker_redeemer(
+  _seed via fuzz.int(),
+) fail {
+  fuzz.label(@"regression.contract.packet.send.invalid_wrong_marker_redeemer")
+  send_packet_spending_channel_tx_wrong_token()
+    |> fuzz_dsl.assert_protocol_checks_accept
+}
+
+test prop_tx_packet_send_rejects_wrong_host_state_action(
+  _seed via fuzz.int(),
+) fail {
+  fuzz.label(@"regression.contract.packet.send.invalid_wrong_host_state_action")
+  send_packet_spending_channel_tx_wrong_host_action()
+    |> fuzz_dsl.assert_protocol_checks_accept
+}
+
+test prop_tx_packet_send_rejects_missing_continuation(_seed via fuzz.int()) fail {
+  fuzz.label(@"regression.contract.packet.send.invalid_missing_continuation")
+  send_packet_spending_channel_tx_missing_continuation()
+    |> fuzz_dsl.assert_protocol_checks_accept
+}
+
+test prop_tx_packet_send_rejects_duplicate_continuation(
+  _seed via fuzz.int(),
+) fail {
+  fuzz.label(@"regression.contract.packet.send.invalid_duplicate_continuation")
+  send_packet_spending_channel_tx_duplicate_continuation()
+    |> fuzz_dsl.assert_protocol_checks_accept
 }
 
 test chan_open_ack_succeed() {
@@ -676,6 +945,8 @@ test chan_open_ack_succeed() {
   let input_channel_datum =
     ChannelDatum {
       state: ChannelDatumState {
+        maximum_receive_proof_height: height_mod.zero_height(),
+        minimum_receive_proof_height: height_mod.zero_height(),
         channel: input_channel,
         next_sequence_send: 1,
         next_sequence_recv: 1,
@@ -726,6 +997,8 @@ test chan_open_ack_succeed() {
   let output_channel_datum =
     ChannelDatum {
       state: ChannelDatumState {
+        maximum_receive_proof_height: height_mod.zero_height(),
+        minimum_receive_proof_height: height_mod.zero_height(),
         channel: output_channel,
         next_sequence_send: 1,
         next_sequence_recv: 1,
@@ -881,6 +1154,7 @@ test chan_open_ack_succeed() {
     mock_data.send_packet_policy_id,
     mock_data.timeout_packet_policy_id,
     mock_data.acknowledge_packet_policy_id,
+    mock_data.prune_packet_history_policy_id,
     mock_data.host_state_nft_policy_id,
     Some(input_channel_datum),
     spend_channel_redeemer,
@@ -908,6 +1182,8 @@ test chan_open_confirm_succeed() {
   let input_channel_datum =
     ChannelDatum {
       state: ChannelDatumState {
+        maximum_receive_proof_height: height_mod.zero_height(),
+        minimum_receive_proof_height: height_mod.zero_height(),
         channel: input_channel,
         next_sequence_send: 1,
         next_sequence_recv: 1,
@@ -1101,6 +1377,7 @@ test chan_open_confirm_succeed() {
     mock_data.send_packet_policy_id,
     mock_data.timeout_packet_policy_id,
     mock_data.acknowledge_packet_policy_id,
+    mock_data.prune_packet_history_policy_id,
     mock_data.host_state_nft_policy_id,
     Some(input_channel_datum),
     spend_channel_redeemer,
@@ -1128,6 +1405,8 @@ test recv_packet_succeed() {
   let input_channel_datum =
     ChannelDatum {
       state: ChannelDatumState {
+        maximum_receive_proof_height: height_mod.zero_height(),
+        minimum_receive_proof_height: height_mod.zero_height(),
         channel: input_channel,
         next_sequence_send: 1,
         next_sequence_recv: 1,
@@ -1307,7 +1586,12 @@ test recv_packet_succeed() {
     channel_keys.format_channel_identifier(mock_data.channel_sequence)
   let module_redeemer: Redeemer =
     Callback(
-      OnRecvPacket { channel_id, acknowledgement: ack, data: OtherModuleData },
+      OnRecvPacket {
+        channel_id,
+        packet_data: packet.data,
+        acknowledgement: ack,
+        data: OtherModuleData,
+      },
     )
 
   let recv_packet_redeemer: Redeemer = mock_data.channel_token
@@ -1347,6 +1631,7 @@ test recv_packet_succeed() {
     mock_data.send_packet_policy_id,
     mock_data.timeout_packet_policy_id,
     mock_data.acknowledge_packet_policy_id,
+    mock_data.prune_packet_history_policy_id,
     mock_data.host_state_nft_policy_id,
     Some(input_channel_datum),
     spend_channel_redeemer,
@@ -1386,6 +1671,8 @@ test send_packet_succeed() {
   let input_channel_datum =
     ChannelDatum {
       state: ChannelDatumState {
+        maximum_receive_proof_height: height_mod.zero_height(),
+        minimum_receive_proof_height: height_mod.zero_height(),
         channel: input_channel,
         next_sequence_send: packet.sequence,
         next_sequence_recv: 1,
@@ -1472,6 +1759,7 @@ test send_packet_succeed() {
     mock_data.send_packet_policy_id,
     mock_data.timeout_packet_policy_id,
     mock_data.acknowledge_packet_policy_id,
+    mock_data.prune_packet_history_policy_id,
     mock_data.host_state_nft_policy_id,
     Some(input_channel_datum),
     spend_channel_redeemer,
@@ -1513,6 +1801,8 @@ test timeout_packet_succeed() {
   let input_channel_datum =
     ChannelDatum {
       state: ChannelDatumState {
+        maximum_receive_proof_height: height_mod.zero_height(),
+        minimum_receive_proof_height: height_mod.zero_height(),
         channel: input_channel,
         next_sequence_send: 1,
         next_sequence_recv: 1,
@@ -1697,7 +1987,13 @@ test timeout_packet_succeed() {
   let channel_id =
     channel_keys.format_channel_identifier(mock_data.channel_sequence)
   let module_redeemer: Redeemer =
-    Callback(OnTimeoutPacket { channel_id, data: OtherModuleData })
+    Callback(
+      OnTimeoutPacket {
+        channel_id,
+        packet_data: packet.data,
+        data: OtherModuleData,
+      },
+    )
 
   let timeout_packet_redeemer: Redeemer = mock_data.channel_token
 
@@ -1741,6 +2037,7 @@ test timeout_packet_succeed() {
     mock_data.send_packet_policy_id,
     mock_data.timeout_packet_policy_id,
     mock_data.acknowledge_packet_policy_id,
+    mock_data.prune_packet_history_policy_id,
     mock_data.host_state_nft_policy_id,
     Some(input_channel_datum),
     spend_channel_redeemer,
@@ -1780,6 +2077,8 @@ test acknowledge_packet_succeed() {
   let input_channel_datum =
     ChannelDatum {
       state: ChannelDatumState {
+        maximum_receive_proof_height: height_mod.zero_height(),
+        minimum_receive_proof_height: height_mod.zero_height(),
         channel: input_channel,
         next_sequence_send: 1,
         next_sequence_recv: 1,
@@ -1948,6 +2247,7 @@ test acknowledge_packet_succeed() {
     Callback(
       OnAcknowledgementPacket {
         channel_id,
+        packet_data: packet.data,
         data: OtherModuleData,
         acknowledgement: acknowledgement_mod.new_result_acknowledgement("AQ=="),
       },
@@ -1998,6 +2298,7 @@ test acknowledge_packet_succeed() {
     mock_data.send_packet_policy_id,
     mock_data.timeout_packet_policy_id,
     mock_data.acknowledge_packet_policy_id,
+    mock_data.prune_packet_history_policy_id,
     mock_data.host_state_nft_policy_id,
     Some(input_channel_datum),
     spend_channel_redeemer,
@@ -2025,6 +2326,8 @@ test chan_close_init_succeed() {
   let input_channel_datum =
     ChannelDatum {
       state: ChannelDatumState {
+        maximum_receive_proof_height: height_mod.zero_height(),
+        minimum_receive_proof_height: height_mod.zero_height(),
         channel: input_channel,
         next_sequence_send: 1,
         next_sequence_recv: 1,
@@ -2090,6 +2393,7 @@ test chan_close_init_succeed() {
     fake_data.send_packet_policy_id,
     fake_data.timeout_packet_policy_id,
     fake_data.acknowledge_packet_policy_id,
+    fake_data.prune_packet_history_policy_id,
     fake_data.host_state_nft_policy_id,
     Some(input_channel_datum),
     spend_channel_redeemer,
@@ -2116,6 +2420,8 @@ test chan_close_init_fails_without_closed_channel_continuation() fail {
   let input_channel_datum =
     ChannelDatum {
       state: ChannelDatumState {
+        maximum_receive_proof_height: height_mod.zero_height(),
+        minimum_receive_proof_height: height_mod.zero_height(),
         channel: input_channel,
         next_sequence_send: 1,
         next_sequence_recv: 1,
@@ -2160,6 +2466,7 @@ test chan_close_init_fails_without_closed_channel_continuation() fail {
     fake_data.send_packet_policy_id,
     fake_data.timeout_packet_policy_id,
     fake_data.acknowledge_packet_policy_id,
+    fake_data.prune_packet_history_policy_id,
     fake_data.host_state_nft_policy_id,
     Some(input_channel_datum),
     ChanCloseInit,
@@ -2187,6 +2494,8 @@ test chan_close_init_fails_without_host_state_co_spend() fail {
   let input_channel_datum =
     ChannelDatum {
       state: ChannelDatumState {
+        maximum_receive_proof_height: height_mod.zero_height(),
+        minimum_receive_proof_height: height_mod.zero_height(),
         channel: input_channel,
         next_sequence_send: 1,
         next_sequence_recv: 1,
@@ -2227,6 +2536,7 @@ test chan_close_init_fails_without_host_state_co_spend() fail {
     fake_data.send_packet_policy_id,
     fake_data.timeout_packet_policy_id,
     fake_data.acknowledge_packet_policy_id,
+    fake_data.prune_packet_history_policy_id,
     fake_data.host_state_nft_policy_id,
     Some(input_channel_datum),
     spend_channel_redeemer,
@@ -2254,6 +2564,8 @@ test chan_close_confirm_succeed() {
   let input_channel_datum =
     ChannelDatum {
       state: ChannelDatumState {
+        maximum_receive_proof_height: height_mod.zero_height(),
+        minimum_receive_proof_height: height_mod.zero_height(),
         channel: input_channel,
         next_sequence_send: 1,
         next_sequence_recv: 1,
@@ -2311,6 +2623,7 @@ test chan_close_confirm_succeed() {
     fake_data.send_packet_policy_id,
     fake_data.timeout_packet_policy_id,
     fake_data.acknowledge_packet_policy_id,
+    fake_data.prune_packet_history_policy_id,
     fake_data.host_state_nft_policy_id,
     Some(input_channel_datum),
     spend_channel_redeemer,

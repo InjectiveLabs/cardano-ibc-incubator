@@ -9,7 +9,8 @@ use crate::{
     chains, config, logger,
     start::{
         build_aiken_validators_if_needed, build_hermes_if_needed, deploy_contracts,
-        deploy_preprod_bridge, start_dapp, start_gateway, start_hermes_daemon, start_relayer,
+        deploy_public_cardano_bridge, ibc_swap_dapp_url, start_dapp, start_gateway,
+        start_hermes_daemon, start_relayer,
     },
     utils::{prompt_runtime_deployer_sk, query_balance},
     StartTarget, StopTarget,
@@ -19,11 +20,15 @@ const HERMES_BUILD_PROGRESS_LOG_INTERVAL_SECS: u64 = 10;
 const HERMES_BUILD_POLL_INTERVAL_SECS: u64 = 2;
 const MITHRIL_DEPRECATED_ERROR: &str = "ERROR: Mithril setup is deprecated, disabled, and not maintained. Use the default stake-weighted-stability light-client mode. The Mithril source remains in-tree for historical reference only.";
 
-fn ensure_preprod_optional_relayer_routes(
+fn requires_injective_testnet_route(network: config::CoreCardanoNetwork) -> bool {
+    network.is_public_testnet()
+}
+
+fn ensure_public_testnet_relayer_route(
     project_root_path: &Path,
     network: config::CoreCardanoNetwork,
 ) -> Result<(), String> {
-    if network != config::CoreCardanoNetwork::Preprod {
+    if !requires_injective_testnet_route(network) {
         return Ok(());
     }
 
@@ -35,19 +40,27 @@ fn ensure_preprod_optional_relayer_routes(
     })
 }
 
-fn require_preprod_bridge_artifact(artifact_path: &Path, label: &str) -> Result<(), String> {
+fn require_public_bridge_artifact(
+    network: config::CoreCardanoNetwork,
+    artifact_path: &Path,
+    label: &str,
+) -> Result<(), String> {
     if artifact_path.exists() {
         return Ok(());
     }
 
     Err(format!(
-        "ERROR: Missing required preprod {} at {}.\nProvide an existing preprod bridge deployment artifact before starting against --network preprod.",
+        "ERROR: Missing required {} {} at {}.\nProvide an existing {} bridge deployment artifact before starting against --network {}.",
+        network.as_str(),
         label,
-        artifact_path.display()
+        artifact_path.display(),
+        network.as_str(),
+        network.as_str()
     ))
 }
 
-fn require_preprod_gateway_bootstrap_artifact(
+fn require_public_gateway_bootstrap_artifact(
+    network: config::CoreCardanoNetwork,
     manifest_path: Option<&str>,
     handler_path: &Path,
 ) -> Result<(), String> {
@@ -60,10 +73,32 @@ fn require_preprod_gateway_bootstrap_artifact(
     }
 
     Err(format!(
-        "ERROR: Missing required preprod gateway bootstrap artifact.\nExpected either bridge manifest at {} or handler.json at {}.",
+        "ERROR: Missing required {} gateway bootstrap artifact.\nExpected either bridge manifest at {} or handler.json at {}.",
+        network.as_str(),
         manifest_path.unwrap_or("<unset>"),
         handler_path.display()
     ))
+}
+
+fn ensure_active_cardano_runtime_identity(
+    project_root_path: &Path,
+    network: config::CoreCardanoNetwork,
+) -> Result<(), String> {
+    for env_path in [
+        project_root_path.join("chains/cardano/.env"),
+        project_root_path.join("cardano/gateway/.env"),
+    ] {
+        crate::setup::validate_active_cardano_runtime_env(env_path.as_path(), network).map_err(
+            |error| {
+                format!(
+                    "ERROR: Cannot start a standalone service for Cardano {}: {}",
+                    network.as_str(),
+                    error
+                )
+            },
+        )?;
+    }
+    Ok(())
 }
 
 fn target_requires_runtime_deployer_sk(target: Option<StartTarget>) -> bool {
@@ -73,7 +108,11 @@ fn target_requires_runtime_deployer_sk(target: Option<StartTarget>) -> bool {
         || target == Some(StartTarget::Relayer)
 }
 
-/// Starts the requested target and orchestrates startup dependencies for network and bridge components.
+fn target_starts_dapp(target: Option<&StartTarget>) -> bool {
+    target.is_none() || matches!(target, Some(StartTarget::All) | Some(StartTarget::Dapp))
+}
+
+/// Starts the requested target and orchestrates the network, bridge, and dapp components.
 pub async fn run_start(
     target: Option<StartTarget>,
     clean: bool,
@@ -94,6 +133,7 @@ pub async fn run_start(
     let start_all = target.is_none() || target == Some(StartTarget::All);
     let start_network = start_all || target == Some(StartTarget::Network);
     let start_bridge = start_all || target == Some(StartTarget::Bridge);
+    let start_dapp_target = target_starts_dapp(target.as_ref());
 
     if !chain_flags.is_empty() {
         return Err(
@@ -104,6 +144,15 @@ pub async fn run_start(
 
     let core_cardano_network = config::CoreCardanoNetwork::parse(network.as_deref())?;
     let core_cardano_profile = config::cardano_network_profile(core_cardano_network);
+
+    crate::start::ensure_cardano_network_switch_is_safe(project_root_path, core_cardano_network)?;
+
+    if matches!(target, Some(StartTarget::Relayer | StartTarget::Dapp))
+        || (core_cardano_network == config::CoreCardanoNetwork::Local
+            && matches!(target, Some(StartTarget::Bridge | StartTarget::Gateway)))
+    {
+        ensure_active_cardano_runtime_identity(project_root_path, core_cardano_network)?;
+    }
 
     let runtime_deployer_sk = if core_cardano_network != config::CoreCardanoNetwork::Local
         && target_requires_runtime_deployer_sk(target.clone())
@@ -138,8 +187,9 @@ pub async fn run_start(
     }
 
     if target == Some(StartTarget::Gateway) {
-        if core_cardano_network == config::CoreCardanoNetwork::Preprod {
-            require_preprod_gateway_bootstrap_artifact(
+        if core_cardano_network.is_public_testnet() {
+            require_public_gateway_bootstrap_artifact(
+                core_cardano_network,
                 core_cardano_profile.bridge_manifest_path.as_deref(),
                 Path::new(core_cardano_profile.handler_json_path.as_str()),
             )?;
@@ -151,7 +201,8 @@ pub async fn run_start(
             .await
             .map_err(|error| {
                 format!(
-                    "ERROR: Failed to start preprod history sidecar runtime: {}",
+                    "ERROR: Failed to start {} history sidecar runtime: {}",
+                    core_cardano_network.as_str(),
                     error
                 )
             })?;
@@ -170,17 +221,10 @@ pub async fn run_start(
         return Ok(());
     }
 
-    if target == Some(StartTarget::Dapp) {
-        match start_dapp(project_root_path, clean, core_cardano_network) {
-            Ok(_) => logger::log("PASS: IBC Swap dapp started"),
-            Err(error) => return Err(format!("ERROR: Failed to start IBC Swap dapp: {}", error)),
-        };
-        return Ok(());
-    }
-
     if target == Some(StartTarget::Relayer) {
-        if core_cardano_network == config::CoreCardanoNetwork::Preprod {
-            require_preprod_bridge_artifact(
+        if core_cardano_network.is_public_testnet() {
+            require_public_bridge_artifact(
+                core_cardano_network,
                 Path::new(core_cardano_profile.handler_json_path.as_str()),
                 "handler.json",
             )?;
@@ -190,7 +234,10 @@ pub async fn run_start(
             project_root_path.join("relayer").as_path(),
             project_root_path.join("relayer/.env.example").as_path(),
             project_root_path.join("relayer/examples").as_path(),
-            Path::new(core_cardano_profile.handler_json_path.as_str()),
+            core_cardano_profile
+                .bridge_manifest_path
+                .as_deref()
+                .map(Path::new),
             core_cardano_profile.chain_id.as_str(),
             core_cardano_network == config::CoreCardanoNetwork::Local,
             runtime_deployer_sk.as_deref(),
@@ -204,7 +251,7 @@ pub async fn run_start(
             }
         };
 
-        ensure_preprod_optional_relayer_routes(project_root_path, core_cardano_network)?;
+        ensure_public_testnet_relayer_route(project_root_path, core_cardano_network)?;
 
         match start_hermes_daemon() {
             Ok(_) => logger::log("PASS: Hermes daemon started successfully"),
@@ -232,8 +279,8 @@ pub async fn run_start(
                     config::CoreCardanoNetwork::Local => {
                         "cardano-node, ogmios, kupo, postgres, yaci-store, yaci-store-postgres"
                     }
-                    config::CoreCardanoNetwork::Preprod => {
-                        "cardano-node, postgres, yaci-store, yaci-store-postgres"
+                    config::CoreCardanoNetwork::Preprod | config::CoreCardanoNetwork::Preview => {
+                        "postgres, yaci-store, yaci-store-postgres; external Cardano relay, Kupo, and Ogmios"
                     }
                 };
                 logger::log(&format!(
@@ -246,6 +293,7 @@ pub async fn run_start(
                 return fail_and_stop_started_services(
                     project_root_path,
                     StopTarget::Network,
+                    core_cardano_network,
                     &format!(
                         "ERROR: Failed to start managed Cardano {} runtime: {}",
                         core_cardano_network.as_str(),
@@ -281,6 +329,7 @@ pub async fn run_start(
                     return fail_and_stop_started_services(
                         project_root_path,
                         StopTarget::Bridge,
+                        core_cardano_network,
                         &format!("ERROR: Failed to build Aiken validators: {}", error),
                     )
                 }
@@ -288,13 +337,14 @@ pub async fn run_start(
                     return fail_and_stop_started_services(
                         project_root_path,
                         StopTarget::Bridge,
+                        core_cardano_network,
                         &format!("ERROR: Failed to build Aiken validators: {}", error),
                     )
                 }
             }
         }
 
-        if core_cardano_network == config::CoreCardanoNetwork::Preprod {
+        if core_cardano_network.is_public_testnet() {
             if !start_network {
                 crate::start::ensure_managed_cardano_runtime(
                     project_root_path,
@@ -304,7 +354,8 @@ pub async fn run_start(
                 .await
                 .map_err(|error| {
                     format!(
-                        "ERROR: Failed to start preprod history sidecar runtime: {}",
+                        "ERROR: Failed to start {} history sidecar runtime: {}",
+                        core_cardano_network.as_str(),
                         error
                     )
                 })?;
@@ -317,7 +368,8 @@ pub async fn run_start(
             )
             .map_err(|error| {
                 format!(
-                    "ERROR: Failed to prepare preprod gateway runtime: {}",
+                    "ERROR: Failed to prepare {} gateway runtime: {}",
+                    core_cardano_network.as_str(),
                     error
                 )
             })?;
@@ -333,29 +385,40 @@ pub async fn run_start(
                         return fail_and_stop_started_services(
                             project_root_path,
                             StopTarget::Bridge,
+                            core_cardano_network,
                             &format!("ERROR: Failed to deploy Cardano Scripts: {}", error),
                         )
                     }
                 }
             }
-            config::CoreCardanoNetwork::Preprod => {
-                match deploy_preprod_bridge(
+            config::CoreCardanoNetwork::Preprod | config::CoreCardanoNetwork::Preview => {
+                match deploy_public_cardano_bridge(
                     project_root_path,
+                    core_cardano_network,
                     validators_built,
-                    runtime_deployer_sk
-                        .as_deref()
-                        .ok_or("ERROR: Missing runtime DEPLOYER_SK for preprod deploy")?,
+                    runtime_deployer_sk.as_deref().ok_or_else(|| {
+                        format!(
+                            "ERROR: Missing runtime DEPLOYER_SK for {} deploy",
+                            core_cardano_network.as_str()
+                        )
+                    })?,
                 )
                 .await
                 {
-                    Ok(_) => logger::log(
-                        "PASS: IBC smart contracts deployed to Cardano preprod and deployment artifacts exported",
-                    ),
+                    Ok(_) => logger::log(&format!(
+                        "PASS: IBC smart contracts deployed to Cardano {} and deployment artifacts exported",
+                        core_cardano_network.as_str()
+                    )),
                     Err(error) => {
                         return fail_and_stop_started_services(
                             project_root_path,
                             StopTarget::Bridge,
-                            &format!("ERROR: Failed to deploy Cardano preprod bridge: {}", error),
+                            core_cardano_network,
+                            &format!(
+                                "ERROR: Failed to deploy Cardano {} bridge: {}",
+                                core_cardano_network.as_str(),
+                                error
+                            ),
                         )
                     }
                 }
@@ -380,6 +443,7 @@ pub async fn run_start(
                 return fail_and_stop_started_services(
                     project_root_path,
                     StopTarget::Bridge,
+                    core_cardano_network,
                     &format!("ERROR: Failed to start gateway: {}", error),
                 )
             }
@@ -437,6 +501,7 @@ pub async fn run_start(
                     return fail_and_stop_started_services(
                         project_root_path,
                         StopTarget::Bridge,
+                        core_cardano_network,
                         &format!("ERROR: Failed to build Hermes relayer: {}", error),
                     )
                 }
@@ -444,6 +509,7 @@ pub async fn run_start(
                     return fail_and_stop_started_services(
                         project_root_path,
                         StopTarget::Bridge,
+                        core_cardano_network,
                         &format!("ERROR: Failed to build Hermes relayer: {}", error),
                     )
                 }
@@ -454,7 +520,10 @@ pub async fn run_start(
             project_root_path.join("relayer").as_path(),
             project_root_path.join("relayer/.env.example").as_path(),
             project_root_path.join("relayer/examples").as_path(),
-            Path::new(core_cardano_profile.handler_json_path.as_str()),
+            core_cardano_profile
+                .bridge_manifest_path
+                .as_deref()
+                .map(Path::new),
             core_cardano_profile.chain_id.as_str(),
             core_cardano_network == config::CoreCardanoNetwork::Local,
             runtime_deployer_sk.as_deref(),
@@ -464,15 +533,21 @@ pub async fn run_start(
                 return fail_and_stop_started_services(
                     project_root_path,
                     StopTarget::Bridge,
+                    core_cardano_network,
                     &format!("ERROR: Failed to configure Hermes relayer: {}", error),
                 )
             }
         }
 
         if let Err(error) =
-            ensure_preprod_optional_relayer_routes(project_root_path, core_cardano_network)
+            ensure_public_testnet_relayer_route(project_root_path, core_cardano_network)
         {
-            return fail_and_stop_started_services(project_root_path, StopTarget::Bridge, &error);
+            return fail_and_stop_started_services(
+                project_root_path,
+                StopTarget::Bridge,
+                core_cardano_network,
+                &error,
+            );
         }
 
         match start_hermes_daemon() {
@@ -483,6 +558,7 @@ pub async fn run_start(
                 return fail_and_stop_started_services(
                     project_root_path,
                     StopTarget::Bridge,
+                    core_cardano_network,
                     &format!("ERROR: Failed to start Hermes daemon: {}", error),
                 )
             }
@@ -534,13 +610,13 @@ pub async fn run_start(
                     "PASS: Immutable Cardano node files have been created, and Mithril is working as expected",
                 ),
                 Ok(Err(error)) => {
-                    return fail_and_stop_started_services(project_root_path, StopTarget::Bridge, &format!(
+                    return fail_and_stop_started_services(project_root_path, StopTarget::Bridge, core_cardano_network, &format!(
                         "ERROR: Mithril failed to read the immutable cardano node files: {}",
                         error
                     ))
                 }
                 Err(error) => {
-                    return fail_and_stop_started_services(project_root_path, StopTarget::Bridge, &format!(
+                    return fail_and_stop_started_services(project_root_path, StopTarget::Bridge, core_cardano_network, &format!(
                         "ERROR: Mithril genesis bootstrap task failed: {}",
                         error
                     ))
@@ -558,8 +634,34 @@ pub async fn run_start(
         } else {
             logger::log("Next steps:");
             logger::log("   1. Check health: caribic health-check");
-            logger::log("   2. Review exported preprod artifacts in manifests/preprod");
-            logger::log("   3. Restart gateway/relayer independently with `caribic start gateway --network preprod` or `caribic start relayer --network preprod`");
+            logger::log(&format!(
+                "   2. Review exported {} artifacts in manifests/{}",
+                core_cardano_network.as_str(),
+                core_cardano_network.as_str()
+            ));
+            logger::log(&format!(
+                "   3. Restart gateway/relayer independently with `caribic start gateway --network {}` or `caribic start relayer --network {}`",
+                core_cardano_network.as_str(),
+                core_cardano_network.as_str()
+            ));
+        }
+    }
+
+    if start_dapp_target {
+        ensure_active_cardano_runtime_identity(project_root_path, core_cardano_network)?;
+        match start_dapp(project_root_path, clean, core_cardano_network) {
+            Ok(_) => logger::log(&format!(
+                "PASS: IBC Swap dapp started (Next.js UI at {})",
+                ibc_swap_dapp_url()
+            )),
+            Err(error) => {
+                return fail_and_stop_started_services(
+                    project_root_path,
+                    StopTarget::Dapp,
+                    core_cardano_network,
+                    &format!("ERROR: Failed to start IBC Swap dapp: {}", error),
+                )
+            }
         }
     }
 
@@ -574,11 +676,17 @@ pub async fn run_start(
 fn fail_and_stop_started_services(
     _project_root_path: &Path,
     stop_target: StopTarget,
+    network: config::CoreCardanoNetwork,
     message: &str,
 ) -> Result<(), String> {
     logger::error(message);
     logger::log("Stopping services...");
-    crate::commands::stop::run_stop(Some(stop_target), None, Vec::new()).unwrap_or_default();
+    crate::commands::stop::run_stop(
+        Some(stop_target),
+        Some(network.as_str().to_string()),
+        Vec::new(),
+    )
+    .unwrap_or_default();
     Err(message.to_string())
 }
 
@@ -608,5 +716,46 @@ fn format_elapsed_duration(duration: Duration) -> String {
         format!("{seconds}s")
     } else {
         format!("{}ms", duration.subsec_millis())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{requires_injective_testnet_route, target_starts_dapp};
+    use crate::{config::CoreCardanoNetwork, StartTarget};
+
+    #[test]
+    fn default_and_all_targets_start_the_dapp() {
+        assert!(target_starts_dapp(None));
+        assert!(target_starts_dapp(Some(&StartTarget::All)));
+    }
+
+    #[test]
+    fn standalone_dapp_target_starts_the_dapp() {
+        assert!(target_starts_dapp(Some(&StartTarget::Dapp)));
+    }
+
+    #[test]
+    fn non_dapp_targets_do_not_start_the_dapp() {
+        for target in [
+            StartTarget::Network,
+            StartTarget::Bridge,
+            StartTarget::Gateway,
+            StartTarget::Relayer,
+            StartTarget::Mithril,
+        ] {
+            assert!(!target_starts_dapp(Some(&target)));
+        }
+    }
+
+    #[test]
+    fn both_public_cardano_testnets_require_the_injective_route() {
+        assert!(!requires_injective_testnet_route(CoreCardanoNetwork::Local));
+        assert!(requires_injective_testnet_route(
+            CoreCardanoNetwork::Preprod
+        ));
+        assert!(requires_injective_testnet_route(
+            CoreCardanoNetwork::Preview
+        ));
     }
 }

@@ -25,7 +25,15 @@ export type WithLegacyChannelContext = {
 };
 
 export type WithTransferModuleReferenceUtxo = {
-  transferModuleReferenceUtxo?: UTxO;
+  transferModuleReferenceUtxo: UTxO;
+};
+
+export type WithRequiredTransferModuleReferenceUtxo = {
+  transferModuleReferenceUtxo: UTxO;
+};
+
+export type WithTransferModuleUtxo = {
+  transferModuleUtxo: UTxO;
 };
 
 export type WithMockModuleUtxo = {
@@ -65,10 +73,6 @@ export type WithMintVoucherRedeemer = {
   encodedMintVoucherRedeemer: string;
 };
 
-export type WithMintTransferEscrowShardRedeemer = {
-  encodedMintTransferEscrowShardRedeemer?: string;
-};
-
 export type WithVoucherMetadataOutput = {
   voucherReferenceTokenUnit?: string;
   voucherMetadataAddress?: string;
@@ -86,8 +90,7 @@ export type TraceRegistryAppendUpdate = {
 
 export type TraceRegistryExistingProof = {
   kind: "existing";
-  traceRegistryDirectoryUtxo: UTxO;
-  traceRegistryShardWitnessUtxos: UTxO[];
+  traceRegistryMappingWitnessUtxos: UTxO[];
 };
 
 export type TraceRegistryRolloverUpdate = {

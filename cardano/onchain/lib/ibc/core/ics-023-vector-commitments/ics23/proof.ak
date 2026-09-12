@@ -8,6 +8,9 @@ use ibc/core/ics_023_vector_commitments/ics23/proofs.{
   ExistenceProof, InnerOp, InnerSpec, LeafOp, NonExistenceProof, ProofSpec,
 }
 
+/// ICS-23 interprets an unset max_depth as a 128-step cap.
+const default_max_depth = 128
+
 /// calculate() determines the root hash that matches a given Commitment proof
 pub fn calculate(p: CommitmentProof) -> CommitmentRoot {
   when p.proof is {
@@ -33,6 +36,20 @@ pub fn verify_existence_proof(
     value == p.value,
     root == calculate_exist_internal(p, spec),
   }
+}
+
+/// Validate a chained proof's spec, key and value, then hash its path once.
+/// The caller must still compare the final chained root with its trusted root.
+pub fn calculate_checked_existence_root(
+  p: ExistenceProof,
+  spec: ProofSpec,
+  key: ByteArray,
+  value: ByteArray,
+) -> CommitmentRoot {
+  expect check_against_spec(p, spec)
+  expect key == p.key
+  expect value == p.value
+  calculate_exist_internal(p, spec)
 }
 
 /// Verify does all checks to ensure the proof has valid non-existence proofs,
@@ -70,24 +87,31 @@ pub fn verify_non_existence_proof(
       },
       #[],
     )
-  // If both proofs are missing, this is not a valid proof
-  and {
-    !(bytearray.is_empty(left_key) && bytearray.is_empty(right_key)),
-    !(!bytearray.is_empty(right_key) && !(bytearray.compare(
-      key_for_comparison(spec, key),
-      key_for_comparison(spec, right_key),
-    ) == Less)),
-    !(!bytearray.is_empty(left_key) && !(bytearray.compare(
-      key_for_comparison(spec, key),
-      key_for_comparison(spec, left_key),
-    ) == Greater)),
-    if bytearray.is_empty(left_key) {
-      is_left_most(spec.inner_spec, p.right.path)
-    } else if bytearray.is_empty(right_key) {
-      is_right_most(spec.inner_spec, p.left.path)
-    } else {
-      is_left_neighbor(spec.inner_spec, p.left.path, p.right.path)
-    },
+  let has_left_neighbor = !bytearray.is_empty(left_key)
+  let has_right_neighbor = !bytearray.is_empty(right_key)
+
+  // Preserve the missing-neighbor short circuit so an invalid empty proof never hashes the query key.
+  if !has_left_neighbor && !has_right_neighbor {
+    False
+  } else {
+    let comparison_key = key_for_comparison(spec, key)
+    and {
+      !has_right_neighbor || bytearray.compare(
+        comparison_key,
+        key_for_comparison(spec, right_key),
+      ) == Less,
+      !has_left_neighbor || bytearray.compare(
+        comparison_key,
+        key_for_comparison(spec, left_key),
+      ) == Greater,
+      if !has_left_neighbor {
+        is_left_most(spec.inner_spec, p.right.path)
+      } else if !has_right_neighbor {
+        is_right_most(spec.inner_spec, p.left.path)
+      } else {
+        is_left_neighbor(spec.inner_spec, p.left.path, p.right.path)
+      },
+    }
   }
 }
 
@@ -143,8 +167,15 @@ pub fn check_against_spec(p: ExistenceProof, spec: ProofSpec) -> Bool {
   let leaf = get_leaf_existence_proof(p)
   expect leaf != proofs.null_leaf_op()
   expect ops.check_against_spec_leaf_op(leaf, spec, is_iavl_spec)
-  expect !(spec.min_depth > 0 && list.length(p.path) < spec.min_depth)
-  expect !(spec.max_depth > 0 && list.length(p.path) > spec.max_depth)
+  let path_length = list.length(p.path)
+  expect !(spec.min_depth > 0 && path_length < spec.min_depth)
+  let max_depth =
+    if spec.max_depth == 0 {
+      default_max_depth
+    } else {
+      spec.max_depth
+    }
+  expect path_length <= max_depth
 
   let inner_spec = spec.inner_spec
   expect inner_spec != proofs.null_inner_spec()
@@ -162,7 +193,7 @@ pub fn check_against_spec(p: ExistenceProof, spec: ProofSpec) -> Bool {
           ops.check_against_spec_inner_op(
             inner,
             spec,
-            layer_num,
+            accum_layer_num,
             inner_spec,
             max_op_prefix_length,
             is_iavl_spec,
@@ -248,71 +279,39 @@ pub fn is_left_neighbor(
   left: List<InnerOp>,
   right: List<InnerOp>,
 ) -> Bool {
-  let (l, r, opt_top_left, otp_top_right, _is_break) =
-    list.range(0, list.length(left) - 1)
-      |> list.reduce(
-          (
-            list.slice(left, 0, list.length(left) - 2),
-            list.slice(right, 0, list.length(right) - 2),
-            list.at(left, list.length(left) - 1),
-            list.at(right, list.length(right) - 1),
-            False,
-          ),
-          fn(accum, _i) {
-            if accum.5th == False {
-              expect Some(t_left) = accum.3rd
-              expect Some(t_right) = accum.4th
-              if t_left.prefix == t_right.prefix && t_left.suffix == t_right.suffix {
-                if list.length(accum.1st) < 2 && list.length(accum.2nd) < 2 {
-                  (
-                    [],
-                    [],
-                    list.at(accum.1st, list.length(accum.1st) - 1),
-                    list.at(accum.2nd, list.length(accum.2nd) - 1),
-                    False,
-                  )
-                } else if list.length(accum.1st) < 2 && list.length(accum.2nd) >= 2 {
-                  (
-                    [],
-                    list.slice(accum.2nd, 0, list.length(accum.2nd) - 2),
-                    list.at(accum.1st, list.length(accum.1st) - 1),
-                    list.at(accum.2nd, list.length(accum.2nd) - 1),
-                    False,
-                  )
-                } else if list.length(accum.1st) >= 2 && list.length(accum.2nd) < 2 {
-                  (
-                    list.slice(accum.1st, 0, list.length(accum.1st) - 2),
-                    [],
-                    list.at(accum.1st, list.length(accum.1st) - 1),
-                    list.at(accum.2nd, list.length(accum.2nd) - 1),
-                    False,
-                  )
-                } else {
-                  (
-                    list.slice(accum.1st, 0, list.length(accum.1st) - 2),
-                    list.slice(accum.2nd, 0, list.length(accum.2nd) - 2),
-                    list.at(accum.1st, list.length(accum.1st) - 1),
-                    list.at(accum.2nd, list.length(accum.2nd) - 1),
-                    False,
-                  )
-                }
-              } else {
-                (accum.1st, accum.2nd, accum.3rd, accum.4th, True)
-              }
-            } else {
-              accum
-            }
-          },
-        )
-  expect Some(top_left) = opt_top_left
-  expect Some(top_right) = otp_top_right
-  if !is_left_step(spec, top_left, top_right) || !is_right_most(spec, l) || !is_left_most(
+  neighbors_from_root(
     spec,
-    r,
-  ) {
-    False
+    path_from_root(left),
+    path_from_root(right),
+    list.length(left),
+  )
+}
+
+fn path_from_root(path: List<InnerOp>) -> List<InnerOp> {
+  when list.reverse(path) is {
+    // The previous initial slice(0, length - 2) retained a singleton's top
+    // step as its remaining branch. Preserve that behavior here.
+    [step] -> [step, step]
+    reversed -> reversed
+  }
+}
+
+fn neighbors_from_root(
+  spec: InnerSpec,
+  left: List<InnerOp>,
+  right: List<InnerOp>,
+  remaining: Int,
+) -> Bool {
+  expect [top_left, ..left_rest] = left
+  expect [top_right, ..right_rest] = right
+  if remaining > 0 && top_left.prefix == top_right.prefix && top_left.suffix == top_right.suffix {
+    neighbors_from_root(spec, left_rest, right_rest, remaining - 1)
   } else {
-    True
+    and {
+      is_left_step(spec, top_left, top_right),
+      is_right_most(spec, list.reverse(left_rest)),
+      is_left_most(spec, list.reverse(right_rest)),
+    }
   }
 }
 

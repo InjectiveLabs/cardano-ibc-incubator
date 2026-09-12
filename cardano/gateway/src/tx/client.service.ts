@@ -1,16 +1,22 @@
 import {
   MsgCreateClientResponse,
   MsgCreateClient,
+  MsgRecoverClient,
+  MsgRecoverClientResponse,
   MsgUpdateClient,
   MsgUpdateClientResponse,
-} from '@plus/proto-types/build/ibc/core/client/v1/tx';
+} from '@cardano-ibc/proto-types/build/ibc/core/client/v1/tx';
 import { Network, TxBuilder, UTxO } from '@lucid-evolution/lucid';
 
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { ConsensusState } from '../shared/types/consensus-state';
 import { ClientState } from '../shared/types/client-state-types';
 import { LucidService } from 'src/shared/modules/lucid/lucid.service';
-import { GrpcInternalException, GrpcInvalidArgumentException } from '~@/exception/grpc_exceptions';
+import {
+  GrpcFailedPreconditionException,
+  GrpcInternalException,
+  GrpcInvalidArgumentException,
+} from '~@/exception/grpc_exceptions';
 import { decodeHeader, initializeHeader } from '../shared/types/header';
 import { RpcException } from '@nestjs/microservices';
 import { HostStateDatum } from 'src/shared/types/host-state-datum';
@@ -33,24 +39,24 @@ import {
   verifyClientMessage,
 } from '../shared/types/msgs/client-message';
 import { checkForMisbehaviour, TENDERMINT_MISBEHAVIOUR_TYPE_URL } from '@shared/types/misbehaviour/misbehaviour';
-import { UpdateOnMisbehaviourOperatorDto, UpdateClientOperatorDto } from './dto';
-import { validateAndFormatCreateClientParams, validateAndFormatUpdateClientParams } from './helper/client.validate';
+import { RecoverClientOperatorDto, UpdateOnMisbehaviourOperatorDto, UpdateClientOperatorDto } from './dto';
+import {
+  validateAndFormatCreateClientParams,
+  validateAndFormatRecoverClientParams,
+  validateAndFormatUpdateClientParams,
+  validateUpdateHeaderAdvancesLatestHeight,
+} from './helper/client.validate';
 import { sumLovelaceFromUtxos } from './helper/helper';
 import { TRANSACTION_SET_COLLATERAL, TRANSACTION_TIME_TO_LIVE } from '~@/config/constant.config';
-import {
-  computeRootWithClientUpdate as computeRootWithClientUpdateHelper,
-  computeRootWithCreateClientUpdate,
-  computeRootWithUpdateClientUpdate,
-  alignTreeWithChain,
-  isTreeAligned,
-} from '../shared/helpers/ibc-state-root';
+import { IbcTreeStateStore, StaleIbcTreeStateError } from '../shared/helpers/ibc-state-root';
 import { PendingTreeUpdate } from '../shared/services/ibc-tree-pending-updates.service';
 import { TxOperationRunnerService } from './tx-operation-runner.service';
 import { computeLedgerAnchoredValidityWindow } from '../shared/helpers/time';
-import { Any } from '@plus/proto-types/build/google/protobuf/any';
+import { Any } from '@cardano-ibc/proto-types/build/google/protobuf/any';
 import { toHex } from '../shared/helpers/hex';
 import type { GatewayEvent } from './tx-events.service';
 import { getHeightMapValue, getProcessedHeight } from '../shared/helpers/verify';
+import { isDeepStrictEqual } from 'node:util';
 
 @Injectable()
 export class ClientService {
@@ -59,6 +65,7 @@ export class ClientService {
     private configService: ConfigService,
     @Inject(LucidService) private lucidService: LucidService,
     private readonly txOperationRunnerService: TxOperationRunnerService,
+    private readonly ibcTreeStore: IbcTreeStateStore,
   ) {}
 
   private async refreshWalletContext(address: string, context: string): Promise<void> {
@@ -107,40 +114,15 @@ export class ClientService {
   }
 
   /**
-   * Computes the new IBC state root after client update
-   *
-   * IMPORTANT: This is now side-effect free. The result contains a commit()
-   * function that should be called after tx confirmation, but for simplicity
-   * we just return the newRoot and let the next operation rebuild from chain.
-   *
-   * @param oldRoot - Current IBC state root
-   * @param clientId - Client identifier (e.g., "07-tendermint-0")
-   * @param clientState - The client state to store
-   * @param consensusState - Optional consensus state (required for CreateClient)
-   * @param consensusHeight - Height key for the consensus state
-   * @returns The new IBC state root (64-character hex string)
-   */
-  private computeRootWithClientUpdate(
-    oldRoot: string,
-    clientId: string,
-    clientState: any,
-    consensusState?: any,
-    consensusHeight?: string | number | bigint,
-  ): string {
-    const result = computeRootWithClientUpdateHelper(oldRoot, clientId, clientState, consensusState, consensusHeight);
-    // Note: Not calling result.commit() - the tree will be rebuilt from chain on next operation
-    // This is safer because it handles failed transactions automatically
-    return result.newRoot;
-  }
-
-  /**
    * Ensure the in-memory Merkle tree is aligned with on-chain state
    * Call this before building transactions if the tree may be stale
    */
-  private async ensureTreeAligned(onChainRoot: string): Promise<void> {
-    if (!isTreeAligned(onChainRoot)) {
-      this.logger.warn(`Tree is out of sync with on-chain root ${onChainRoot.substring(0, 16)}..., rebuilding...`);
-      await alignTreeWithChain();
+  private async ensureTreeAligned(onChainRoot: string, hostStateUtxo: Pick<UTxO, 'txHash' | 'outputIndex'>): Promise<void> {
+    const snapshot = await this.ibcTreeStore.getAlignedSnapshot();
+    if (snapshot.root !== onChainRoot ||
+      snapshot.hostState.txHash !== hostStateUtxo.txHash ||
+      snapshot.hostState.outputIndex !== hostStateUtxo.outputIndex) {
+      throw new StaleIbcTreeStateError('HostState changed while preparing the transaction, retry with current inputs');
     }
   }
 
@@ -151,16 +133,109 @@ export class ClientService {
     validToSlot: number;
     validToTime: number;
   }> {
-    const ogmiosEndpoint = this.configService.get<string>('ogmiosEndpoint');
+    const ogmiosEndpoint = this.configService.getOrThrow<string>('ogmiosEndpoint');
     const network = this.configService.get('cardanoNetwork') as Network;
     const slotConfig = this.lucidService.LucidImporter.SLOT_CONFIG_NETWORK?.[network];
     if (!slotConfig || slotConfig.slotLength <= 0) {
       throw new GrpcInternalException(`client tx failed: invalid slot configuration for network ${network}`);
     }
 
-    return computeLedgerAnchoredValidityWindow(ogmiosEndpoint, slotConfig, TRANSACTION_TIME_TO_LIVE, {
+    const validity = await computeLedgerAnchoredValidityWindow(ogmiosEndpoint, slotConfig, TRANSACTION_TIME_TO_LIVE, {
       backdateMs,
     });
+    // Lucid encodes slots, and validators see their start times. In particular,
+    // the helper's end-of-slot validToTime is not the on-chain upper bound.
+    const { slotToUnixTime, unixTimeToSlot } = this.lucidService.LucidImporter;
+    return {
+      ...validity,
+      validFromTime: slotToUnixTime(network, unixTimeToSlot(network, validity.validFromTime)),
+      validToTime: slotToUnixTime(network, validity.validToSlot),
+    };
+  }
+
+  private isZeroHeight(height: Height): boolean {
+    return height.revisionNumber === 0n && height.revisionHeight === 0n;
+  }
+
+  private isHeightGreater(left: Height, right: Height): boolean {
+    return (
+      left.revisionNumber > right.revisionNumber ||
+      (left.revisionNumber === right.revisionNumber && left.revisionHeight > right.revisionHeight)
+    );
+  }
+
+  private isSameHeight(left: Height, right: Height): boolean {
+    return left.revisionNumber === right.revisionNumber && left.revisionHeight === right.revisionHeight;
+  }
+
+  private recoveryParametersMatch(subject: ClientState, substitute: ClientState): boolean {
+    return (
+      subject.chainId === substitute.chainId &&
+      subject.trustLevel.numerator === substitute.trustLevel.numerator &&
+      subject.trustLevel.denominator === substitute.trustLevel.denominator &&
+      subject.trustingPeriod === substitute.trustingPeriod &&
+      subject.unbondingPeriod === substitute.unbondingPeriod &&
+      subject.maxClockDrift === substitute.maxClockDrift &&
+      isDeepStrictEqual(subject.proofSpecs, substitute.proofSpecs)
+    );
+  }
+
+  private validateRecoveryState(
+    subjectDatum: ClientDatum,
+    substituteDatum: ClientDatum,
+    validToNs: bigint,
+  ): { height: Height; consensusState: ConsensusState; processedTime: bigint; processedHeight: bigint } {
+    const subjectState = subjectDatum.state.clientState;
+    const substituteState = substituteDatum.state.clientState;
+    const subjectLatestConsensus = getHeightMapValue(subjectDatum.state.consensusStates, subjectState.latestHeight);
+    const subjectIsActive =
+      this.isZeroHeight(subjectState.frozenHeight) &&
+      subjectLatestConsensus !== undefined &&
+      subjectLatestConsensus.timestamp + subjectState.trustingPeriod > validToNs;
+    if (subjectIsActive) {
+      throw new GrpcFailedPreconditionException('Subject client must be frozen or expired');
+    }
+
+    if (!this.isZeroHeight(substituteState.frozenHeight)) {
+      throw new GrpcFailedPreconditionException('Substitute client must be active');
+    }
+    const substituteConsensus = getHeightMapValue(substituteDatum.state.consensusStates, substituteState.latestHeight);
+    if (!substituteConsensus || substituteConsensus.timestamp + substituteState.trustingPeriod <= validToNs) {
+      throw new GrpcFailedPreconditionException('Substitute client must be active');
+    }
+    if (!this.isHeightGreater(substituteState.latestHeight, subjectState.latestHeight)) {
+      throw new GrpcFailedPreconditionException('Substitute client must be newer than the subject client');
+    }
+    if (!this.recoveryParametersMatch(subjectState, substituteState)) {
+      throw new GrpcFailedPreconditionException('Subject and substitute client parameters do not match');
+    }
+    if (subjectDatum.state.consensusStates.size > MAX_CONSENSUS_STATE_SIZE) {
+      throw new GrpcFailedPreconditionException('Subject client consensus-state history exceeds the configured limit');
+    }
+    const consensusKeys = Array.from(subjectDatum.state.consensusStates.keys());
+    const processedTimeKeys = Array.from(subjectDatum.state.processedTimes.keys());
+    const processedHeightKeys = Array.from(subjectDatum.state.processedHeights.keys());
+    const keysMatch = (candidate: Height[]) =>
+      candidate.length === consensusKeys.length &&
+      candidate.every((height, index) => this.isSameHeight(height, consensusKeys[index]));
+    if (!keysMatch(processedTimeKeys) || !keysMatch(processedHeightKeys)) {
+      throw new GrpcFailedPreconditionException(
+        'Subject client consensus-state history and processed metadata keys do not match',
+      );
+    }
+
+    const processedTime = getHeightMapValue(substituteDatum.state.processedTimes, substituteState.latestHeight);
+    const processedHeight = getHeightMapValue(substituteDatum.state.processedHeights, substituteState.latestHeight);
+    if (processedTime === undefined || processedHeight === undefined) {
+      throw new GrpcFailedPreconditionException('Substitute client is missing processed metadata at its latest height');
+    }
+
+    return {
+      height: substituteState.latestHeight,
+      consensusState: substituteConsensus,
+      processedTime,
+      processedHeight,
+    };
   }
   /**
    * Processes the creation of a client tx.
@@ -174,13 +249,13 @@ export class ClientService {
       await this.refreshWalletContext(constructedAddress, 'createClientBuilder');
       const { validFromTime: validFromTimestamp, validToTime: validToTimestamp } =
         await this.computeTxValidityWindow(60_000);
-      const txValidFromNs = BigInt(validFromTimestamp) * 1_000_000n;
+      const txValidToNs = BigInt(validToTimestamp) * 1_000_000n;
       // Build unsigned create client transaction
       const { unsignedTx: unsignedCreateClientTx, clientId, pendingTreeUpdate } = await this.buildUnsignedCreateClientTx(
         clientState,
         consensusState,
         constructedAddress,
-        txValidFromNs,
+        txValidToNs,
       );
 
       this.logger.log(`[DEBUG] Setting validity: validFrom=${new Date(validFromTimestamp).toISOString()}, validTo=${new Date(validToTimestamp).toISOString()}`);
@@ -249,7 +324,7 @@ export class ClientService {
    */
   async updateClient(data: MsgUpdateClient): Promise<MsgUpdateClientResponse> {
     try {
-      const { clientId, constructedAddress } = validateAndFormatUpdateClientParams(data);
+      const { clientId, constructedAddress, clientMessage } = validateAndFormatUpdateClientParams(data);
 
       // Get the token unit associated with the client
       const clientTokenUnit = this.lucidService.getClientTokenUnit(clientId);
@@ -261,18 +336,18 @@ export class ClientService {
         'client',
       );
 
-      if (!verifyClientMessage(data.client_message, currentClientDatum)) {
+      if (!verifyClientMessage(clientMessage, currentClientDatum)) {
         throw new GrpcInvalidArgumentException('Invalid client message');
       }
 
-      const foundMisbehaviour = checkForMisbehaviour(data.client_message, currentClientDatum);
+      const foundMisbehaviour = checkForMisbehaviour(clientMessage, currentClientDatum);
 
       if (foundMisbehaviour) {
         await this.refreshWalletContext(constructedAddress, 'updateClientOnMisbehaviourBuilder');
         // Build and complete the unsigned transaction
         const updateOnMisbehaviourOperator: UpdateOnMisbehaviourOperatorDto = {
           clientId,
-          clientMessage: data.client_message,
+          clientMessage,
           constructedAddress,
           clientDatum: currentClientDatum,
           clientTokenUnit,
@@ -315,7 +390,7 @@ export class ClientService {
               EVENT_TYPE_CLIENT.CLIENT_MISBEHAVIOR,
               clientId,
               frozenHeight,
-              data.client_message,
+              clientMessage,
             ),
           ],
         });
@@ -331,10 +406,10 @@ export class ClientService {
         } as unknown as MsgUpdateClientResponse;
         return response;
       }
-      if (data.client_message.type_url === TENDERMINT_MISBEHAVIOUR_TYPE_URL) {
+      if (clientMessage.type_url === TENDERMINT_MISBEHAVIOUR_TYPE_URL) {
         throw new GrpcInvalidArgumentException('submitted Tendermint misbehaviour does not prove a conflict');
       }
-      const headerMsg = decodeHeader(data.client_message.value);
+      const headerMsg = decodeHeader(clientMessage.value);
       const header = initializeHeader(headerMsg);
       const updateConsensusHeight = {
         revisionNumber: header.trustedHeight.revisionNumber,
@@ -374,6 +449,7 @@ export class ClientService {
         clientTokenUnit,
         currentClientUtxo,
         txValidFrom: txValidFromNs,
+        txValidTo: BigInt(validToTimeMs) * 1_000_000n,
       };
 
       await this.refreshWalletContext(constructedAddress, 'updateClientBuilder');
@@ -400,7 +476,7 @@ export class ClientService {
             EVENT_TYPE_CLIENT.UPDATE_CLIENT,
             clientId,
             updateConsensusHeight,
-            data.client_message,
+            clientMessage,
           ),
         ],
       });
@@ -426,6 +502,116 @@ export class ClientService {
       }
     }
   }
+
+  async recoverClient(data: MsgRecoverClient): Promise<MsgRecoverClientResponse> {
+    try {
+      const { subjectClientId, substituteClientId, constructedAddress } =
+        validateAndFormatRecoverClientParams(data);
+      const recoveryConfig = this.configService.get('deployment')?.validators?.recoverClient;
+      if (!recoveryConfig?.address || !recoveryConfig?.refUtxo) {
+        throw new GrpcFailedPreconditionException(
+          'Tendermint client recovery is not configured for this deployment',
+        );
+      }
+
+      const hostStateUtxo = await this.lucidService.findUtxoAtHostStateNFT();
+      if (!hostStateUtxo.datum) {
+        throw new GrpcInternalException('HostState UTXO has no datum');
+      }
+      const hostStateDatum = await this.lucidService.decodeDatum<HostStateDatum>(
+        hostStateUtxo.datum,
+        'host_state',
+      );
+
+      let signerKeyHash: string;
+      try {
+        const paymentCredential = this.lucidService.getPaymentCredential(constructedAddress);
+        if (!paymentCredential || paymentCredential.type !== 'Key') {
+          throw new Error('signer does not use a key payment credential');
+        }
+        signerKeyHash = paymentCredential.hash;
+      } catch {
+        throw new GrpcInvalidArgumentException('Recover client signer is not a valid Cardano address');
+      }
+      if (signerKeyHash.toLowerCase() !== hostStateDatum.deployer.toLowerCase()) {
+        throw new GrpcFailedPreconditionException(
+          'Recover client signer does not match the deployment recovery authority',
+        );
+      }
+
+      const subjectClientTokenUnit = this.lucidService.getClientTokenUnit(subjectClientId);
+      const substituteClientTokenUnit = this.lucidService.getClientTokenUnit(substituteClientId);
+      const [subjectClientUtxo, substituteClientUtxo] = await Promise.all([
+        this.lucidService.findUtxoByUnit(subjectClientTokenUnit),
+        this.lucidService.findUtxoByUnit(substituteClientTokenUnit),
+      ]);
+      const [subjectClientDatum, substituteClientDatum] = await Promise.all([
+        this.lucidService.decodeDatum<ClientDatum>(subjectClientUtxo.datum!, 'client'),
+        this.lucidService.decodeDatum<ClientDatum>(substituteClientUtxo.datum!, 'client'),
+      ]);
+      const { validFromTime, validToTime } = await this.computeTxValidityWindow(60_000);
+
+      await this.refreshWalletContext(constructedAddress, 'recoverClientBuilder');
+      const { unsignedTx, pendingTreeUpdate } = await this.buildUnsignedRecoverClientTx({
+        subjectClientId,
+        substituteClientId,
+        constructedAddress,
+        subjectClientDatum,
+        substituteClientDatum,
+        subjectClientTokenUnit,
+        subjectClientUtxo,
+        substituteClientUtxo,
+        hostStateUtxo,
+        hostStateDatum,
+        signerKeyHash,
+        txValidTo: BigInt(validToTime) * 1_000_000n,
+      });
+      const { unsignedTxBytes } = await this.txOperationRunnerService.run({
+        operationName: 'recoverClient',
+        unsignedTx,
+        validity: {
+          apply: (builder: TxBuilder) => builder.validFrom(validFromTime).validTo(validToTime),
+        },
+        wallet: {
+          mode: 'refresh_from_address',
+          address: constructedAddress,
+          context: 'recoverClient',
+        },
+        completeOptions: {
+          localUPLCEval: false,
+          setCollateral: TRANSACTION_SET_COLLATERAL,
+        },
+        pendingTreeUpdate,
+        syntheticEvents: [
+          {
+            type: EVENT_TYPE_CLIENT.RECOVER_CLIENT,
+            attributes: [
+              { key: ATTRIBUTE_KEY_CLIENT.SUBJECT_CLIENT_ID, value: `${CLIENT_ID_PREFIX}-${subjectClientId}` },
+              { key: ATTRIBUTE_KEY_CLIENT.CLIENT_TYPE, value: CLIENT_ID_PREFIX },
+              {
+                key: ATTRIBUTE_KEY_CLIENT.SUBSTITUTE_CLIENT_ID,
+                value: `${CLIENT_ID_PREFIX}-${substituteClientId}`,
+              },
+            ],
+          },
+        ],
+      });
+
+      return {
+        unsigned_tx: {
+          type_url: '',
+          value: unsignedTxBytes,
+        },
+      } as MsgRecoverClientResponse;
+    } catch (error) {
+      this.logger.error(`recoverClient: ${error}`);
+      if (!(error instanceof RpcException)) {
+        throw new GrpcInternalException(`An unexpected error occurred. ${error.stack}`);
+      }
+      throw error;
+    }
+  }
+
   public async buildUnsignedUpdateOnMisbehaviour(
     updateOnMisbehaviourOperator: UpdateOnMisbehaviourOperatorDto,
   ): Promise<{ unsignedTx: TxBuilder; pendingTreeUpdate: PendingTreeUpdate }> {
@@ -469,7 +655,7 @@ export class ClientService {
       hostStateUtxo.datum,
       'host_state',
     );
-    await this.ensureTreeAligned(hostStateDatum.state.ibc_state_root);
+    await this.ensureTreeAligned(hostStateDatum.state.ibc_state_root, hostStateUtxo);
 
     // The IBC client identifier used in the commitment tree matches the on-chain convention.
     const ibcClientId = `07-tendermint-${updateOnMisbehaviourOperator.clientId}`;
@@ -490,21 +676,18 @@ export class ClientService {
       }
     }
 
-    // Misbehaviour updates do not add a new consensus state.
-    const addedConsensusState = undefined;
-
     const newClientStateValue = Buffer.from(
       await encodeClientStateValue(newClientState, this.lucidService.LucidImporter),
       'hex',
     );
 
     const { newRoot, clientStateSiblings, consensusStateSiblings, removedConsensusStateSiblings, commit } =
-      computeRootWithUpdateClientUpdate(
+      this.ibcTreeStore.computeRootWithUpdateClientUpdate(
         hostStateDatum.state.ibc_state_root,
         ibcClientId,
         newClientStateValue,
         removedConsensusHeights,
-        addedConsensusState,
+        undefined,
       );
 
     const updatedHostStateDatum: HostStateDatum = {
@@ -562,6 +745,10 @@ export class ClientService {
       },
     };
     const headerHeight = header.signedHeader.header.height;
+    validateUpdateHeaderAdvancesLatestHeight(
+      headerHeight,
+      currentClientDatumState.clientState.latestHeight,
+    );
     const newHeight: Height = {
       ...currentClientDatumState.clientState.latestHeight,
       revisionHeight: headerHeight,
@@ -605,7 +792,7 @@ export class ClientService {
       currentConsStateInArray.map(([height]) => [
         height,
         height.revisionHeight === newHeight.revisionHeight && height.revisionNumber === newHeight.revisionNumber
-          ? updateClientOperator.txValidFrom
+          ? updateClientOperator.txValidTo
           : getHeightMapValue(currentClientDatumState.processedTimes, height) ?? 0n,
       ]),
     );
@@ -613,7 +800,7 @@ export class ClientService {
       currentConsStateInArray.map(([height]) => [
         height,
         height.revisionHeight === newHeight.revisionHeight && height.revisionNumber === newHeight.revisionNumber
-          ? getProcessedHeight(updateClientOperator.txValidFrom)
+          ? getProcessedHeight(updateClientOperator.txValidTo)
           : getHeightMapValue(currentClientDatumState.processedHeights, height) ?? 0n,
       ]),
     );
@@ -640,7 +827,7 @@ export class ClientService {
       hostStateUtxo.datum,
       'host_state',
     );
-    await this.ensureTreeAligned(hostStateDatum.state.ibc_state_root);
+    await this.ensureTreeAligned(hostStateDatum.state.ibc_state_root, hostStateUtxo);
 
     const ibcClientId = `07-tendermint-${updateClientOperator.clientId}`;
 
@@ -691,7 +878,7 @@ export class ClientService {
     );
 
     const { newRoot, clientStateSiblings, consensusStateSiblings, removedConsensusStateSiblings, commit } =
-      computeRootWithUpdateClientUpdate(
+      this.ibcTreeStore.computeRootWithUpdateClientUpdate(
         hostStateDatum.state.ibc_state_root,
         ibcClientId,
         newClientStateValue,
@@ -736,6 +923,155 @@ export class ClientService {
       pendingTreeUpdate: { expectedNewRoot: newRoot, commit },
     };
   }
+
+  public async buildUnsignedRecoverClientTx(
+    operator: RecoverClientOperatorDto,
+  ): Promise<{ unsignedTx: TxBuilder; pendingTreeUpdate: PendingTreeUpdate }> {
+    const recoveryState = this.validateRecoveryState(
+      operator.subjectClientDatum,
+      operator.substituteClientDatum,
+      operator.txValidTo,
+    );
+    if (
+      Array.from(operator.subjectClientDatum.state.consensusStates.keys()).some((height) =>
+        this.isSameHeight(height, recoveryState.height),
+      )
+    ) {
+      throw new GrpcFailedPreconditionException(
+        'Subject client already contains the substitute latest consensus state',
+      );
+    }
+
+    const subjectHistory = Array.from(operator.subjectClientDatum.state.consensusStates.entries()).map(
+      ([height, consensusState]) => {
+        const processedTime = getHeightMapValue(operator.subjectClientDatum.state.processedTimes, height);
+        const processedHeight = getHeightMapValue(operator.subjectClientDatum.state.processedHeights, height);
+        if (processedTime === undefined || processedHeight === undefined) {
+          throw new GrpcFailedPreconditionException(
+            'Subject client consensus-state history is missing processed metadata',
+          );
+        }
+        return { height, consensusState, processedTime, processedHeight };
+      },
+    );
+    const retainedHistory = [recoveryState, ...subjectHistory].slice(0, MAX_CONSENSUS_STATE_SIZE);
+    const newClientState: ClientState = {
+      ...operator.subjectClientDatum.state.clientState,
+      frozenHeight: { revisionNumber: 0n, revisionHeight: 0n },
+      latestHeight: recoveryState.height,
+    };
+    const recoveredClientDatum: ClientDatum = {
+      ...operator.subjectClientDatum,
+      state: {
+        clientState: newClientState,
+        consensusStates: new Map(
+          retainedHistory.map(({ height, consensusState }) => [height, consensusState]),
+        ),
+        processedTimes: new Map(
+          retainedHistory.map(({ height, processedTime }) => [height, processedTime]),
+        ),
+        processedHeights: new Map(
+          retainedHistory.map(({ height, processedHeight }) => [height, processedHeight]),
+        ),
+      },
+    };
+
+    await this.ensureTreeAligned(operator.hostStateDatum.state.ibc_state_root, operator.hostStateUtxo);
+    const outputHeightKeys = new Set(
+      retainedHistory.map(
+        ({ height }) => `${height.revisionNumber.toString()}-${height.revisionHeight.toString()}`,
+      ),
+    );
+    const removedConsensusHeights = Array.from(
+      operator.subjectClientDatum.state.consensusStates.keys(),
+    )
+      .filter(
+        (height) =>
+          !outputHeightKeys.has(`${height.revisionNumber.toString()}-${height.revisionHeight.toString()}`),
+      )
+      .map((height) => height.revisionHeight.toString());
+    if (removedConsensusHeights.length > 1) {
+      throw new GrpcInternalException('RecoverClient should prune at most one consensus state');
+    }
+
+    const newClientStateValue = Buffer.from(
+      await encodeClientStateValue(newClientState, this.lucidService.LucidImporter),
+      'hex',
+    );
+    const addedConsensusState = {
+      height: recoveryState.height.revisionHeight.toString(),
+      value: Buffer.from(
+        await encodeConsensusStateValue(recoveryState.consensusState, this.lucidService.LucidImporter),
+        'hex',
+      ),
+    };
+    const ibcClientId = `${CLIENT_ID_PREFIX}-${operator.subjectClientId}`;
+    const { newRoot, clientStateSiblings, consensusStateSiblings, removedConsensusStateSiblings, commit } =
+      this.ibcTreeStore.computeRootWithUpdateClientUpdate(
+        operator.hostStateDatum.state.ibc_state_root,
+        ibcClientId,
+        newClientStateValue,
+        removedConsensusHeights,
+        addedConsensusState,
+      );
+
+    const updatedHostStateDatum: HostStateDatum = {
+      ...operator.hostStateDatum,
+      state: {
+        ...operator.hostStateDatum.state,
+        version: operator.hostStateDatum.state.version + 1n,
+        ibc_state_root: newRoot,
+        last_update_time: BigInt(Date.now()),
+      },
+    };
+    const hostStateRedeemer = {
+      UpdateClient: {
+        client_state_siblings: clientStateSiblings,
+        consensus_state_siblings: consensusStateSiblings,
+        removed_consensus_state_siblings: removedConsensusStateSiblings,
+      },
+    };
+    const spendClientRedeemer: SpendClientRedeemer = {
+      RecoverClient: {
+        substitute_token: operator.substituteClientDatum.token,
+      },
+    };
+    const withdrawalRedeemer = {
+      RecoverClientWithdrawal: {
+        subject_token: operator.subjectClientDatum.token,
+        substitute_token: operator.substituteClientDatum.token,
+      },
+    };
+
+    const [encodedHostStateRedeemer, encodedSpendClientRedeemer, encodedWithdrawalRedeemer] =
+      await Promise.all([
+        this.lucidService.encode(hostStateRedeemer, 'host_state_redeemer'),
+        this.lucidService.encode(spendClientRedeemer, 'spendClientRedeemer'),
+        this.lucidService.encode(withdrawalRedeemer, 'recoverClientWithdrawalRedeemer'),
+      ]);
+    const [encodedUpdatedHostStateDatum, encodedRecoveredClientDatum] = await Promise.all([
+      this.lucidService.encode(updatedHostStateDatum, 'host_state'),
+      this.lucidService.encode(recoveredClientDatum, 'client'),
+    ]);
+    const unsignedTx = this.lucidService.createUnsignedRecoverClientTransaction(
+      operator.hostStateUtxo,
+      encodedHostStateRedeemer,
+      operator.subjectClientUtxo,
+      encodedSpendClientRedeemer,
+      operator.substituteClientUtxo,
+      encodedWithdrawalRedeemer,
+      encodedUpdatedHostStateDatum,
+      encodedRecoveredClientDatum,
+      operator.subjectClientTokenUnit,
+      operator.signerKeyHash,
+    );
+
+    return {
+      unsignedTx,
+      pendingTreeUpdate: { expectedNewRoot: newRoot, commit },
+    };
+  }
+
   /**
    * Builds an unsigned transaction for creating a new client, incorporating client and consensus state.
    *
@@ -745,7 +1081,7 @@ export class ClientService {
     clientState: ClientState,
     consensusState: ConsensusState,
     constructedAddress: string,
-    txValidFromNs: bigint,
+    txValidToNs: bigint,
   ): Promise<{ unsignedTx: TxBuilder; clientId: bigint; pendingTreeUpdate: PendingTreeUpdate }> {
     // The HostState NFT identifies the single coordinator UTxO for this update.
     const hostStateUtxo: UTxO = await this.lucidService.findUtxoAtHostStateNFT();
@@ -764,7 +1100,7 @@ export class ClientService {
 
     // Ensure the in-memory Merkle tree is aligned with on-chain state before computing new root
     // This prevents stale tree state from causing root mismatches after failed transactions
-    await this.ensureTreeAligned(hostStateDatum.state.ibc_state_root);
+    await this.ensureTreeAligned(hostStateDatum.state.ibc_state_root, hostStateUtxo);
 
     this.logger.log(`[DEBUG] Decoded HostState datum - version: ${hostStateDatum.state.version}, nft_policy: ${hostStateDatum.nft_policy.substring(0, 20)}...`);
 
@@ -792,7 +1128,7 @@ export class ClientService {
     );
 
     const { newRoot, clientStateSiblings, consensusStateSiblings, commit } =
-      computeRootWithCreateClientUpdate(
+      this.ibcTreeStore.computeRootWithCreateClientUpdate(
         hostStateDatum.state.ibc_state_root,
         clientId,
         clientStateValue,
@@ -820,8 +1156,8 @@ export class ClientService {
     const clientDatumState: ClientDatumState = {
       clientState: clientState,
       consensusStates: new Map([[clientState.latestHeight, consensusState]]),
-      processedTimes: new Map([[clientState.latestHeight, txValidFromNs]]),
-      processedHeights: new Map([[clientState.latestHeight, getProcessedHeight(txValidFromNs)]]),
+      processedTimes: new Map([[clientState.latestHeight, txValidToNs]]),
+      processedHeights: new Map([[clientState.latestHeight, getProcessedHeight(txValidToNs)]]),
     };
 
     const clientTokenName = this.generateClientTokenName(hostStateDatum);

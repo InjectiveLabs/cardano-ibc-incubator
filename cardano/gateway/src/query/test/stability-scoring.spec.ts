@@ -1,3 +1,5 @@
+import { readFileSync } from 'fs';
+import { resolve } from 'path';
 import {
   assertStabilityThresholds,
   computeStabilityMetrics,
@@ -22,6 +24,18 @@ describe('stability-scoring', () => {
     slotLeader,
   });
 
+  it('keeps one stability threshold of local rollback headroom after an anchor is accepted', () => {
+    const shelleyGenesis = JSON.parse(
+      readFileSync(resolve(__dirname, '../../../../../chains/cardano/config/devnet/genesis-shelley.json'), 'utf8'),
+    ) as { securityParam: number };
+    const byronGenesis = JSON.parse(
+      readFileSync(resolve(__dirname, '../../../../../chains/cardano/config/devnet/genesis-byron.json'), 'utf8'),
+    ) as { protocolConsts: { k: number } };
+
+    expect(byronGenesis.protocolConsts.k).toBe(shelleyGenesis.securityParam);
+    expect(BigInt(shelleyGenesis.securityParam) >= getStabilityPolicy().threshold_depth * 2n).toBe(true);
+  });
+
   it('computes qualified pool stake and score from epoch stake distribution', () => {
     const stabilityPolicy = policy({
       threshold_depth: 3n,
@@ -38,18 +52,24 @@ describe('stability-scoring', () => {
       {
         poolId: 'pool-a',
         stake: 500n,
+        relativeStakeNumerator: 500n,
+        relativeStakeDenominator: 1000n,
         vrfKeyHash: 'aa'.repeat(32),
         firstRegistrationSlot: 1n,
       },
       {
         poolId: 'pool-b',
         stake: 300n,
+        relativeStakeNumerator: 300n,
+        relativeStakeDenominator: 1000n,
         vrfKeyHash: 'bb'.repeat(32),
         firstRegistrationSlot: 1n,
       },
       {
         poolId: 'pool-c',
         stake: 200n,
+        relativeStakeNumerator: 200n,
+        relativeStakeDenominator: 1000n,
         vrfKeyHash: 'cc'.repeat(32),
         firstRegistrationSlot: 1n,
       },
@@ -81,18 +101,24 @@ describe('stability-scoring', () => {
       {
         poolId: 'pool-a',
         stake: 400n,
+        relativeStakeNumerator: 400n,
+        relativeStakeDenominator: 1000n,
         vrfKeyHash: 'aa'.repeat(32),
         firstRegistrationSlot: 1n,
       },
       {
         poolId: 'pool-b',
         stake: 200n,
+        relativeStakeNumerator: 200n,
+        relativeStakeDenominator: 1000n,
         vrfKeyHash: 'bb'.repeat(32),
         firstRegistrationSlot: 1n,
       },
       {
         poolId: 'pool-c',
         stake: 400n,
+        relativeStakeNumerator: 400n,
+        relativeStakeDenominator: 1000n,
         vrfKeyHash: 'cc'.repeat(32),
         firstRegistrationSlot: 1n,
       },
@@ -125,18 +151,24 @@ describe('stability-scoring', () => {
       {
         poolId: 'pool-a',
         stake: 2n,
+        relativeStakeNumerator: 2n,
+        relativeStakeDenominator: 6n,
         vrfKeyHash: 'aa'.repeat(32),
         firstRegistrationSlot: 1n,
       },
       {
         poolId: 'pool-b',
         stake: 2n,
+        relativeStakeNumerator: 2n,
+        relativeStakeDenominator: 6n,
         vrfKeyHash: 'bb'.repeat(32),
         firstRegistrationSlot: 1n,
       },
       {
         poolId: 'pool-c',
         stake: 2n,
+        relativeStakeNumerator: 2n,
+        relativeStakeDenominator: 6n,
         vrfKeyHash: 'cc'.repeat(32),
         firstRegistrationSlot: 1n,
       },
@@ -181,12 +213,16 @@ describe('stability-scoring', () => {
       {
         poolId: 'pool-a',
         stake: 500n,
+        relativeStakeNumerator: 500n,
+        relativeStakeDenominator: 1000n,
         vrfKeyHash: 'aa'.repeat(32),
         firstRegistrationSlot: 1n,
       },
       {
         poolId: 'pool-b',
         stake: 500n,
+        relativeStakeNumerator: 500n,
+        relativeStakeDenominator: 1000n,
         vrfKeyHash: 'bb'.repeat(32),
         firstRegistrationSlot: poolRegistrationCutoffSlot,
       },
@@ -209,7 +245,13 @@ describe('stability-scoring', () => {
 
     const descendants = [makeBlock(601, 'anchor', 'pool-a')];
     const epochStakeDistribution: HistoryStakeDistributionEntry[] = [
-      { poolId: 'pool-a', stake: 1000n, vrfKeyHash: 'aa'.repeat(32) },
+      {
+        poolId: 'pool-a',
+        stake: 1000n,
+        relativeStakeNumerator: 1n,
+        relativeStakeDenominator: 1n,
+        vrfKeyHash: 'aa'.repeat(32),
+      },
     ];
 
     expect(() =>

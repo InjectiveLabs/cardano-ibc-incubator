@@ -11,6 +11,7 @@ import {
   ScriptHash,
   type SpendingValidator,
   UTxO,
+  validatorToRewardAddress,
   validatorToScriptHash,
 } from "@lucid-evolution/lucid";
 import {
@@ -18,7 +19,7 @@ import {
   DeploymentTemplate,
   formatTimestamp,
   generateIdentifierTokenName,
-  generateTokenName,
+  generatePortTokenName,
   getLiveWalletUtxos,
   isRetryableOgmiosTransportError,
   readValidator,
@@ -31,7 +32,6 @@ import {
   EMULATOR_ENV,
   ICQ_MODULE_PORT,
   MOCK_MODULE_PORT,
-  PORT_PREFIX,
   RESERVED_DEPLOYMENT_NONCE_COUNT,
   TRACE_REGISTRY_DIRECTORY_NONCE_COUNT,
   TRACE_REGISTRY_SHARD_COUNT,
@@ -41,12 +41,15 @@ import {
   AuthToken,
   AuthTokenSchema,
   HostStateDatum,
+  HostStateNftRedeemer,
   HostStateRedeemer,
   MintPortRedeemer,
+  ModuleRegistration,
   OutputReference,
   OutputReferenceSchema,
   type TraceRegistryDirectoryDatum,
   type TraceRegistryShardDatum,
+  TransferModuleDatum,
 } from "../types/index.ts";
 
 // deno-lint-ignore no-explicit-any
@@ -85,6 +88,14 @@ const sortUtxosByLovelaceDesc = (utxos: UTxO[]): UTxO[] =>
     return aLovelace < bLovelace ? 1 : -1;
   });
 
+const sortUtxosByLovelaceAsc = (utxos: UTxO[]): UTxO[] =>
+  [...utxos].sort((a, b) => {
+    const aLovelace = utxoLovelace(a);
+    const bLovelace = utxoLovelace(b);
+    if (aLovelace === bLovelace) return 0;
+    return aLovelace < bLovelace ? -1 : 1;
+  });
+
 const sortNonceCandidateUtxos = (utxos: UTxO[]): UTxO[] =>
   [...utxos].sort((a, b) => {
     const aAdaOnly = isAdaOnlyUtxo(a);
@@ -104,6 +115,9 @@ const encodeRawDatum = (value: unknown): string =>
 
 const MERKLE_DEPTH_BITS = 64;
 const EMPTY_HASH = "00".repeat(32);
+
+export const GENERIC_MODULE_SPEND_VALIDATOR_TITLE =
+  "spending_mock_module.spend_mock_module.spend";
 
 const concatBytes = (...parts: Uint8Array[]): Uint8Array => {
   const length = parts.reduce((sum, part) => sum + part.length, 0);
@@ -235,23 +249,22 @@ export class DeploymentIbcTree {
   }
 }
 
-const portCommitmentKey = (portNumber: bigint): string =>
-  `ports/port-${portNumber.toString()}`;
+const portCommitmentKey = (portId: string): string => `ports/${portId}`;
 
 const buildBindPortHostStateUpdate = async (
   currentDatum: HostStateDatum,
-  portNumber: bigint,
+  portIdText: string,
+  registration: ModuleRegistration,
   tree: DeploymentIbcTree,
 ): Promise<{
   redeemer: HostStateRedeemer;
   datum: HostStateDatum;
   commit: () => void;
 }> => {
-  const portKey = portCommitmentKey(portNumber);
+  const portId = fromText(portIdText);
+  const portKey = portCommitmentKey(portIdText);
   const portSiblings = await tree.getSiblings(portKey);
-  const portValue = Data.to(portNumber as never, Data.Integer() as never, {
-    canonical: true,
-  });
+  const portValue = Data.to(registration, ModuleRegistration);
   tree.set(portKey, portValue);
   const newRoot = await tree.getRoot();
   const updatedDatum: HostStateDatum = {
@@ -260,16 +273,20 @@ const buildBindPortHostStateUpdate = async (
       ...currentDatum.state,
       version: currentDatum.state.version + 1n,
       ibc_state_root: newRoot,
-      bound_port: sortPortNumbers([
-        ...currentDatum.state.bound_port,
-        portNumber,
-      ]),
       last_update_time: BigInt(Date.now()),
+    },
+    control: {
+      ...currentDatum.control,
+      port_registry: sortPortRegistrations(
+        new Map(currentDatum.control.port_registry).set(portId, registration),
+      ),
     },
   };
 
   return {
-    redeemer: { BindPort: { port: portNumber, port_siblings: portSiblings } },
+    redeemer: {
+      BindPort: { port_id: portId, registration, port_siblings: portSiblings },
+    },
     datum: updatedDatum,
     commit: () => {},
   };
@@ -432,11 +449,37 @@ export const createDeployment = async (
     Data.Tuple([Data.Bytes()]) as unknown as [string],
   );
 
+  // Recovery is authorized by a zero withdrawal from this script reward
+  // address. The client validator pins its hash so recovery cannot substitute
+  // another authority script.
+  const [recoverClientValidator, recoverClientScriptHash] = await readValidator(
+    "recover_client.recover_client.withdraw",
+    lucid,
+    [mintHostStateNFTPolicyId],
+    Data.Tuple([Data.Bytes()]) as unknown as [string],
+  );
+  const recoverClientAddress = validatorToRewardAddress(
+    lucid.config().network || "Custom",
+    recoverClientValidator,
+  );
+  referredValidators.push(recoverClientValidator);
+
+  const credentialSchema = Data.Enum([
+    Data.Object({ VerificationKey: Data.Tuple([Data.Bytes()]) }),
+    Data.Object({ Script: Data.Tuple([Data.Bytes()]) }),
+  ]);
+
   // load spend client validator
   const [spendClientValidator, spendClientScriptHash, spendClientAddress] =
-    await readValidator("spending_client.spend_client.spend", lucid, [
-      mintHostStateNFTPolicyId,
-    ]);
+    await readValidator(
+      "spending_client.spend_client.spend",
+      lucid,
+      [mintHostStateNFTPolicyId, { Script: [recoverClientScriptHash] }],
+      Data.Tuple([Data.Bytes(), credentialSchema]) as unknown as [
+        string,
+        { Script: [string] },
+      ],
+    );
   referredValidators.push(spendClientValidator);
 
   // STT minting policies derive client/connection/channel token names from the
@@ -493,7 +536,7 @@ export const createDeployment = async (
   referredValidators.push(mintConnectionSttValidator);
 
   // load spend channel validator
-  const spendingChannel = await deploySpendChannel(
+  const spendingChannel = buildChannelValidators(
     lucid,
     mintClientSttPolicyId,
     mintConnectionSttPolicyId,
@@ -544,6 +587,17 @@ export const createDeployment = async (
     "initial validator preflight",
   );
 
+  // A withdrawal validator is only usable after its script stake credential
+  // exists in the ledger accounts state. Registration itself uses the legacy
+  // witness-free certificate, so it does not execute the validator.
+  await submitTx(
+    () => lucid.newTx().register.Stake(recoverClientAddress),
+    lucid,
+    "RegisterRecoverClient",
+    false,
+  );
+  reservedDeploymentRefs = await setSpendableWalletUtxos();
+
   // Deploy HostState (STT Architecture)
   const {
     hostStateStt,
@@ -557,6 +611,9 @@ export const createDeployment = async (
     spendClientScriptHash,
     spendConnectionScriptHash,
     spendingChannel.base.hash,
+    mintClientSttPolicyId,
+    mintConnectionSttPolicyId,
+    mintChannelSttPolicyId,
     deployerPaymentKeyHash,
   );
   referredValidators.push(hostStateStt.validator);
@@ -665,7 +722,6 @@ export const createDeployment = async (
     mintPortValidator,
     mintIdentifierValidator,
     MOCK_MODULE_PORT,
-    "mock",
     hostStateNFT,
     mockModuleNonceUtxo,
     bootstrapReferenceScripts,
@@ -683,7 +739,6 @@ export const createDeployment = async (
     mintPortValidator,
     mintIdentifierValidator,
     ICQ_MODULE_PORT,
-    "icqhost",
     hostStateNFT,
     icqModuleNonceUtxo,
     bootstrapReferenceScripts,
@@ -732,7 +787,15 @@ export const createDeployment = async (
 
   const deploymentInfo: DeploymentTemplate = {
     deployedAt,
+    ics20PacketCodec: "ics20-classic-json-v1",
     validators: {
+      recoverClient: {
+        title: "recover_client.recover_client.withdraw",
+        script: recoverClientValidator.script,
+        scriptHash: recoverClientScriptHash,
+        address: recoverClientAddress,
+        refUtxo: refUtxosInfo[recoverClientScriptHash],
+      },
       spendClient: {
         title: "spending_client.spend_client.spend",
         script: spendClientValidator.script,
@@ -763,7 +826,7 @@ export const createDeployment = async (
         refUtxo: refUtxosInfo[spendTransferModule.scriptHash],
       },
       spendMockModule: {
-        title: "spending_mock_module.spend_mock_module.else",
+        title: GENERIC_MODULE_SPEND_VALIDATOR_TITLE,
         script: spendMockModule.validator.script,
         scriptHash: spendMockModule.scriptHash,
         address: spendMockModule.address,
@@ -858,6 +921,7 @@ export const createDeployment = async (
     hostStateNFT: {
       policyId: hostStateNFT.policy_id,
       name: hostStateNFT.name,
+      script: hostStateNFT.script,
     },
     traceRegistry: {
       address: traceRegistry.base.address,
@@ -907,6 +971,8 @@ const REFERENCE_UTXO_TX_OVERHEAD_BYTES = 4_000;
 const REFERENCE_UTXO_OUTPUT_OVERHEAD_BYTES = 200;
 const REFERENCE_UTXO_SAFE_TX_HEADROOM_BYTES = 1_000;
 const REFERENCE_UTXO_SINGLE_TX_HEADROOM_BYTES = 750;
+const REFERENCE_UTXO_DEDICATED_FUNDING_MARGIN_BYTES = 1_500;
+const REFERENCE_UTXO_DEDICATED_FUNDING_FEE_BUFFER_LOVELACE = 1_500_000n;
 const REFERENCE_UTXO_ADOPTION_ATTEMPTS = 6;
 const REFERENCE_UTXO_ADOPTION_TIMEOUT_MS = 60_000;
 const REFERENCE_UTXO_ADOPTION_RETRY_DELAY_MS = 5_000;
@@ -1031,6 +1097,14 @@ const isReferenceUtxoAdoptionTimeout = (error: unknown): boolean => {
 const isRetryableReferenceUtxoAdoptionError = (error: unknown): boolean =>
   isRetryableOgmiosTransportError(error) ||
   isReferenceUtxoAdoptionTimeout(error);
+
+const shouldUseDedicatedReferenceFunding = (
+  validators: Script[],
+  maxTxSize: number,
+): boolean =>
+  validators.length === 1 &&
+  estimateReferenceValidatorSize(validators[0]) >
+    maxTxSize - REFERENCE_UTXO_DEDICATED_FUNDING_MARGIN_BYTES;
 
 export const buildReferenceValidatorBatches = (
   validators: Script[],
@@ -1191,13 +1265,29 @@ const isLikelyReferenceBatchTooLarge = (error: unknown) => {
   ].some((pattern) => normalizedMessage.includes(pattern));
 };
 
-const sortPortNumbers = (ports: bigint[]) =>
-  [...ports].sort((left, right) => {
-    if (left === right) {
-      return 0;
+// Mirror Aiken's canonical CBOR byte-key order so HostState maps serialize identically off-chain.
+const compareCanonicalBytes = (leftHex: string, rightHex: string): number => {
+  const left = hexToBytes(leftHex);
+  const right = hexToBytes(rightHex);
+  if (left.length !== right.length) {
+    return left.length - right.length;
+  }
+  for (let index = 0; index < left.length; index += 1) {
+    if (left[index] !== right[index]) {
+      return left[index] - right[index];
     }
-    return left < right ? -1 : 1;
-  });
+  }
+  return 0;
+};
+
+export const sortPortRegistrations = (
+  registrations: Map<string, ModuleRegistration>,
+) =>
+  new Map(
+    [...registrations.entries()].sort(([left], [right]) =>
+      compareCanonicalBytes(left, right)
+    ),
+  );
 
 async function mintMockToken(lucid: LucidEvolution) {
   // load mint mock token validator
@@ -1252,6 +1342,7 @@ async function createReferenceUtxos(
       [hostStateNftPolicyId],
       Data.Tuple([Data.Bytes()]) as unknown as [string],
     );
+    const walletAddress = await lucid.wallet().address();
 
     const maxTxSize = lucid.config().protocolParameters?.maxTxSize ?? 16_384;
     logReferenceValidatorSizeReport(referredValidators, maxTxSize);
@@ -1303,13 +1394,82 @@ async function createReferenceUtxos(
     };
     await refreshReferenceWalletState();
 
+    const selectDedicatedFundingUtxo = (
+      walletUtxos: UTxO[],
+      fundingLovelace: bigint,
+    ): UTxO | undefined =>
+      sortUtxosByLovelaceAsc(
+        walletUtxos.filter((utxo) =>
+          isAdaOnlyUtxo(utxo) &&
+          !utxo.scriptRef &&
+          utxoLovelace(utxo) === fundingLovelace
+        ),
+      )[0];
+
+    const createDedicatedFundingUtxo = async (
+      fundingLovelace: bigint,
+      batchLabel: string,
+    ): Promise<UTxO> => {
+      await refreshReferenceWalletState();
+      const txHash = await submitTx(
+        () =>
+          lucid
+            .newTx()
+            .pay.ToAddress(walletAddress, { lovelace: fundingLovelace }),
+        lucid,
+        `Prepare reference funding ${batchLabel}`,
+        false,
+      );
+      await refreshReferenceWalletState();
+      const [fundingUtxo] = (await getLiveWalletUtxos(lucid)).filter((utxo) =>
+        utxo.txHash === txHash &&
+        isAdaOnlyUtxo(utxo) &&
+        utxoLovelace(utxo) === fundingLovelace
+      );
+      if (!fundingUtxo) {
+        throw new Error(
+          `Unable to find prepared reference funding UTxO ${txHash} with ${fundingLovelace} lovelace`,
+        );
+      }
+      return fundingUtxo;
+    };
+
+    const prepareDedicatedFundingUtxo = async (
+      outputLovelace: bigint,
+      batchLabel: string,
+    ): Promise<UTxO> => {
+      const fundingLovelace = outputLovelace +
+        REFERENCE_UTXO_DEDICATED_FUNDING_FEE_BUFFER_LOVELACE;
+      const spendableWalletUtxos = filterReservedWalletUtxos(
+        mergeWalletUtxos(await getLiveWalletUtxos(lucid)),
+        reservedWalletRefs,
+      ).filter((utxo) => !spentReferenceBatchRefs.has(utxoRefKey(utxo)));
+      const existingFundingUtxo = selectDedicatedFundingUtxo(
+        spendableWalletUtxos,
+        fundingLovelace,
+      );
+      if (existingFundingUtxo) {
+        return existingFundingUtxo;
+      }
+
+      console.log(
+        "Preparing dedicated reference funding UTxO",
+        batchLabel,
+        `with ${fundingLovelace} lovelace ...`,
+      );
+      return await createDedicatedFundingUtxo(fundingLovelace, batchLabel);
+    };
+
     while (pendingBatches.length > 0) {
       // We still submit sequentially because each successful batch updates the
       // wallet UTxO set used to build the next one.
       const batch = pendingBatches.shift()!;
+      const batchLabel = `${batch.startIndex + 1}-${
+        batch.startIndex + batch.validators.length
+      }`;
       console.log(
         "Preparing reference batch for validators",
-        `${batch.startIndex + 1}-${batch.startIndex + batch.validators.length}`,
+        batchLabel,
         `(${batch.validators.length} validators) ...`,
       );
 
@@ -1329,6 +1489,17 @@ async function createReferenceUtxos(
         return tx;
       };
 
+      const dedicatedFunding = shouldUseDedicatedReferenceFunding(
+          batch.validators,
+          maxTxSize,
+        )
+        ? await prepareDedicatedFundingUtxo(
+          (await buildReferenceBatchTx().config()).totalOutputAssets.lovelace ??
+            0n,
+          batchLabel,
+        )
+        : undefined;
+
       let newWalletUTxOs: UTxO[] | undefined;
       let derivedOutputs: UTxO[] | undefined;
       let signedTx;
@@ -1340,7 +1511,14 @@ async function createReferenceUtxos(
           [newWalletUTxOs, derivedOutputs, signedTx] = await (async () => {
             const txBuilder = buildReferenceBatchTx();
             const [walletUTxOs, outputs, txSignBuilder] = await txBuilder
-              .chain();
+              .chain(
+                dedicatedFunding
+                  ? {
+                    presetWalletInputs: [dedicatedFunding],
+                    includeLeftoverLovelaceAsFee: true,
+                  }
+                  : undefined,
+              );
             consumedWalletInputs = (txBuilder as unknown as {
               rawConfig: () => { consumedInputs?: UTxO[] };
             }).rawConfig().consumedInputs ?? [];
@@ -1555,6 +1733,47 @@ async function createReferenceUtxos(
   }
 }
 
+export const loadTransferModuleValidator = (
+  lucid: LucidEvolution,
+  portToken: AuthToken,
+  identifierToken: AuthToken,
+  portId: string,
+  mintTransferEscrowShardPolicyId: string,
+  mintChannelPolicyId: string,
+  mintVoucherPolicyId: string,
+  hostStateNftPolicyId: string,
+) =>
+  readValidator(
+    "spending_transfer_module.spend_transfer_module.spend",
+    lucid,
+    [
+      portToken,
+      identifierToken,
+      portId,
+      mintTransferEscrowShardPolicyId,
+      mintChannelPolicyId,
+      mintVoucherPolicyId,
+      hostStateNftPolicyId,
+    ],
+    Data.Tuple([
+      AuthTokenSchema,
+      AuthTokenSchema,
+      Data.Bytes(),
+      Data.Bytes(),
+      Data.Bytes(),
+      Data.Bytes(),
+      Data.Bytes(),
+    ]) as unknown as [
+      AuthToken,
+      AuthToken,
+      string,
+      string,
+      string,
+      string,
+      string,
+    ],
+  );
+
 const deployTransferModule = async (
   lucid: LucidEvolution,
   hostStateStt: {
@@ -1566,7 +1785,7 @@ const deployTransferModule = async (
   mintPortValidator: MintingPolicy,
   mintIdentifierValidator: MintingPolicy,
   mintChannelPolicyId: string,
-  portNumber: bigint,
+  portIdText: string,
   hostStateNFT: AuthToken,
   traceRegistryDirectoryAuthToken: AuthToken,
   nonceUtxo: UTxO,
@@ -1618,13 +1837,9 @@ const deployTransferModule = async (
   // NOTE: IBC port identifiers are part of on-chain commitment paths and are exchanged
   // over IBC. For the transfer module we use the canonical Cosmos port ID so Hermes can
   // operate without any Cardano-specific port mapping.
-  const portId = fromText("transfer");
+  const portId = fromText(portIdText);
   const mintPortPolicyId = validatorToScriptHash(mintPortValidator);
-  const portTokenName = await generateTokenName(
-    hostStateNFT,
-    PORT_PREFIX,
-    portNumber,
-  );
+  const portTokenName = generatePortTokenName(portId);
   const portTokenUnit = mintPortPolicyId + portTokenName;
   const portToken: AuthToken = {
     policy_id: mintPortPolicyId,
@@ -1645,49 +1860,35 @@ const deployTransferModule = async (
     spendTransferModuleValidator,
     spendTransferModuleScriptHash,
     spendTransferModuleAddress,
-  ] = await readValidator(
-    "spending_transfer_module.spend_transfer_module.spend",
+  ] = loadTransferModuleValidator(
     lucid,
-    [
-      portToken,
-      identifierToken,
-      portId,
-      mintTransferEscrowShardPolicyId,
-      mintChannelPolicyId,
-      mintVoucherPolicyId,
-      hostStateNFT.policy_id,
-    ],
-    Data.Tuple([
-      AuthTokenSchema,
-      AuthTokenSchema,
-      Data.Bytes(),
-      Data.Bytes(),
-      Data.Bytes(),
-      Data.Bytes(),
-      Data.Bytes(),
-    ]) as unknown as [
-      AuthToken,
-      AuthToken,
-      string,
-      string,
-      string,
-      string,
-      string,
-    ],
+    portToken,
+    identifierToken,
+    portId,
+    mintTransferEscrowShardPolicyId,
+    mintChannelPolicyId,
+    mintVoucherPolicyId,
+    hostStateNFT.policy_id,
   );
 
   const hostStateUnit = hostStateNFT.policy_id + hostStateNFT.name;
   const hostStateUtxo = await lucid.utxoByUnit(hostStateUnit);
   const currentHostStateDatum = Data.from(hostStateUtxo.datum!, HostStateDatum);
+  const registration: ModuleRegistration = {
+    module_script_hash: spendTransferModuleScriptHash,
+    port_token: portToken,
+    module_token: identifierToken,
+  };
   const hostStateUpdate = await buildBindPortHostStateUpdate(
     currentHostStateDatum,
-    portNumber,
+    portIdText,
+    registration,
     hostStateTree,
   );
 
   const mintPortRedeemer: MintPortRedeemer = {
     spend_module_script_hash: spendTransferModuleScriptHash,
-    port_number: portNumber,
+    port_id: portId,
   };
   assertDeploymentReferenceValidatorsFit(
     lucid,
@@ -1738,13 +1939,22 @@ const deployTransferModule = async (
           [hostStateUnit]: 1n,
         },
       )
-      .pay.ToAddress(
+      .pay.ToContract(
         spendTransferModuleAddress,
+        {
+          kind: "inline",
+          value: Data.to(
+            { escrow_shard_registry_root: "00".repeat(32) },
+            TransferModuleDatum,
+            { canonical: true },
+          ),
+        },
         {
           [identifierTokenUnit]: 1n,
           [portTokenUnit]: 1n,
         },
-      );
+      )
+      .addSignerKey(currentHostStateDatum.deployer);
 
   await submitTx(buildMintTransferModuleTx, lucid, "Mint Transfer Module");
   hostStateUpdate.commit();
@@ -1780,7 +1990,6 @@ const deployGenericModule = async (
   hostStateTree: DeploymentIbcTree,
   mintPortValidator: MintingPolicy,
   mintIdentifierValidator: MintingPolicy,
-  portNumber: bigint,
   portIdText: string,
   hostStateNFT: AuthToken,
   nonceUtxo: UTxO,
@@ -1801,11 +2010,7 @@ const deployGenericModule = async (
 
   const portId = fromText(portIdText);
   const mintPortPolicyId = validatorToScriptHash(mintPortValidator);
-  const portTokenName = await generateTokenName(
-    hostStateNFT,
-    PORT_PREFIX,
-    portNumber,
-  );
+  const portTokenName = generatePortTokenName(portId);
   const portTokenUnit = mintPortPolicyId + portTokenName;
   const portToken: AuthToken = {
     policy_id: mintPortPolicyId,
@@ -1817,22 +2022,31 @@ const deployGenericModule = async (
     spendModuleScriptHash,
     spendModuleAddress,
   ] = await readValidator(
-    "spending_mock_module.spend_mock_module.else",
+    // Parameterizing the shared script prevents mock or ICQ witnesses from crossing HostState deployments.
+    GENERIC_MODULE_SPEND_VALIDATOR_TITLE,
     lucid,
+    [hostStateNFT.policy_id],
+    Data.Tuple([Data.Bytes()]) as unknown as [string],
   );
 
   const hostStateUnit = hostStateNFT.policy_id + hostStateNFT.name;
   const hostStateUtxo = await lucid.utxoByUnit(hostStateUnit);
   const currentHostStateDatum = Data.from(hostStateUtxo.datum!, HostStateDatum);
+  const registration: ModuleRegistration = {
+    module_script_hash: spendModuleScriptHash,
+    port_token: portToken,
+    module_token: identifierToken,
+  };
   const hostStateUpdate = await buildBindPortHostStateUpdate(
     currentHostStateDatum,
-    portNumber,
+    portIdText,
+    registration,
     hostStateTree,
   );
 
   const mintPortRedeemer: MintPortRedeemer = {
     spend_module_script_hash: spendModuleScriptHash,
-    port_number: portNumber,
+    port_id: portId,
   };
   assertDeploymentReferenceValidatorsFit(
     lucid,
@@ -1885,7 +2099,8 @@ const deployGenericModule = async (
           [identifierTokenUnit]: 1n,
           [portTokenUnit]: 1n,
         },
-      );
+      )
+      .addSignerKey(currentHostStateDatum.deployer);
 
   await submitTx(buildMintGenericModuleTx, lucid, `Mint ${portIdText} Module`);
   hostStateUpdate.commit();
@@ -2158,6 +2373,39 @@ const deployTraceRegistryDirectory = async (
   };
 };
 
+export const loadHostStateValidator = (
+  lucid: LucidEvolution,
+  hostPolicy: string,
+  clientHash: string,
+  connectionHash: string,
+  channelHash: string,
+  clientPolicy: string,
+  connectionPolicy: string,
+  channelPolicy: string,
+) =>
+  readValidator(
+    "host_state_stt.host_state_stt.spend",
+    lucid,
+    [
+      hostPolicy,
+      clientHash,
+      connectionHash,
+      channelHash,
+      clientPolicy,
+      connectionPolicy,
+      channelPolicy,
+    ],
+    Data.Tuple([
+      Data.Bytes(),
+      Data.Bytes(),
+      Data.Bytes(),
+      Data.Bytes(),
+      Data.Bytes(),
+      Data.Bytes(),
+      Data.Bytes(),
+    ]) as unknown as [string, string, string, string, string, string, string],
+  );
+
 const deployHostState = async (
   lucid: LucidEvolution,
   nonceUtxo: UTxO,
@@ -2167,6 +2415,9 @@ const deployHostState = async (
   spendClientScriptHash: string,
   spendConnectionScriptHash: string,
   spendChannelScriptHash: string,
+  mintClientSttPolicyId: string,
+  mintConnectionSttPolicyId: string,
+  mintChannelSttPolicyId: string,
   deployerPaymentKeyHash: string,
 ) => {
   console.log("Deploy HostState (STT Architecture)");
@@ -2192,27 +2443,19 @@ const deployHostState = async (
   // 2) `spend_client_script_hash` (used to locate the created client output when enforcing root correctness)
   // 3) `spend_connection_script_hash` (used to locate the created connection output when enforcing root correctness)
   // 4) `spend_channel_script_hash` (used to locate the created channel output when enforcing root correctness)
+  // 5) `client_policy_id` (authenticates client state tokens)
+  // 6) `connection_policy_id` (authenticates connection state tokens)
+  // 7) `channel_policy_id` (authenticates channel state tokens)
   const [hostStateSttValidator, hostStateSttScriptHash, hostStateSttAddress] =
-    await readValidator(
-      "host_state_stt.host_state_stt.spend",
+    loadHostStateValidator(
       lucid,
-      [
-        mintHostStateNFTPolicyId,
-        spendClientScriptHash,
-        spendConnectionScriptHash,
-        spendChannelScriptHash,
-      ],
-      Data.Tuple([
-        Data.Bytes(),
-        Data.Bytes(),
-        Data.Bytes(),
-        Data.Bytes(),
-      ]) as unknown as [
-        string,
-        string,
-        string,
-        string,
-      ],
+      mintHostStateNFTPolicyId,
+      spendClientScriptHash,
+      spendConnectionScriptHash,
+      spendChannelScriptHash,
+      mintClientSttPolicyId,
+      mintConnectionSttPolicyId,
+      mintChannelSttPolicyId,
     );
 
   const HOST_STATE_TOKEN_NAME = fromText("ibc_host_state");
@@ -2236,13 +2479,16 @@ const deployHostState = async (
     },
     nft_policy: mintHostStateNFTPolicyId,
     deployer: deployerPaymentKeyHash,
-    shutdown: "Active",
+    control: {
+      port_registry: new Map(),
+      shutdown: "Active",
+    },
   };
 
   // Create and send tx to mint NFT and create HostState UTXO
-  // NFTRedeemer has only one variant (MintInitial) with no fields
-  // Use Data.void() as the redeemer (same as other simple mints)
-  const encodedRedeemer = Data.void();
+  const encodedRedeemer = Data.to("MintInitial", HostStateNftRedeemer, {
+    canonical: true,
+  });
 
   const encodedDatum = Data.to(initHostStateDatum, HostStateDatum, {
     canonical: true,
@@ -2290,11 +2536,12 @@ const deployHostState = async (
     hostStateNFT: {
       policy_id: mintHostStateNFTPolicyId,
       name: HOST_STATE_TOKEN_NAME,
+      script: mintHostStateNFTValidator.script,
     },
   };
 };
 
-const deploySpendChannel = async (
+export const buildChannelValidators = (
   lucid: LucidEvolution,
   mintClientPolicyId: PolicyId,
   mintConnectionPolicyId: PolicyId,
@@ -2304,25 +2551,44 @@ const deploySpendChannel = async (
 ) => {
   const referredValidators = {
     chan_open_ack: "chan_open_ack.mint",
-    chan_open_confirm: "chan_open_confirm.spend",
-    chan_close_init: "chan_close_init.spend",
-    chan_close_confirm: "chan_close_confirm.spend",
+    chan_open_confirm: "chan_open_confirm.mint",
+    chan_close_init: "chan_close_init.mint",
+    chan_close_confirm: "chan_close_confirm.mint",
     recv_packet: "recv_packet.mint",
-    send_packet: "send_packet.spend",
+    send_packet: "send_packet.mint",
     timeout_packet: "timeout_packet.mint",
     acknowledge_packet: "acknowledge_packet.mint",
+    prune_packet_history: "prune_packet_history.mint",
   };
 
   const referredScripts: Record<string, { script: Script; hash: string }> = {};
+  const moduleCallbackValidators = new Set([
+    "send_packet",
+    "chan_open_ack",
+    "chan_open_confirm",
+    "chan_close_init",
+    "chan_close_confirm",
+    "recv_packet",
+    "timeout_packet",
+    "acknowledge_packet",
+  ]);
 
   for (const [name, validator] of Object.entries(referredValidators)) {
-    const args = [mintClientPolicyId, mintConnectionPolicyId, mintPortPolicyId];
+    const args = name === "prune_packet_history"
+      ? [mintClientPolicyId, mintConnectionPolicyId, verifyProofScriptHash]
+      : [mintClientPolicyId, mintConnectionPolicyId, mintPortPolicyId];
 
-    if (name !== "send_packet" && name !== "chan_close_init") {
+    if (
+      name !== "prune_packet_history" &&
+      name !== "send_packet" &&
+      name !== "chan_close_init"
+    ) {
       args.push(verifyProofScriptHash);
     }
 
-    const [script, hash] = await readValidator(
+    if (moduleCallbackValidators.has(name)) args.push(hostStateNftPolicyId);
+
+    const [script, hash] = readValidator(
       `spending_channel/${name}.${validator}`,
       lucid,
       args,
@@ -2334,7 +2600,7 @@ const deploySpendChannel = async (
     };
   }
 
-  const [script, hash, address] = await readValidator(
+  const [script, hash, address] = readValidator(
     "spending_channel.spend_channel.spend",
     lucid,
     [

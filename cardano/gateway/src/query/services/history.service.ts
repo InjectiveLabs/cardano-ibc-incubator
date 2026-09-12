@@ -40,12 +40,17 @@ export type HistoryStakeDistributionEntry = {
   poolId: string;
   stake: bigint;
   vrfKeyHash: string;
+  relativeStakeNumerator: bigint;
+  relativeStakeDenominator: bigint;
   firstRegistrationSlot?: bigint | null;
 };
 
 export type HistoryEpochVerificationContext = {
   epochNonce: string;
   slotsPerKesPeriod: number;
+  maxKesEvolutions: number;
+  activeSlotCoefficientNumerator: bigint;
+  activeSlotCoefficientDenominator: bigint;
   currentEpochStartSlot: bigint;
   currentEpochEndSlotExclusive: bigint;
 };
@@ -66,6 +71,7 @@ export type HistoryService = {
   findBridgeBlocks(trustedHeight: bigint, anchorHeight: bigint): Promise<HistoryBlock[]>;
   findDescendantBlocks(anchorHeight: bigint, limit: number): Promise<HistoryBlock[]>;
   findEpochContextAtBlock(block: HistoryBlock): Promise<HistoryEpochContextAtBlock | null>;
+  findOperationalCertificateCountersAtBlock(block: HistoryBlock): Promise<Map<string, bigint>>;
   findFirstPoolRegistrationSlots(
     poolIds: string[],
     referenceBlock: Pick<HistoryBlock, 'slotNo' | 'timestampUnixNs'>,
@@ -73,6 +79,6 @@ export type HistoryService = {
   findClientUtxosByBlockNo(height: number): Promise<UtxoDto[]>;
   checkExistPoolUpdateByBlockNo(height: number): Promise<boolean>;
   checkExistPoolRetireByBlockNo(height: number): Promise<boolean>;
-  findTxByHash(hash: string): Promise<TxDto>;
+  findTxByHash(hash: string): Promise<TxDto | null>;
   findTransactionEvidenceByHash(hash: string): Promise<HistoryTxEvidence | null>;
 };

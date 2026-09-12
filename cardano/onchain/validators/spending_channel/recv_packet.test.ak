@@ -1,11 +1,17 @@
+use aiken/builtin
+use aiken/cbor
 use aiken/collection/pairs
+use aiken/fuzz
 use aiken/interval
+use aiken/primitive/bytearray
 use cardano/address.{from_script}
-use cardano/assets.{from_asset}
+use cardano/assets.{add, from_asset}
 use cardano/transaction.{
-  InlineDatum, Input, Mint, Output, OutputReference, Redeemer, ScriptPurpose,
-  Spend, Transaction,
+  InlineDatum, Input, Mint, NoDatum, Output, OutputReference, Redeemer,
+  ScriptPurpose, Spend, Transaction,
 }
+use host_state_stt
+use ibc/apps/transfer/types/fungible_token_packet_data
 use ibc/auth.{AuthToken}
 use ibc/client/ics_007_tendermint_client/client_datum.{
   ClientDatum, ClientDatumState,
@@ -38,6 +44,7 @@ use ibc/core/ics_004/types/state as chan_state_mod
 use ibc/core/ics_005/types/ibc_module_redeemer.{
   Callback, OnRecvPacket, OtherModuleData,
 }
+use ibc/core/ics_005/types/keys as port_keys
 use ibc/core/ics_023_vector_commitments/ics23/proofs.{
   CommitmentProof, CommitmentProof_Exist, ExistenceProof, InnerOp, InnerSpec,
   LeafOp, ProofSpec,
@@ -47,12 +54,136 @@ use ibc/core/ics_023_vector_commitments/merkle.{
 }
 use ibc/core/ics_023_vector_commitments/merkle_prefix.{MerklePrefix}
 use ibc/core/ics_024_host_requirements/packet_keys
+use ibc/core/ics_025_handler_interface/host_state.{
+  Active, HostState, HostStateControl, HostStateDatum, ModuleRegistration,
+  empty_ibc_state_root, host_state_token_name,
+}
+use ibc/core/ics_025_handler_interface/host_state_redeemer.{HandlePacket}
+use ibc/core/ics_025_handler_interface/ibc_state_commitment
+use ibc/utils/bits
 use ibc/utils/test_utils
 use ibc/utils/validator_utils
 use spending_channel/recv_packet
 use spending_channel/spending_channel_fixture.{MockData, setup}
 
-test succeed_recv_packet() {
+fn repeat_bytearray(value: ByteArray, count: Int) -> List<ByteArray> {
+  if count <= 0 {
+    []
+  } else {
+    [value, ..repeat_bytearray(value, count - 1)]
+  }
+}
+
+fn full_empty_siblings() -> List<ByteArray> {
+  repeat_bytearray(
+    ibc_state_commitment.empty_hash,
+    ibc_state_commitment.merkle_depth_bits,
+  )
+}
+
+fn key_bit(key_hash: ByteArray, depth: Int) -> Int {
+  let byte_index = 7 - depth / 8
+  let bit_in_byte = depth % 8
+  bits.shr(builtin.index_bytearray(key_hash, byte_index), bit_in_byte) % 2
+}
+
+fn last_different_key_bit(
+  first_hash: ByteArray,
+  second_hash: ByteArray,
+  depth: Int,
+  last_difference: Int,
+) -> Int {
+  if depth == ibc_state_commitment.merkle_depth_bits {
+    expect last_difference >= 0
+    last_difference
+  } else {
+    last_different_key_bit(
+      first_hash,
+      second_hash,
+      depth + 1,
+      if key_bit(first_hash, depth) != key_bit(second_hash, depth) {
+        depth
+      } else {
+        last_difference
+      },
+    )
+  }
+}
+
+fn raise_single_leaf(
+  key_hash: ByteArray,
+  current: ByteArray,
+  depth: Int,
+  target_depth: Int,
+) -> ByteArray {
+  if depth == target_depth {
+    current
+  } else {
+    let next =
+      if key_bit(key_hash, depth) == 0 {
+        ibc_state_commitment.inner_hash(
+          current,
+          ibc_state_commitment.empty_hash,
+        )
+      } else {
+        ibc_state_commitment.inner_hash(
+          ibc_state_commitment.empty_hash,
+          current,
+        )
+      }
+    raise_single_leaf(key_hash, next, depth + 1, target_depth)
+  }
+}
+
+fn single_sibling_list(
+  depth: Int,
+  sibling_depth: Int,
+  sibling: ByteArray,
+) -> List<ByteArray> {
+  if depth == ibc_state_commitment.merkle_depth_bits {
+    []
+  } else {
+    [
+      if depth == sibling_depth {
+        sibling
+      } else {
+        ibc_state_commitment.empty_hash
+      },
+      ..single_sibling_list(depth + 1, sibling_depth, sibling)
+    ]
+  }
+}
+
+fn siblings_after_single_insert(
+  existing_key: ByteArray,
+  existing_value: ByteArray,
+  target_key: ByteArray,
+) -> List<ByteArray> {
+  let existing_key_hash = builtin.sha2_256(existing_key)
+  let target_key_hash = builtin.sha2_256(target_key)
+  let divergence =
+    last_different_key_bit(existing_key_hash, target_key_hash, 0, -1)
+  let existing_leaf =
+    ibc_state_commitment.leaf_hash(
+      existing_key_hash,
+      ibc_state_commitment.value_hash(existing_value),
+    )
+  let sibling =
+    raise_single_leaf(existing_key_hash, existing_leaf, 0, divergence)
+  single_sibling_list(0, divergence, sibling)
+}
+
+fn check_recv_packet_with_timeout(
+  include_module_callback: Bool,
+  mutate_successor: Bool,
+  match_callback_packet: Bool,
+  match_callback_acknowledgement: Bool,
+  preserve_module_binding: Bool,
+  compose_host_state: Bool,
+  packet_data: ByteArray,
+  timeout_height: Height,
+  timeout_timestamp: Int,
+) -> Bool {
   let mock_data = setup()
 
   let channel_id =
@@ -74,6 +205,8 @@ test succeed_recv_packet() {
   let input_channel_datum =
     ChannelDatum {
       state: ChannelDatumState {
+        maximum_receive_proof_height: height_mod.zero_height(),
+        minimum_receive_proof_height: height_mod.zero_height(),
         channel: input_channel,
         next_sequence_send: 1,
         next_sequence_recv: 1,
@@ -88,8 +221,6 @@ test succeed_recv_packet() {
 
   let channel_input =
     test_utils.build_channel_input(input_channel_datum, mock_data.channel_token)
-
-  let inputs = [mock_data.module_input, channel_input]
 
   //========================arrange reference_inputs=======================
   let proof_height = Height { revision_number: 1, revision_height: 19 }
@@ -120,16 +251,17 @@ test succeed_recv_packet() {
       source_channel: input_channel.counterparty.channel_id,
       destination_port: mock_data.port_id,
       destination_channel: channel_id,
-      data: "mock packet data",
-      timeout_height: Height { revision_number: 0, revision_height: 0 },
-      timeout_timestamp: 1735689600000000000,
+      data: packet_data,
+      timeout_height,
+      timeout_timestamp,
     }
 
-  let output_channel_datum =
+  let valid_output_channel_datum =
     ChannelDatum {
       ..input_channel_datum,
       state: ChannelDatumState {
         ..input_channel_datum.state,
+        maximum_receive_proof_height: proof_height,
         packet_receipt: [
           Pair(packet.sequence, ""),
           ..input_channel_datum.state.packet_receipt
@@ -140,6 +272,12 @@ test succeed_recv_packet() {
         ],
       },
     }
+  let output_channel_datum =
+    if mutate_successor {
+      ChannelDatum { ..valid_output_channel_datum, port_id: "port-999" }
+    } else {
+      valid_output_channel_datum
+    }
 
   let channel_output =
     test_utils.build_channel_output(
@@ -147,7 +285,124 @@ test succeed_recv_packet() {
       mock_data.channel_token,
     )
 
-  let outputs = [channel_output]
+  // Compose the receive marker with the HostState transition over the same
+  // transaction. The old tree is empty; receipt insertion is followed by the
+  // acknowledgement insertion using the resulting sparse-tree witness.
+  let packet_receipt_siblings = full_empty_siblings()
+  let receipt_key =
+    packet_keys.packet_receipt_path(
+      input_channel_datum.port_id,
+      channel_id,
+      packet.sequence,
+    )
+  let acknowledgement_key =
+    packet_keys.packet_acknowledgement_path(
+      input_channel_datum.port_id,
+      channel_id,
+      packet.sequence,
+    )
+  let receipt_value = cbor.serialise("")
+  let root_after_receipt =
+    ibc_state_commitment.apply_update(
+      empty_ibc_state_root,
+      receipt_key,
+      "",
+      receipt_value,
+      packet_receipt_siblings,
+    )
+  let packet_acknowledgement_siblings =
+    siblings_after_single_insert(
+      receipt_key,
+      receipt_value,
+      acknowledgement_key,
+    )
+  let updated_root =
+    ibc_state_commitment.apply_update(
+      root_after_receipt,
+      acknowledgement_key,
+      "",
+      cbor.serialise(commit_ack),
+      packet_acknowledgement_siblings,
+    )
+  let host_nft_policy = mock_data.host_state_nft_policy_id
+  expect registered_host_datum: HostStateDatum =
+    validator_utils.get_inline_datum(mock_data.host_state_input.output)
+  let deployer = registered_host_datum.deployer
+  let old_host_state =
+    HostState {
+      ..registered_host_datum.state,
+      version: 0,
+      ibc_state_root: empty_ibc_state_root,
+    }
+  let new_host_state =
+    HostState { ..old_host_state, version: 1, ibc_state_root: updated_root }
+  let host_input =
+    Input {
+      output_reference: OutputReference {
+        transaction_id: #"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        output_index: 0,
+      },
+      output: Output {
+        address: from_script("mock host state script hash"),
+        value: from_asset(host_nft_policy, host_state_token_name, 1),
+        datum: InlineDatum(
+          HostStateDatum {
+            state: old_host_state,
+            nft_policy: host_nft_policy,
+            deployer,
+            control: registered_host_datum.control,
+          },
+        ),
+        reference_script: None,
+      },
+    }
+  let host_output =
+    Output {
+      ..host_input.output,
+      datum: InlineDatum(
+        HostStateDatum {
+          state: new_host_state,
+          nft_policy: host_nft_policy,
+          deployer,
+          control: registered_host_datum.control,
+        },
+      ),
+    }
+
+  let inputs =
+    if include_module_callback {
+      if compose_host_state {
+        [mock_data.module_input, channel_input, host_input]
+      } else {
+        [mock_data.module_input, channel_input, mock_data.host_state_input]
+      }
+    } else if compose_host_state {
+      [channel_input, host_input]
+    } else {
+      [channel_input, mock_data.host_state_input]
+    }
+
+  let outputs =
+    if include_module_callback {
+      let module_output =
+        Output {
+          ..mock_data.module_input.output,
+          address: if preserve_module_binding {
+            mock_data.module_input.output.address
+          } else {
+            from_script("wrong-module-script")
+          },
+        }
+      if compose_host_state {
+        [channel_output, module_output, host_output]
+      } else {
+        [channel_output, module_output]
+      }
+    } else if compose_host_state {
+      [channel_output, host_output]
+    } else {
+      [channel_output]
+    }
 
   //========================arrange validity_range=======================
   let validity_range = mock_data.validity_range
@@ -253,7 +508,20 @@ test succeed_recv_packet() {
 
   let module_redeemer: Redeemer =
     Callback(
-      OnRecvPacket { channel_id, acknowledgement: ack, data: OtherModuleData },
+      OnRecvPacket {
+        channel_id,
+        packet_data: if match_callback_packet {
+          packet.data
+        } else {
+          "wrong"
+        },
+        acknowledgement: if match_callback_acknowledgement {
+          ack
+        } else {
+          acknowledgement_mod.new_error_acknowledgement("wrong")
+        },
+        data: OtherModuleData,
+      },
     )
 
   expect client_datum: ClientDatum =
@@ -300,14 +568,40 @@ test succeed_recv_packet() {
     }
 
   let recv_packet_redeemer: Redeemer = mock_data.channel_token
+  let host_state_redeemer =
+    HandlePacket {
+      channel_siblings: [],
+      next_sequence_send_siblings: [],
+      next_sequence_recv_siblings: [],
+      next_sequence_ack_siblings: [],
+      packet_commitment_siblings: [],
+      packet_receipt_siblings,
+      packet_acknowledgement_siblings,
+    }
+  let host_state_redeemer_data: Redeemer = host_state_redeemer
+  let host_state_redeemers =
+    if compose_host_state {
+      [Pair(Spend(host_input.output_reference), host_state_redeemer_data)]
+    } else {
+      []
+    }
 
-  let redeemers: Pairs<ScriptPurpose, Redeemer> =
+  let required_redeemers: Pairs<ScriptPurpose, Redeemer> =
     [
-      Pair(Spend(mock_data.module_input.output_reference), module_redeemer),
       Pair(Spend(channel_input.output_reference), spend_channel_redeemer),
       Pair(Mint(mock_data.recv_packet_policy_id), recv_packet_redeemer),
       Pair(Mint(mock_data.verify_proof_policy_id), verify_proof_redeemer),
+      ..host_state_redeemers
     ]
+  let redeemers =
+    if include_module_callback {
+      [
+        Pair(Spend(mock_data.module_input.output_reference), module_redeemer),
+        ..required_redeemers
+      ]
+    } else {
+      required_redeemers
+    }
 
   //==========================arrange context=========================
   let transaction =
@@ -321,14 +615,157 @@ test succeed_recv_packet() {
       mint: from_asset(mock_data.recv_packet_policy_id, "", 1),
     }
 
-  recv_packet.recv_packet.mint(
-    mock_data.client_minting_policy_id,
-    mock_data.connection_minting_policy_id,
-    mock_data.port_minting_policy_id,
-    mock_data.verify_proof_policy_id,
-    mock_data.channel_token,
-    mock_data.recv_packet_policy_id,
-    transaction,
+  let recv_packet_valid =
+    recv_packet.recv_packet.mint(
+      mock_data.client_minting_policy_id,
+      mock_data.connection_minting_policy_id,
+      mock_data.port_minting_policy_id,
+      mock_data.verify_proof_policy_id,
+      mock_data.host_state_nft_policy_id,
+      mock_data.channel_token,
+      mock_data.recv_packet_policy_id,
+      transaction,
+    )
+  if compose_host_state {
+    and {
+      recv_packet_valid?,
+      host_state_stt.host_state_stt.spend(
+        host_nft_policy,
+        "unused client script hash",
+        "unused connection script hash",
+        "mock spend channel script hash",
+        mock_data.client_minting_policy_id,
+        mock_data.connection_minting_policy_id,
+        mock_data.channel_minting_policy_id,
+        None,
+        host_state_redeemer,
+        host_input.output_reference,
+        transaction,
+      )?,
+    }
+  } else {
+    recv_packet_valid
+  }
+}
+
+fn check_recv_packet(
+  include_module_callback: Bool,
+  mutate_successor: Bool,
+  match_callback_packet: Bool,
+  match_callback_acknowledgement: Bool,
+  preserve_module_binding: Bool,
+  compose_host_state: Bool,
+) -> Bool {
+  check_recv_packet_with_timeout(
+    include_module_callback,
+    mutate_successor,
+    match_callback_packet,
+    match_callback_acknowledgement,
+    preserve_module_binding,
+    compose_host_state,
+    "mock packet data",
+    Height { revision_number: 0, revision_height: 0 },
+    1735689600000000000,
+  )
+}
+
+fn check_recv_packet_timeout(
+  timeout_height: Height,
+  timeout_timestamp: Int,
+) -> Bool {
+  check_recv_packet_with_timeout(
+    True,
+    False,
+    True,
+    True,
+    True,
+    False,
+    "mock packet data",
+    timeout_height,
+    timeout_timestamp,
+  )
+}
+
+test succeed_recv_packet() {
+  check_recv_packet(True, False, True, True, True, False)
+}
+
+test succeed_recv_packet_maximum_ics20_packet() {
+  let packet_data =
+    #"7b2264656e6f6d223a226962632f75736474222c22616d6f756e74223a22313030222c2273656e646572223a22636f736d6f732073656e6465722061646472657373222c227265636569766572223a223532356636653262306638613135613363393564383263383131336239396466656266653430663132346362326263373165653939653232222c226d656d6f223a225c753030306261616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161227d"
+  expect
+    bytearray.length(packet_data) == fungible_token_packet_data.max_packet_bytes
+
+  check_recv_packet_with_timeout(
+    True,
+    False,
+    True,
+    True,
+    True,
+    False,
+    packet_data,
+    Height { revision_number: 0, revision_height: 0 },
+    1735689600000000000,
+  )
+}
+
+test prop_tx_recv_packet_accepts_atomic_successor_and_callback(
+  _seed via fuzz.int(),
+) {
+  fuzz.label(@"regression.contract.packet.recv.valid_atomic_successor_callback")
+  check_recv_packet(True, False, True, True, True, True)
+}
+
+test prop_tx_recv_packet_rejects_missing_application_callback(
+  _seed via fuzz.int(),
+) fail {
+  fuzz.label(
+    @"regression.contract.packet.recv.invalid_missing_application_callback",
+  )
+  check_recv_packet(False, False, True, True, True, True)
+}
+
+test prop_tx_recv_packet_rejects_moved_port_binding(_seed via fuzz.int()) fail {
+  fuzz.label(@"regression.contract.packet.recv.invalid_moved_port_binding")
+  check_recv_packet(True, False, True, True, False, True)
+}
+
+test prop_tx_recv_packet_rejects_unrelated_successor_mutation(
+  _seed via fuzz.int(),
+) fail {
+  fuzz.label(
+    @"regression.contract.packet.recv.invalid_unrelated_successor_mutation",
+  )
+  check_recv_packet(True, True, True, True, True, True)
+}
+
+test prop_tx_recv_packet_rejects_callback_packet_data_mismatch(
+  _seed via fuzz.int(),
+) fail {
+  fuzz.label(@"regression.contract.packet.recv.invalid_callback_packet_data")
+  check_recv_packet(True, False, False, True, True, True)
+}
+
+test prop_tx_recv_packet_rejects_callback_acknowledgement_mismatch(
+  _seed via fuzz.int(),
+) fail {
+  fuzz.label(
+    @"regression.contract.packet.recv.invalid_callback_acknowledgement",
+  )
+  check_recv_packet(True, False, True, False, True, True)
+}
+
+test recv_packet_rejects_height_only_timeout() fail {
+  check_recv_packet_timeout(
+    Height { revision_number: 0, revision_height: 100 },
+    0,
+  )
+}
+
+test recv_packet_rejects_mixed_height_and_timestamp_timeout() fail {
+  check_recv_packet_timeout(
+    Height { revision_number: 0, revision_height: 100 },
+    1735689600000000000,
   )
 }
 
@@ -353,6 +790,8 @@ test recv_packet_fails_when_channel_is_closed() fail {
   let input_channel_datum =
     ChannelDatum {
       state: ChannelDatumState {
+        maximum_receive_proof_height: height_mod.zero_height(),
+        minimum_receive_proof_height: height_mod.zero_height(),
         channel: input_channel,
         next_sequence_send: 1,
         next_sequence_recv: 1,
@@ -411,13 +850,14 @@ test recv_packet_fails_when_channel_is_closed() fail {
     mock_data.connection_minting_policy_id,
     mock_data.port_minting_policy_id,
     mock_data.verify_proof_policy_id,
+    mock_data.host_state_nft_policy_id,
     mock_data.channel_token,
     mock_data.recv_packet_policy_id,
     transaction,
   )
 }
 
-test recv_packet_non_mock_data() {
+test recv_packet_non_mock_data_rejects_mixed_timeout() fail {
   let client_minting_policy_id =
     #"dcecce6c178dae972476121042b79ac470bd9c2797bedea2c1906e8a"
   let connection_minting_policy_id =
@@ -426,6 +866,8 @@ test recv_packet_non_mock_data() {
     #"b28620755b65066a860e6ff8e1772bb65e73b60dd21d099b2457052b"
   let verify_proof_policy_id =
     #"f94ca68702f061f67713298edda2dd59eaab7b9de711e4728bfe6e03"
+  let host_state_nft_policy_id =
+    #"b377ba1758b1fdea633a60e494f085d59c7799448b0913cc2c6ca753"
   let recv_packet_policy_id =
     #"fb62d2738f5a9fdf049ef19229f82b4b427ed0aceab4282ba9a56039"
 
@@ -440,6 +882,8 @@ test recv_packet_non_mock_data() {
   let input_channel_datum =
     ChannelDatum {
       state: ChannelDatumState {
+        maximum_receive_proof_height: height_mod.zero_height(),
+        minimum_receive_proof_height: height_mod.zero_height(),
         channel: Channel {
           state: chan_state_mod.Open,
           ordering: chan_order_mod.Unordered,
@@ -494,7 +938,67 @@ test recv_packet_non_mock_data() {
       },
     }
 
-  let inputs = [spend_channel_input]
+  let port_token_name = port_keys.port_token_name(input_channel_datum.port_id)
+  let port_token =
+    AuthToken { policy_id: port_minting_policy_id, name: port_token_name }
+  let module_token =
+    AuthToken { policy_id: "module-token-policy", name: "module-token-name" }
+  let module_registration =
+    ModuleRegistration {
+      module_script_hash: "module-script",
+      port_token,
+      module_token,
+    }
+  let module_input =
+    Input {
+      output_reference: OutputReference {
+        transaction_id: #"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        output_index: 0,
+      },
+      output: Output {
+        address: from_script("module-script"),
+        value: from_asset(port_token.policy_id, port_token.name, 1)
+          |> add(module_token.policy_id, module_token.name, 1),
+        datum: NoDatum,
+        reference_script: None,
+      },
+    }
+
+  let host_state_input =
+    Input {
+      output_reference: OutputReference {
+        transaction_id: #"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        output_index: 0,
+      },
+      output: Output {
+        address: from_script("host-state-script"),
+        value: from_asset(host_state_nft_policy_id, host_state_token_name, 1),
+        datum: InlineDatum(
+          HostStateDatum {
+            state: HostState {
+              version: 0,
+              ibc_state_root: empty_ibc_state_root,
+              next_client_sequence: 0,
+              next_connection_sequence: 0,
+              next_channel_sequence: 0,
+              bound_port: [],
+              last_update_time: 0,
+            },
+            nft_policy: host_state_nft_policy_id,
+            deployer: #"00000000000000000000000000000000000000000000000000000000",
+            control: HostStateControl {
+              port_registry: [
+                Pair(input_channel_datum.port_id, module_registration),
+              ],
+              shutdown: Active,
+            },
+          },
+        ),
+        reference_script: None,
+      },
+    }
+
+  let inputs = [module_input, spend_channel_input, host_state_input]
 
   let outputs =
     [
@@ -504,6 +1008,7 @@ test recv_packet_non_mock_data() {
         datum: InlineDatum(updated_channel_datum),
         reference_script: None,
       },
+      module_input.output,
     ]
 
   let merkle_proof =
@@ -952,25 +1457,37 @@ test recv_packet_non_mock_data() {
       },
     ]
 
+  let packet =
+    Packet {
+      sequence: 1,
+      source_port: "vesseloracle",
+      source_channel: "channel-1",
+      destination_port: "port-100",
+      destination_channel: "channel-0",
+      data: #"7b22696d6f223a2239353235333338222c227473223a313734313235353632322c22746f74616c53616d706c6573223a382c226574614f75746c69657273223a312c226574614d65616e436c65616e6564223a313732373639303339342c226574614d65616e416c6c223a313732373638373633332c22657461537464436c65616e6564223a34342c22657461537464416c6c223a313031372c22646570706f7274223a22494e4e5341222c22646570706f727453636f7265223a38377d",
+      timeout_height: Height { revision_number: 1, revision_height: 2406 },
+      timeout_timestamp: 1741267642158681752,
+    }
   let spend_channel_redeemer: Redeemer =
     RecvPacket {
-      packet: Packet {
-        sequence: 1,
-        source_port: "vesseloracle",
-        source_channel: "channel-1",
-        destination_port: "port-100",
-        destination_channel: "channel-0",
-        data: #"7b22696d6f223a2239353235333338222c227473223a313734313235353632322c22746f74616c53616d706c6573223a382c226574614f75746c69657273223a312c226574614d65616e436c65616e6564223a313732373639303339342c226574614d65616e416c6c223a313732373638373633332c22657461537464436c65616e6564223a34342c22657461537464416c6c223a313031372c22646570706f7274223a22494e4e5341222c22646570706f727453636f7265223a38377d",
-        timeout_height: Height { revision_number: 1, revision_height: 2406 },
-        timeout_timestamp: 1741267642158681752,
-      },
+      packet,
       proof_commitment: merkle_proof,
       proof_height: Height { revision_height: 2709, revision_number: 0 },
     }
+  let module_redeemer: Redeemer =
+    Callback(
+      OnRecvPacket {
+        channel_id: "channel-0",
+        packet_data: packet.data,
+        acknowledgement: acknowledgement_mod.new_result_acknowledgement("AQ=="),
+        data: OtherModuleData,
+      },
+    )
 
   let redeemers: Pairs<ScriptPurpose, Redeemer> =
     [
       Pair(Mint(verify_proof_policy_id), mint_verifying_proof_redeemer),
+      Pair(Spend(module_input.output_reference), module_redeemer),
       Pair(Spend(spend_channel_input.output_reference), spend_channel_redeemer),
     ]
 
@@ -990,6 +1507,7 @@ test recv_packet_non_mock_data() {
     connection_minting_policy_id,
     port_minting_policy_id,
     verify_proof_policy_id,
+    host_state_nft_policy_id,
     channel_token,
     recv_packet_policy_id,
     transaction,

@@ -17,7 +17,7 @@ import {
   MsgChannelOpenInitResponse,
   MsgChannelOpenTry,
   MsgChannelOpenTryResponse,
-} from '@plus/proto-types/build/ibc/core/channel/v1/tx';
+} from '@cardano-ibc/proto-types/build/ibc/core/channel/v1/tx';
 import { HostStateDatum } from 'src/shared/types/host-state-datum';
 import { parseClientSequence, parseConnectionSequence } from 'src/shared/helpers/sequence';
 import { ConnectionDatum } from 'src/shared/types/connection/connection-datum';
@@ -47,7 +47,7 @@ import {
   Channel as CardanoChannel,
   State as CardanoChannelState,
   orderFromJSON,
-} from '@plus/proto-types/build/ibc/core/channel/v1/channel';
+} from '@cardano-ibc/proto-types/build/ibc/core/channel/v1/channel';
 import { ORDER_MAPPING_CHANNEL } from '~@/constant/channel';
 import { computeLedgerAnchoredValidityWindow, sleep } from '../shared/helpers/time';
 import {
@@ -66,12 +66,7 @@ import {
   UnsignedChannelOpenInitDto,
 } from '~@/shared/modules/lucid/dtos';
 import { TRANSACTION_SET_COLLATERAL, TRANSACTION_TIME_TO_LIVE } from '~@/config/constant.config';
-import {
-  alignTreeWithChain,
-  computeRootWithCreateChannelUpdate,
-  computeRootWithUpdateChannelUpdate,
-  isTreeAligned,
-} from '../shared/helpers/ibc-state-root';
+import { IbcTreeStateStore, StateRootResult, StaleIbcTreeStateError } from '../shared/helpers/ibc-state-root';
 import { PendingTreeUpdate } from '../shared/services/ibc-tree-pending-updates.service';
 import { TxOperationRunnerService } from './tx-operation-runner.service';
 import { getGatewayModuleConfigForPortId } from '@shared/helpers/module-port';
@@ -83,6 +78,7 @@ export class ChannelService {
     private configService: ConfigService,
     @Inject(LucidService) private lucidService: LucidService,
     private readonly txOperationRunnerService: TxOperationRunnerService,
+    private readonly ibcTreeStore: IbcTreeStateStore,
   ) {}
 
   private async refreshWalletContext(address: string, context: string): Promise<void> {
@@ -116,7 +112,7 @@ export class ChannelService {
     nextSequenceSendSiblings: string[];
     nextSequenceRecvSiblings: string[];
     nextSequenceAckSiblings: string[];
-    commit: () => void;
+    commit: StateRootResult['commit'];
   }> {
     // Encode the exact bytes that the on-chain validator commits to the root.
     // These bytes must match Aiken's `cbor.serialise(...)` output.
@@ -139,7 +135,7 @@ export class ChannelService {
       'hex',
     );
 
-    return computeRootWithCreateChannelUpdate(
+    return this.ibcTreeStore.computeRootWithCreateChannelUpdate(
       oldRoot,
       portId,
       channelId,
@@ -157,7 +153,7 @@ export class ChannelService {
     validToSlot: number;
     validToTime: number;
   }> {
-    const ogmiosEndpoint = this.configService.get<string>('ogmiosEndpoint');
+    const ogmiosEndpoint = this.configService.getOrThrow<string>('ogmiosEndpoint');
     const network = this.configService.get('cardanoNetwork') as Network;
     const slotConfig = this.lucidService.LucidImporter.SLOT_CONFIG_NETWORK?.[network];
     if (!slotConfig || slotConfig.slotLength <= 0) {
@@ -179,7 +175,7 @@ export class ChannelService {
     portId: string,
     channelId: string,
     channelDatum: ChannelDatum,
-  ): Promise<{ newRoot: string; channelSiblings: string[]; commit: () => void }> {
+  ): Promise<{ newRoot: string; channelSiblings: string[]; commit: StateRootResult['commit'] }> {
     // Encode the exact bytes that the on-chain validator commits to the root.
     // These bytes must match Aiken's `cbor.serialise(...)` output.
     const channelValue = Buffer.from(
@@ -187,21 +183,23 @@ export class ChannelService {
       'hex',
     );
 
-    return computeRootWithUpdateChannelUpdate(oldRoot, portId, channelId, channelValue);
+    return this.ibcTreeStore.computeRootWithUpdateChannelUpdate(oldRoot, portId, channelId, channelValue);
   }
 
   /**
    * Ensure the in-memory Merkle tree is aligned with on-chain state
    */
-  private async ensureTreeAligned(onChainRoot: string): Promise<void> {
-    if (!isTreeAligned(onChainRoot)) {
-      this.logger.warn(`Tree is out of sync with on-chain root ${onChainRoot.substring(0, 16)}..., rebuilding...`);
-      await alignTreeWithChain();
+  private async ensureTreeAligned(onChainRoot: string, hostStateUtxo: Pick<UTxO, 'txHash' | 'outputIndex'>): Promise<void> {
+    const snapshot = await this.ibcTreeStore.getAlignedSnapshot();
+    if (snapshot.root !== onChainRoot ||
+      snapshot.hostState.txHash !== hostStateUtxo.txHash ||
+      snapshot.hostState.outputIndex !== hostStateUtxo.outputIndex) {
+      throw new StaleIbcTreeStateError('HostState changed while preparing the transaction, retry with current inputs');
     }
   }
 
   private getModuleConfig(portId: string) {
-    return getGatewayModuleConfigForPortId(this.configService.get('deployment'), portId);
+    return getGatewayModuleConfigForPortId(this.configService.getOrThrow('deployment'), portId);
   }
 
   async channelOpenInit(data: MsgChannelOpenInit): Promise<MsgChannelOpenInitResponse> {
@@ -533,7 +531,7 @@ export class ChannelService {
     );
 
     // Ensure the in-memory Merkle tree is aligned with on-chain state before computing witnesses.
-    await this.ensureTreeAligned(hostStateDatum.state.ibc_state_root);
+    await this.ensureTreeAligned(hostStateDatum.state.ibc_state_root, hostStateUtxo);
 
     const [mintConnectionPolicyId, connectionTokenName] = this.lucidService.getConnectionTokenUnit(
       parseConnectionSequence(channelOpenInitOperator.connectionId),
@@ -577,6 +575,8 @@ export class ChannelService {
         next_sequence_send: 1n,
         next_sequence_recv: 1n,
         next_sequence_ack: 1n,
+        minimum_receive_proof_height: { revisionNumber: 0n, revisionHeight: 0n },
+        maximum_receive_proof_height: { revisionNumber: 0n, revisionHeight: 0n },
         packet_commitment: new Map(),
         packet_receipt: new Map(),
         packet_acknowledgement: new Map(),
@@ -678,7 +678,7 @@ export class ChannelService {
     );
 
     // Ensure the in-memory Merkle tree is aligned with on-chain state before computing witnesses.
-    await this.ensureTreeAligned(hostStateDatum.state.ibc_state_root);
+    await this.ensureTreeAligned(hostStateDatum.state.ibc_state_root, hostStateUtxo);
 
     const [mintConnectionPolicyId, connectionTokenName] = this.lucidService.getConnectionTokenUnit(
       parseConnectionSequence(channelOpenTryOperator.connectionId),
@@ -694,6 +694,36 @@ export class ChannelService {
     // Get the token unit associated with the client
     const clientTokenUnit = this.lucidService.getClientTokenUnit(connectionClientSequence);
     const clientUtxo = await this.lucidService.findUtxoByUnit(clientTokenUnit);
+    const clientDatum = await this.lucidService.decodeDatum<ClientDatum>(clientUtxo.datum!, 'client');
+    const heightsArray = Array.from(clientDatum.state.consensusStates.keys());
+    if (!isValidProofHeight(heightsArray, channelOpenTryOperator.proofHeight)) {
+      throw new GrpcInternalException(
+        `Invalid proof height: ${channelOpenTryOperator.proofHeight.revisionNumber}/${channelOpenTryOperator.proofHeight.revisionHeight}`,
+      );
+    }
+    const consensusEntry = [...clientDatum.state.consensusStates.entries()].find(
+      ([key]) =>
+        key.revisionNumber === channelOpenTryOperator.proofHeight.revisionNumber &&
+        key.revisionHeight === channelOpenTryOperator.proofHeight.revisionHeight,
+    );
+    if (!consensusEntry) {
+      throw new GrpcInternalException(
+        `Missing consensus state at proof height ${channelOpenTryOperator.proofHeight.revisionNumber}/${channelOpenTryOperator.proofHeight.revisionHeight}`,
+      );
+    }
+    const processedTime = getHeightMapValue(
+      clientDatum.state.processedTimes,
+      channelOpenTryOperator.proofHeight,
+    );
+    const processedHeight = getHeightMapValue(
+      clientDatum.state.processedHeights,
+      channelOpenTryOperator.proofHeight,
+    );
+    if (processedTime == null || processedHeight == null) {
+      throw new GrpcInternalException(
+        `Missing processed delay metadata at proof height ${channelOpenTryOperator.proofHeight.revisionNumber}/${channelOpenTryOperator.proofHeight.revisionHeight}`,
+      );
+    }
 
     // Derive the new channel identifier from the HostState sequence.
     const channelSequence = hostStateDatum.state.next_channel_sequence;
@@ -729,6 +759,8 @@ export class ChannelService {
         next_sequence_send: 1n,
         next_sequence_recv: 1n,
         next_sequence_ack: 1n,
+        minimum_receive_proof_height: { revisionNumber: 0n, revisionHeight: 0n },
+        maximum_receive_proof_height: { revisionNumber: 0n, revisionHeight: 0n },
         packet_commitment: new Map(),
         packet_receipt: new Map(),
         packet_acknowledgement: new Map(),
@@ -736,6 +768,45 @@ export class ChannelService {
       port: convertString2Hex(channelOpenTryOperator.port_id),
       token: channelToken,
     };
+    const expectedCounterpartyChannel: CardanoChannel = {
+      state: CardanoChannelState.STATE_INIT,
+      ordering: orderFromJSON(ORDER_MAPPING_CHANNEL[channelDatum.state.channel.ordering]),
+      counterparty: {
+        port_id: convertHex2String(channelDatum.port),
+        channel_id: '',
+      },
+      connection_hops: [convertHex2String(connectionDatum.state.counterparty.connection_id)],
+      version: channelOpenTryOperator.counterpartyVersion,
+    };
+    const verifyProofRedeemer: VerifyProofRedeemer = {
+      VerifyMembership: {
+        cs: clientDatum.state.clientState,
+        cons_state: consensusEntry[1],
+        height: channelOpenTryOperator.proofHeight,
+        processed_time: processedTime,
+        processed_height: processedHeight,
+        delay_time_period: connectionDatum.state.delay_period,
+        delay_block_period: getBlockDelay(connectionDatum.state.delay_period),
+        proof: channelOpenTryOperator.proofInit,
+        path: {
+          key_path: [
+            connectionDatum.state.counterparty.prefix.key_prefix,
+            convertString2Hex(
+              channelPath(
+                convertHex2String(channelDatum.state.channel.counterparty.port_id),
+                convertHex2String(channelDatum.state.channel.counterparty.channel_id),
+              ),
+            ),
+          ],
+        },
+        value: toHex(CardanoChannel.encode(expectedCounterpartyChannel).finish()),
+      },
+    };
+    const verifyProofPolicyId = this.configService.get('deployment').validators.verifyProof.scriptHash;
+    const encodedVerifyProofRedeemer = encodeVerifyProofRedeemer(
+      verifyProofRedeemer,
+      this.lucidService.LucidImporter,
+    );
 
     const { newRoot, channelSiblings, nextSequenceSendSiblings, nextSequenceRecvSiblings, nextSequenceAckSiblings } =
       await this.computeRootWithCreateChannelUpdate(
@@ -797,6 +868,8 @@ export class ChannelService {
       moduleUtxo,
       encodedSpendModuleRedeemer,
       encodedMintChannelRedeemer,
+      verifyProofPolicyId,
+      encodedVerifyProofRedeemer,
       channelTokenUnit,
       encodedUpdatedHostStateDatum,
       encodedChannelDatum,
@@ -838,7 +911,7 @@ export class ChannelService {
     );
 
     // Ensure the in-memory Merkle tree is aligned with on-chain state before computing witnesses.
-    await this.ensureTreeAligned(hostStateDatum.state.ibc_state_root);
+    await this.ensureTreeAligned(hostStateDatum.state.ibc_state_root, hostStateUtxo);
     const [mintConnectionPolicyId, connectionTokenName] = this.lucidService.getConnectionTokenUnit(
       //TODO: recheck
       parseConnectionSequence(convertHex2String(channelDatum.state.channel.connection_hops[0])),
@@ -1071,7 +1144,7 @@ export class ChannelService {
     );
 
     // Ensure the in-memory Merkle tree is aligned with on-chain state before computing witnesses.
-    await this.ensureTreeAligned(hostStateDatum.state.ibc_state_root);
+    await this.ensureTreeAligned(hostStateDatum.state.ibc_state_root, hostStateUtxo);
     const [mintConnectionPolicyId, connectionTokenName] = this.lucidService.getConnectionTokenUnit(
       //TODO: recheck
       parseConnectionSequence(convertHex2String(channelDatum.state.channel.connection_hops[0])),
@@ -1269,7 +1342,7 @@ export class ChannelService {
     );
 
     // Ensure the in-memory Merkle tree is aligned with on-chain state before computing witnesses.
-    await this.ensureTreeAligned(hostStateDatum.state.ibc_state_root);
+    await this.ensureTreeAligned(hostStateDatum.state.ibc_state_root, hostStateUtxo);
 
     const channelSequence = channelCloseInitOperator.channel_id;
 
@@ -1425,7 +1498,7 @@ export class ChannelService {
       'host_state',
     );
 
-    await this.ensureTreeAligned(hostStateDatum.state.ibc_state_root);
+    await this.ensureTreeAligned(hostStateDatum.state.ibc_state_root, hostStateUtxo);
 
     const [mintConnectionPolicyId, connectionTokenName] = this.lucidService.getConnectionTokenUnit(
       parseConnectionSequence(convertHex2String(channelDatum.state.channel.connection_hops[0])),

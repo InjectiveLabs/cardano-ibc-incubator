@@ -1,3 +1,4 @@
+use cardano/assets.{Value}
 use cardano/transaction.{
   Input, Mint, Redeemer, ScriptPurpose, Spend, Transaction,
 }
@@ -31,7 +32,7 @@ use ibc/utils/validator_utils
 use spending_channel/chan_close_confirm
 use spending_channel/spending_channel_fixture.{MockData, setup}
 
-fn check_chan_close_confirm(module_redeemer: Redeemer) {
+fn check_chan_close_confirm(module_redeemer: Redeemer, mint: Value) {
   let fake_data = setup()
 
   //========================arrange inputs=======================
@@ -50,6 +51,8 @@ fn check_chan_close_confirm(module_redeemer: Redeemer) {
   let input_channel_datum =
     ChannelDatum {
       state: ChannelDatumState {
+        maximum_receive_proof_height: height_mod.zero_height(),
+        minimum_receive_proof_height: height_mod.zero_height(),
         channel: input_channel,
         next_sequence_send: 1,
         next_sequence_recv: 1,
@@ -65,7 +68,8 @@ fn check_chan_close_confirm(module_redeemer: Redeemer) {
   let channel_input =
     test_utils.build_channel_input(input_channel_datum, fake_data.channel_token)
 
-  let inputs = [fake_data.module_input, channel_input]
+  let inputs =
+    [fake_data.host_state_input, fake_data.module_input, channel_input]
 
   //========================arrange reference_inputs=======================
   let proof_height = Height { revision_number: 1, revision_height: 13 }
@@ -193,20 +197,21 @@ fn check_chan_close_confirm(module_redeemer: Redeemer) {
     Transaction {
       ..transaction.placeholder,
       inputs,
+      mint,
       reference_inputs,
       outputs,
       redeemers,
       validity_range,
     }
 
-  chan_close_confirm.chan_close_confirm.spend(
+  chan_close_confirm.chan_close_confirm.mint(
     fake_data.client_minting_policy_id,
     fake_data.connection_minting_policy_id,
     fake_data.port_minting_policy_id,
     fake_data.verify_proof_policy_id,
-    None,
+    fake_data.host_state_nft_policy_id,
     fake_data.channel_token,
-    channel_input.output_reference,
+    fake_data.chan_close_confirm_policy_id,
     transaction,
   )
 }
@@ -217,7 +222,10 @@ test chan_close_confirm_succeed() {
   let module_redeemer: Redeemer =
     Callback(OnChanCloseConfirm { channel_id: fake_data.channel_id })
 
-  check_chan_close_confirm(module_redeemer)
+  check_chan_close_confirm(
+    module_redeemer,
+    assets.from_asset(fake_data.chan_close_confirm_policy_id, "", 1),
+  )
 }
 
 test chan_close_confirm_rejects_open_confirm_callback() fail {
@@ -226,5 +234,48 @@ test chan_close_confirm_rejects_open_confirm_callback() fail {
   let module_redeemer: Redeemer =
     Callback(OnChanOpenConfirm { channel_id: fake_data.channel_id })
 
-  check_chan_close_confirm(module_redeemer)
+  check_chan_close_confirm(
+    module_redeemer,
+    assets.from_asset(fake_data.chan_close_confirm_policy_id, "", 1),
+  )
+}
+
+fn check_close_confirm_marker(mint: Value) {
+  let mock_data = setup()
+  let callback: Redeemer =
+    Callback(OnChanCloseConfirm { channel_id: mock_data.channel_id })
+  check_chan_close_confirm(callback, mint)
+}
+
+test chan_close_confirm_rejects_missing_marker() fail {
+  check_close_confirm_marker(assets.zero)
+}
+
+test chan_close_confirm_rejects_marker_burn() fail {
+  let mock_data = setup()
+  check_close_confirm_marker(
+    assets.from_asset(mock_data.chan_close_confirm_policy_id, "", -1),
+  )
+}
+
+test chan_close_confirm_rejects_multiple_markers() fail {
+  let mock_data = setup()
+  check_close_confirm_marker(
+    assets.from_asset(mock_data.chan_close_confirm_policy_id, "", 2),
+  )
+}
+
+test chan_close_confirm_rejects_wrong_marker_name() fail {
+  let mock_data = setup()
+  check_close_confirm_marker(
+    assets.from_asset(mock_data.chan_close_confirm_policy_id, "wrong", 1),
+  )
+}
+
+test chan_close_confirm_rejects_extra_marker_asset() fail {
+  let mock_data = setup()
+  check_close_confirm_marker(
+    assets.from_asset(mock_data.chan_close_confirm_policy_id, "", 1)
+      |> assets.add(mock_data.chan_close_confirm_policy_id, "extra", 1),
+  )
 }

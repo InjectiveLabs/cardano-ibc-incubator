@@ -6,19 +6,19 @@ import {
   MsgChannelOpenInit,
   MsgChannelOpenTry,
   MsgChannelCloseInit,
-} from '@plus/proto-types/build/ibc/core/channel/v1/tx';
+} from '@cardano-ibc/proto-types/build/ibc/core/channel/v1/tx';
 import { ChannelCloseConfirmOperator } from '../dto/channel/channel-close-confirm-operator.dto';
 import { ChannelOpenInitOperator } from '../dto/channel/channel-open-init-operator.dto';
 import { Order } from 'src/shared/types/channel/order';
 import { ChannelOpenTryOperator } from '../dto/channel/channel-open-try-operator.dto';
 import { ChannelCloseInitOperator } from '../dto/channel/channel-close-init-operator.dto';
 import { decodeMerkleProof } from './helper';
-import { MerkleProof } from '@plus/proto-types/build/ibc/core/commitment/v1/commitment';
+import { MerkleProof } from '@cardano-ibc/proto-types/build/ibc/core/commitment/v1/commitment';
 import { initializeMerkleProof } from '@shared/helpers/merkle-proof';
 import { ChannelOpenAckOperator } from '../dto/channel/channel-open-ack-operator.dto';
 import { CHANNEL_ID_PREFIX } from 'src/constant';
 import { ChannelOpenConfirmOperator } from '../dto/channel/channel-open-confirm-operator.dto';
-import { Order as ChannelOrder } from '@plus/proto-types/build/ibc/core/channel/v1/channel';
+import { Order as ChannelOrder } from '@cardano-ibc/proto-types/build/ibc/core/channel/v1/channel';
 export function validateAndFormatChannelOpenInitParams(data: MsgChannelOpenInit): {
   constructedAddress: string;
   channelOpenInitOperator: ChannelOpenInitOperator;
@@ -30,10 +30,6 @@ export function validateAndFormatChannelOpenInitParams(data: MsgChannelOpenInit)
   if (data.channel.connection_hops.length == 0) {
     throw new GrpcInvalidArgumentException('Invalid connection id: Connection Id is not valid');
   }
-  // if (['transfer'].includes(data.port_id.toLocaleLowerCase())) data.port_id = 'port-99';
-
-  // if (['transfer'].includes(data.port_id.toLocaleLowerCase())) data.port_id = 'port-99';
-
   // Prepare the Channel open init operator object
   let orderingChannel: Order;
   switch (data.channel.ordering) {
@@ -46,6 +42,8 @@ export function validateAndFormatChannelOpenInitParams(data: MsgChannelOpenInit)
     case ChannelOrder.ORDER_ORDERED:
       orderingChannel = Order.Ordered;
       break;
+    default:
+      throw new GrpcInvalidArgumentException('Invalid argument: "channel.ordering" is not recognized');
   }
   const channelOpenInitOperator: ChannelOpenInitOperator = {
     //TODO: check in channel.connection_hops
@@ -69,7 +67,6 @@ export function validateAndFormatChannelOpenTryParams(data: MsgChannelOpenTry): 
     throw new GrpcInvalidArgumentException('Invalid connection id: Connection Id is not valid');
   }
   const decodedProofInitMsg: MerkleProof = decodeMerkleProof(data.proof_init);
-  // if (['transfer'].includes(data.port_id.toLocaleLowerCase())) data.port_id = 'port-99';
   // Prepare the Channel open try operator object
   const channelOpenTryOperator: ChannelOpenTryOperator = {
     //TODO: check with connection_hops
@@ -100,7 +97,6 @@ export function validateAndFormatChannelOpenAckParams(data: MsgChannelOpenAck): 
     throw new GrpcInvalidArgumentException(
       `Invalid argument: "channel_id". Please use the prefix "${CHANNEL_ID_PREFIX}-"`,
     );
-  // if (['transfer'].includes(data.port_id.toLocaleLowerCase())) data.port_id = 'port-99';
   const channelSequence: string = data.channel_id.replaceAll(`${CHANNEL_ID_PREFIX}-`, '');
   const decodedProofTryMsg: MerkleProof = decodeMerkleProof(data.proof_try);
   // Prepare the Channel open ack operator object

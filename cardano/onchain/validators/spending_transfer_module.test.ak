@@ -7,6 +7,8 @@ use cardano/transaction.{
   InlineDatum, Input, Mint, NoDatum, Output, OutputReference, Redeemer,
   ScriptPurpose, Spend, Transaction,
 }
+use ibc/apps/transfer/channel_callback as transfer_channel_callback
+use ibc/apps/transfer/escrow as transfer_escrow
 use ibc/apps/transfer/mint_voucher_redeemer.{
   BurnVoucher, MintVoucher, RefundVoucher,
 }
@@ -16,33 +18,36 @@ use ibc/apps/transfer/types/coin as transfer_coin
 use ibc/apps/transfer/types/escrow_datum.{TransferEscrowDatum}
 use ibc/apps/transfer/types/fungible_token_packet_data.{FungibleTokenPacketData}
 use ibc/apps/transfer/types/keys as transfer_module_keys
+use ibc/apps/transfer/types/transfer_module_datum.{
+  TransferModuleDatum, empty_escrow_shard_registry_root,
+}
 use ibc/auth.{AuthToken}
 use ibc/client/ics_007_tendermint_client/height.{Height}
 use ibc/core/ics_004/channel_datum.{ChannelDatum, ChannelDatumState}
 use ibc/core/ics_004/channel_redeemer.{
   AcknowledgePacket, ChanOpenAck, ChanOpenConfirm, ChanOpenInit, ChanOpenTry,
-  RecvPacket, SendPacket, TimeoutPacket,
+  RecvPacket, SendPacket, TimeoutOnClose, TimeoutPacket,
 }
 use ibc/core/ics_004/types/acknowledgement as acknowledgement_mod
 use ibc/core/ics_004/types/channel.{Channel}
 use ibc/core/ics_004/types/counterparty.{ChannelCounterparty}
 use ibc/core/ics_004/types/keys as channel_keys
 use ibc/core/ics_004/types/order as chan_order_mod
-use ibc/core/ics_004/types/packet.{Packet}
+use ibc/core/ics_004/types/packet.{Packet} as packet_mod
 use ibc/core/ics_004/types/state as chan_state_mod
 use ibc/core/ics_005/types/ibc_module_redeemer.{
-  Callback, IBCModuleRedeemer, OnAcknowledgementPacket, OnChanCloseConfirm,
-  OnChanCloseInit, OnChanOpenAck, OnChanOpenConfirm, OnChanOpenInit,
-  OnChanOpenTry, OnRecvPacket, OnTimeoutPacket, Operator, TransferModuleData,
-  TransferModuleOperator,
+  Callback, IBCModuleRedeemer, ModuleDataV1, ModuleOperatorV1,
+  OnAcknowledgementPacket, OnChanCloseConfirm, OnChanCloseInit, OnChanOpenAck,
+  OnChanOpenConfirm, OnChanOpenInit, OnChanOpenTry, OnRecvPacket, OnSendPacket,
+  OnTimeoutPacket, Operator,
 }
 use ibc/core/ics_023_vector_commitments/ics23/proofs.{
   CommitmentProof, CommitmentProof_Exist, ExistenceProof, InnerOp, LeafOp,
 }
 use ibc/core/ics_023_vector_commitments/merkle.{MerkleProof}
 use ibc/core/ics_025_handler_interface/host_state.{
-  Active, HostState, HostStateDatum, ShutdownState, ShuttingDown,
-  empty_ibc_state_root,
+  Active, HostState, HostStateControl, HostStateDatum, ShutdownState,
+  ShuttingDown, empty_ibc_state_root,
 }
 use ibc/testing/fuzz_dsl
 use ibc/utils/string as string_utils
@@ -88,7 +93,7 @@ fn host_state_datum(
     },
     nft_policy,
     deployer: #"00000000000000000000000000000000000000000000000000000000",
-    shutdown,
+    control: HostStateControl { port_registry: [], shutdown },
   }
 }
 
@@ -148,7 +153,11 @@ fn setup() -> MockData {
       value: from_asset(module_token.policy_id, module_token.name, 1)
         |> add(port_token.policy_id, port_token.name, 1)
         |> add(ada_policy_id, ada_asset_name, 99999999999),
-      datum: NoDatum,
+      datum: InlineDatum(
+        TransferModuleDatum {
+          escrow_shard_registry_root: empty_escrow_shard_registry_root,
+        },
+      ),
       reference_script: None,
     }
 
@@ -181,6 +190,8 @@ fn setup() -> MockData {
   let channel_datum =
     ChannelDatum {
       state: ChannelDatumState {
+        minimum_receive_proof_height: height.zero_height(),
+        maximum_receive_proof_height: height.zero_height(),
         channel: Channel {
           state: chan_state_mod.Init,
           ordering: chan_order_mod.Unordered,
@@ -363,6 +374,24 @@ fn setup() -> MockData {
   }
 }
 
+fn receive_channel_output(mock: MockData) -> Output {
+  expect InlineDatum(channel_datum_data) = mock.channel_output.datum
+  expect channel_datum: ChannelDatum = channel_datum_data
+
+  Output {
+    ..mock.channel_output,
+    datum: InlineDatum(
+      ChannelDatum {
+        ..channel_datum,
+        state: ChannelDatumState {
+          ..channel_datum.state,
+          maximum_receive_proof_height: mock.proof_height,
+        },
+      },
+    ),
+  }
+}
+
 fn transfer_escrow_input(
   output_index: Int,
   module_output: Output,
@@ -403,6 +432,17 @@ fn transfer_escrow_output(
       |> add(transfer_escrow_shard_policy_id, shard_token_name, 1),
     datum: InlineDatum(TransferEscrowDatum { channel_id, denom }),
     reference_script: None,
+  }
+}
+
+fn module_output_with_registered_shard(module_output: Output) -> Output {
+  Output {
+    ..module_output,
+    datum: InlineDatum(
+      TransferModuleDatum {
+        escrow_shard_registry_root: #"1111111111111111111111111111111111111111111111111111111111111111",
+      },
+    ),
   }
 }
 
@@ -494,6 +534,62 @@ fn build_packet(
   (ftpd, packet)
 }
 
+// Representative budget cases use prebuilt canonical bytes so fixture
+// construction does not double-charge the off-chain serializer.
+fn build_prebuilt_packet(
+  denom: ByteArray,
+  amount: ByteArray,
+  sender: ByteArray,
+  receiver: ByteArray,
+  source_port: ByteArray,
+  source_channel: ByteArray,
+  destination_port: ByteArray,
+  destination_channel: ByteArray,
+  authenticated_data: ByteArray,
+) -> (FungibleTokenPacketData, Packet) {
+  build_prebuilt_packet_with_memo(
+    denom,
+    amount,
+    sender,
+    receiver,
+    "",
+    source_port,
+    source_channel,
+    destination_port,
+    destination_channel,
+    authenticated_data,
+  )
+}
+
+fn build_prebuilt_packet_with_memo(
+  denom: ByteArray,
+  amount: ByteArray,
+  sender: ByteArray,
+  receiver: ByteArray,
+  memo: ByteArray,
+  source_port: ByteArray,
+  source_channel: ByteArray,
+  destination_port: ByteArray,
+  destination_channel: ByteArray,
+  authenticated_data: ByteArray,
+) -> (FungibleTokenPacketData, Packet) {
+  let ftpd = FungibleTokenPacketData { denom, amount, sender, receiver, memo }
+
+  (
+    ftpd,
+    Packet {
+      sequence: 1,
+      source_port,
+      source_channel,
+      destination_port,
+      destination_channel,
+      data: authenticated_data,
+      timeout_height: height.zero_height(),
+      timeout_timestamp: 1111,
+    },
+  )
+}
+
 fn run_transfer_module_transition(
   mock: MockData,
   transaction: Transaction,
@@ -524,13 +620,29 @@ fn run_transfer_module_transition(
       )
 }
 
+type SendCallbackMutation {
+  ExactSendCallback
+  UndecodableSender
+  WrongLengthSender
+  WrongTypedPacketData
+  WrongSendCommitment
+  MovedModuleCredential
+}
+
 fn native_send_escrow_fixture(
   escrow_amount: Int,
   mutation: fuzz_dsl.Mutation,
+  callback_mutation: SendCallbackMutation,
 ) -> fuzz_dsl.ProtocolTxFixture {
   let mock = setup()
   let transfer_amount = 1234
-  let receiver = mock.cardano_public_key_hash
+  let sender =
+    when callback_mutation is {
+      UndecodableSender -> "zz"
+      WrongLengthSender -> "00"
+      _ -> mock.cardano_public_key_hash
+    }
+  let receiver = mock.cosmos_address
   let inputs = [mock.module_input, mock.channel_input, mock.host_state_input]
   let source_port = "port-0"
   let source_channel = "channel-0"
@@ -545,29 +657,46 @@ fn native_send_escrow_fixture(
       denom,
       escrow_amount,
     )
+  let module_output =
+    when callback_mutation is {
+      MovedModuleCredential ->
+        Output {
+          ..module_output_with_registered_shard(mock.module_output),
+          address: from_script("attacker module script hash"),
+        }
+      _ -> module_output_with_registered_shard(mock.module_output)
+    }
   let outputs =
-    [
-      mock.module_output,
-      escrow_output,
-      mock.channel_output,
-      mock.host_state_output,
-    ]
+    [module_output, escrow_output, mock.channel_output, mock.host_state_output]
   let (ftpd, packet) =
     build_packet(
       denom,
       transfer_amount,
-      mock.cosmos_address,
+      sender,
       receiver,
       source_port,
       source_channel,
       mock.port_id,
       mock.channel_id,
     )
+  let callback_data =
+    when callback_mutation is {
+      WrongTypedPacketData -> FungibleTokenPacketData { ..ftpd, amount: "999" }
+      _ -> ftpd
+    }
+  let callback_commitment =
+    when callback_mutation is {
+      WrongSendCommitment -> "wrong packet commitment"
+      _ -> packet_mod.commit_packet(packet)
+    }
   let module_redeemer: Redeemer =
-    Operator(
-      TransferModuleOperator(
-        Transfer { channel_id: mock.channel_id, data: ftpd },
-      ),
+    Callback(
+      OnSendPacket {
+        channel_id: mock.channel_id,
+        packet_data: packet.data,
+        packet_commitment: callback_commitment,
+        data: ModuleDataV1(callback_data),
+      },
     )
   let channel_redeemer: Redeemer = SendPacket { packet }
   let redeemers: Pairs<ScriptPurpose, Redeemer> =
@@ -607,10 +736,19 @@ fn recv_source_unescrow_fixture(
       datum: NoDatum,
       reference_script: None,
     }
+  let empty_escrow_output =
+    transfer_escrow_output(
+      mock.module_output,
+      mock.transfer_escrow_shard_policy_id,
+      mock.channel_id,
+      "6c6f76656c616365",
+      0,
+    )
   let outputs =
     [
       mock.module_output,
-      mock.channel_output,
+      empty_escrow_output,
+      receive_channel_output(mock),
       receiver_output,
       mock.host_state_output,
     ]
@@ -629,8 +767,6 @@ fn recv_source_unescrow_fixture(
       "6c6f76656c616365",
       transfer_amount,
     )
-  let shard_token_name =
-    transfer_escrow_shard.shard_token_name(mock.channel_id, "6c6f76656c616365")
   let inputs =
     [mock.module_input, escrow_input, mock.channel_input, mock.host_state_input]
   let (ftpd, packet) =
@@ -648,8 +784,9 @@ fn recv_source_unescrow_fixture(
     Callback(
       OnRecvPacket {
         channel_id: mock.channel_id,
+        packet_data: packet.data,
         acknowledgement,
-        data: TransferModuleData(ftpd),
+        data: ModuleDataV1(ftpd),
       },
     )
   let channel_redeemer: Redeemer =
@@ -664,17 +801,7 @@ fn recv_source_unescrow_fixture(
       Pair(Spend(mock.channel_input.output_reference), channel_redeemer),
     ]
   let transaction =
-    Transaction {
-      ..transaction.placeholder,
-      inputs,
-      outputs,
-      redeemers,
-      mint: from_asset(
-        mock.transfer_escrow_shard_policy_id,
-        shard_token_name,
-        -1,
-      ),
-    }
+    Transaction { ..transaction.placeholder, inputs, outputs, redeemers }
   expect module_redeemer: IBCModuleRedeemer = module_redeemer
 
   run_transfer_module_transition(mock, transaction, module_redeemer, mutation)
@@ -699,9 +826,18 @@ fn timeout_unescrow_fixture(
       datum: NoDatum,
       reference_script: None,
     }
+  let empty_escrow_output =
+    transfer_escrow_output(
+      mock.module_output,
+      mock.transfer_escrow_shard_policy_id,
+      "channel-0",
+      "6c6f76656c616365",
+      0,
+    )
   let outputs =
     [
       mock.module_output,
+      empty_escrow_output,
       mock.channel_output,
       receiver_output,
       mock.host_state_output,
@@ -718,8 +854,6 @@ fn timeout_unescrow_fixture(
       denom,
       transfer_amount,
     )
-  let shard_token_name =
-    transfer_escrow_shard.shard_token_name(source_channel, denom)
   let inputs =
     [mock.module_input, escrow_input, mock.channel_input, mock.host_state_input]
   let (ftpd, packet) =
@@ -737,7 +871,8 @@ fn timeout_unescrow_fixture(
     Callback(
       OnTimeoutPacket {
         channel_id: mock.channel_id,
-        data: TransferModuleData(ftpd),
+        packet_data: packet.data,
+        data: ModuleDataV1(ftpd),
       },
     )
   let channel_redeemer: Redeemer =
@@ -753,17 +888,7 @@ fn timeout_unescrow_fixture(
       Pair(Spend(mock.channel_input.output_reference), channel_redeemer),
     ]
   let transaction =
-    Transaction {
-      ..transaction.placeholder,
-      inputs,
-      outputs,
-      redeemers,
-      mint: from_asset(
-        mock.transfer_escrow_shard_policy_id,
-        shard_token_name,
-        -1,
-      ),
-    }
+    Transaction { ..transaction.placeholder, inputs, outputs, redeemers }
   expect module_redeemer: IBCModuleRedeemer = module_redeemer
 
   run_transfer_module_transition(mock, transaction, module_redeemer, mutation)
@@ -835,7 +960,8 @@ fn native_asset_timeout_fixture(
     Callback(
       OnTimeoutPacket {
         channel_id: mock.channel_id,
-        data: TransferModuleData(ftpd),
+        packet_data: packet.data,
+        data: ModuleDataV1(ftpd),
       },
     )
   let channel_redeemer: Redeemer =
@@ -886,8 +1012,9 @@ fn ack_success_fixture(
     Callback(
       OnAcknowledgementPacket {
         channel_id: mock.channel_id,
+        packet_data: packet.data,
         acknowledgement,
-        data: TransferModuleData(ftpd),
+        data: ModuleDataV1(ftpd),
       },
     )
   let bz_ack = acknowledgement_mod.acknowledgement(acknowledgement)
@@ -915,7 +1042,7 @@ fn voucher_send_burn_fixture(
 ) -> fuzz_dsl.ProtocolTxFixture {
   let mock = setup()
   let transfer_amount = 1234
-  let receiver = mock.cardano_public_key_hash
+  let receiver = mock.cosmos_address
   let inputs = [mock.module_input, mock.channel_input, mock.host_state_input]
   let outputs =
     [mock.module_output, mock.channel_output, mock.host_state_output]
@@ -928,7 +1055,7 @@ fn voucher_send_burn_fixture(
     build_packet(
       denom,
       transfer_amount,
-      mock.cosmos_address,
+      mock.cardano_public_key_hash,
       receiver,
       source_port,
       source_channel,
@@ -936,10 +1063,13 @@ fn voucher_send_burn_fixture(
       "channel-0",
     )
   let module_redeemer: Redeemer =
-    Operator(
-      TransferModuleOperator(
-        Transfer { channel_id: mock.channel_id, data: ftpd },
-      ),
+    Callback(
+      OnSendPacket {
+        channel_id: mock.channel_id,
+        packet_data: packet.data,
+        packet_commitment: packet_mod.commit_packet(packet),
+        data: ModuleDataV1(ftpd),
+      },
     )
   let channel_redeemer: Redeemer = SendPacket { packet }
   let mint_voucher_redeemer: Redeemer =
@@ -984,8 +1114,9 @@ fn voucher_recv_sink_fixture(
     Callback(
       OnRecvPacket {
         channel_id: mock.channel_id,
+        packet_data: packet.data,
         acknowledgement,
-        data: TransferModuleData(ftpd),
+        data: ModuleDataV1(ftpd),
       },
     )
   let channel_redeemer: Redeemer =
@@ -1044,8 +1175,9 @@ fn voucher_error_ack_refund_fixture(
     Callback(
       OnAcknowledgementPacket {
         channel_id: mock.channel_id,
+        packet_data: packet.data,
         acknowledgement,
-        data: TransferModuleData(ftpd),
+        data: ModuleDataV1(ftpd),
       },
     )
   let bz_ack = acknowledgement_mod.acknowledgement(acknowledgement)
@@ -1085,8 +1217,26 @@ test prop_transfer_module_native_send_escrow_increases_exactly(
 
   // Native SendPacket should move exactly the sent amount into escrow. This is
   // the positive baseline that the value-delta mutations below deviate from.
-  native_send_escrow_fixture(1234, fuzz_dsl.no_mutation())
-    |> fuzz_dsl.assert_protocol_valid
+  native_send_escrow_fixture(1234, fuzz_dsl.no_mutation(), ExactSendCallback)
+    |> fuzz_dsl.assert_protocol_checks_accept
+}
+
+test transfer_send_rejects_undecodable_sender() fail {
+  native_send_escrow_fixture(
+    1234,
+    fuzz_dsl.mutation("undecodable_sender"),
+    UndecodableSender,
+  )
+    |> fuzz_dsl.assert_protocol_checks_accept
+}
+
+test transfer_send_rejects_wrong_length_sender() fail {
+  native_send_escrow_fixture(
+    1234,
+    fuzz_dsl.mutation("wrong_length_sender"),
+    WrongLengthSender,
+  )
+    |> fuzz_dsl.assert_protocol_checks_accept
 }
 
 test prop_transfer_module_native_send_rejects_wrong_escrow_delta(
@@ -1098,8 +1248,39 @@ test prop_transfer_module_native_send_rejects_wrong_escrow_delta(
 
   // One-lovelace-short escrow is near-valid enough to exercise the same path,
   // but it must fail because transfer accounting is exact, not lower-bound.
-  native_send_escrow_fixture(1233, fuzz_dsl.mutation("wrong_escrow_delta"))
-    |> fuzz_dsl.assert_protocol_valid
+  native_send_escrow_fixture(
+    1233,
+    fuzz_dsl.mutation("wrong_escrow_delta"),
+    ExactSendCallback,
+  )
+    |> fuzz_dsl.assert_protocol_checks_accept
+}
+
+test transfer_send_rejects_mismatched_typed_packet_data() fail {
+  native_send_escrow_fixture(
+    1234,
+    fuzz_dsl.mutation("wrong_typed_packet_data"),
+    WrongTypedPacketData,
+  )
+    |> fuzz_dsl.assert_protocol_checks_accept
+}
+
+test transfer_send_rejects_mismatched_packet_commitment() fail {
+  native_send_escrow_fixture(
+    1234,
+    fuzz_dsl.mutation("wrong_packet_commitment"),
+    WrongSendCommitment,
+  )
+    |> fuzz_dsl.assert_protocol_checks_accept
+}
+
+test transfer_module_rejects_moving_registered_port_credential() fail {
+  native_send_escrow_fixture(
+    1234,
+    fuzz_dsl.mutation("moved_module_credential"),
+    MovedModuleCredential,
+  )
+    |> fuzz_dsl.assert_protocol_checks_accept
 }
 
 test prop_transfer_module_recv_source_unescrows_exactly(_seed via fuzz.int()) {
@@ -1107,7 +1288,7 @@ test prop_transfer_module_recv_source_unescrows_exactly(_seed via fuzz.int()) {
 
   // Source-chain receive releases escrow instead of minting voucher supply.
   recv_source_unescrow_fixture(fuzz_dsl.no_mutation())
-    |> fuzz_dsl.assert_protocol_valid
+    |> fuzz_dsl.assert_protocol_checks_accept
 }
 
 test prop_transfer_module_native_timeout_refunds_exactly(_seed via fuzz.int()) {
@@ -1115,7 +1296,7 @@ test prop_transfer_module_native_timeout_refunds_exactly(_seed via fuzz.int()) {
 
   // Timeout on native escrow should restore the original sender balance exactly.
   timeout_unescrow_fixture(1234, fuzz_dsl.no_mutation())
-    |> fuzz_dsl.assert_protocol_valid
+    |> fuzz_dsl.assert_protocol_checks_accept
 }
 
 test prop_transfer_module_native_timeout_rejects_wrong_refund_amount(
@@ -1132,7 +1313,7 @@ test prop_transfer_module_native_timeout_rejects_wrong_refund_amount(
     50,
     fuzz_dsl.mutation("wrong_native_refund_amount"),
   )
-    |> fuzz_dsl.assert_protocol_valid
+    |> fuzz_dsl.assert_protocol_checks_accept
 }
 
 test prop_transfer_module_native_ack_has_no_refund(_seed via fuzz.int()) {
@@ -1140,7 +1321,7 @@ test prop_transfer_module_native_ack_has_no_refund(_seed via fuzz.int()) {
 
   // Successful ack confirms delivery; it must not also refund native escrow.
   ack_success_fixture(fuzz_dsl.no_mutation())
-    |> fuzz_dsl.assert_protocol_valid
+    |> fuzz_dsl.assert_protocol_checks_accept
 }
 
 test prop_transfer_module_voucher_send_burns_exactly(_seed via fuzz.int()) {
@@ -1149,7 +1330,7 @@ test prop_transfer_module_voucher_send_burns_exactly(_seed via fuzz.int()) {
   // Sending a voucher back toward its source burns voucher supply rather than
   // increasing native escrow.
   voucher_send_burn_fixture(fuzz_dsl.no_mutation())
-    |> fuzz_dsl.assert_protocol_valid
+    |> fuzz_dsl.assert_protocol_checks_accept
 }
 
 test prop_transfer_module_recv_sink_mints_voucher_exactly(_seed via fuzz.int()) {
@@ -1157,7 +1338,7 @@ test prop_transfer_module_recv_sink_mints_voucher_exactly(_seed via fuzz.int()) 
 
   // Sink-chain receive creates voucher supply only for the packet amount.
   voucher_recv_sink_fixture(fuzz_dsl.no_mutation())
-    |> fuzz_dsl.assert_protocol_valid
+    |> fuzz_dsl.assert_protocol_checks_accept
 }
 
 test prop_transfer_module_voucher_error_ack_remints_exactly(
@@ -1167,7 +1348,100 @@ test prop_transfer_module_voucher_error_ack_remints_exactly(
 
   // Error ack reverses a voucher send by reminting the burned voucher amount.
   voucher_error_ack_refund_fixture(fuzz_dsl.no_mutation())
-    |> fuzz_dsl.assert_protocol_valid
+    |> fuzz_dsl.assert_protocol_checks_accept
+}
+
+test prop_transfer_module_root_rejects_capability_relocation(
+  _seed via fuzz.int(),
+) fail {
+  fuzz.label(@"regression.contract.transfer.invalid_capability_relocation")
+
+  let mock = setup()
+  let relocated_output =
+    Output {
+      ..mock.module_output,
+      address: from_script("attacker module script hash"),
+    }
+
+  expect _ =
+    transfer_escrow.classify_transfer_module_spend(
+      mock.module_input.output,
+      [relocated_output],
+      mock.port_token,
+      mock.module_token,
+      mock.transfer_escrow_shard_policy_id,
+    )
+  True
+}
+
+test transfer_module_root_rejects_datum_downgrade() fail {
+  let mock = setup()
+  let no_datum_output = Output { ..mock.module_output, datum: NoDatum }
+
+  let spend =
+    transfer_escrow.classify_transfer_module_spend(
+      mock.module_input.output,
+      [no_datum_output],
+      mock.port_token,
+      mock.module_token,
+      mock.transfer_escrow_shard_policy_id,
+    )
+
+  expect _ = transfer_escrow.expect_module_state(spend)
+  True
+}
+
+test transfer_module_root_rejects_registry_mutation_without_mint() fail {
+  let mock = setup()
+  let mutated_output =
+    Output {
+      ..mock.module_output,
+      datum: InlineDatum(
+        TransferModuleDatum {
+          escrow_shard_registry_root: #"1111111111111111111111111111111111111111111111111111111111111111",
+        },
+      ),
+    }
+  let spend =
+    transfer_escrow.classify_transfer_module_spend(
+      mock.module_input.output,
+      [mutated_output],
+      mock.port_token,
+      mock.module_token,
+      mock.transfer_escrow_shard_policy_id,
+    )
+
+  expect _ = transfer_escrow.expect_module_state(spend)
+  True
+}
+
+test transfer_escrow_rejects_missing_empty_successor() fail {
+  let mock = setup()
+  let denom = "6c6f76656c616365"
+  let escrow_amount = 1_234
+  let escrow_input =
+    transfer_escrow_input(
+      2,
+      mock.module_output,
+      mock.transfer_escrow_shard_policy_id,
+      mock.channel_id,
+      denom,
+      escrow_amount,
+    )
+  let datum = TransferEscrowDatum { channel_id: mock.channel_id, denom }
+
+  transfer_escrow.validate_module_escrow_transition(
+    escrow_input,
+    transfer_escrow.EscrowShard { datum, updated_output: None },
+    [escrow_input],
+    [],
+    datum,
+    mock.transfer_escrow_shard_policy_id,
+    from_asset(ada_policy_id, ada_asset_name, 0),
+    0 - escrow_amount,
+    from_asset(ada_policy_id, ada_asset_name, 0 - escrow_amount),
+    "lovelace",
+  )
 }
 
 test on_chan_open_init_succeed() {
@@ -1416,12 +1690,13 @@ test on_recv_packet_mint_voucher_succeed() {
       mock.channel_id,
     )
 
-  let packet_data = TransferModuleData(ftpd)
+  let packet_data = ModuleDataV1(ftpd)
 
   let module_redeemer: Redeemer =
     Callback(
       OnRecvPacket {
         channel_id: mock.channel_id,
+        packet_data: packet.data,
         acknowledgement,
         data: packet_data,
       },
@@ -1471,6 +1746,94 @@ test on_recv_packet_mint_voucher_succeed() {
   )
 }
 
+fn on_recv_packet_mint_voucher_prebuilt_succeeds(
+  memo: ByteArray,
+  authenticated_data: ByteArray,
+) -> Bool {
+  let mock = setup()
+  expect
+    bytearray.length(authenticated_data) == fungible_token_packet_data.max_packet_bytes
+
+  let inputs = [mock.module_input, mock.channel_input, mock.host_state_input]
+  let outputs =
+    [mock.module_output, mock.channel_output, mock.host_state_output]
+  let acknowledgement = acknowledgement_mod.new_result_acknowledgement("AQ==")
+  let (ftpd, packet) =
+    build_prebuilt_packet_with_memo(
+      "ibc/usdt",
+      "100",
+      "cosmos sender address",
+      mock.cardano_public_key_hash,
+      memo,
+      "port-0",
+      "channel-0",
+      mock.port_id,
+      mock.channel_id,
+      authenticated_data,
+    )
+
+  let module_redeemer: Redeemer =
+    Callback(
+      OnRecvPacket {
+        channel_id: mock.channel_id,
+        packet_data: packet.data,
+        acknowledgement,
+        data: ModuleDataV1(ftpd),
+      },
+    )
+  let channel_redeemer: Redeemer =
+    RecvPacket {
+      packet,
+      proof_commitment: mock.proof,
+      proof_height: mock.proof_height,
+    }
+  let mint_voucher_redeemer: Redeemer =
+    MintVoucher {
+      packet_source_port: packet.source_port,
+      packet_source_channel: packet.source_channel,
+      packet_dest_port: packet.destination_port,
+      packet_dest_channel: packet.destination_channel,
+      data: ftpd,
+    }
+  let redeemers: Pairs<ScriptPurpose, Redeemer> =
+    [
+      Pair(Spend(mock.module_input.output_reference), module_redeemer),
+      Pair(Spend(mock.channel_input.output_reference), channel_redeemer),
+      Pair(Mint(mock.voucher_minting_policy_id), mint_voucher_redeemer),
+    ]
+  let transaction =
+    Transaction { ..transaction.placeholder, inputs, outputs, redeemers }
+  expect module_redeemer: IBCModuleRedeemer = module_redeemer
+
+  spending_transfer_module.spend_transfer_module.spend(
+    mock.port_token,
+    mock.module_token,
+    mock.port_id,
+    mock.transfer_escrow_shard_policy_id,
+    mock.channel_minting_policy_id,
+    mock.voucher_minting_policy_id,
+    mock.host_state_nft_policy_id,
+    None,
+    module_redeemer,
+    mock.module_input.output_reference,
+    transaction,
+  )
+}
+
+test on_recv_packet_mint_voucher_maximum_ics20_packet_succeed() {
+  on_recv_packet_mint_voucher_prebuilt_succeeds(
+    #"0b61616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161",
+    #"7b2264656e6f6d223a226962632f75736474222c22616d6f756e74223a22313030222c2273656e646572223a22636f736d6f732073656e6465722061646472657373222c227265636569766572223a223532356636653262306638613135613363393564383263383131336239396466656266653430663132346362326263373165653939653232222c226d656d6f223a225c753030306261616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161227d",
+  )
+}
+
+test on_recv_packet_mint_voucher_maximum_v8_ics20_packet_succeed() {
+  on_recv_packet_mint_voucher_prebuilt_succeeds(
+    #"3c61616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161",
+    #"7b22616d6f756e74223a22313030222c2264656e6f6d223a226962632f75736474222c226d656d6f223a225c753030336361616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161222c227265636569766572223a223532356636653262306638613135613363393564383263383131336239396466656266653430663132346362326263373165653939653232222c2273656e646572223a22636f736d6f732073656e6465722061646472657373227d",
+  )
+}
+
 test on_recv_packet_unescrow_succeed() {
   let mock = setup()
 
@@ -1489,10 +1852,20 @@ test on_recv_packet_unescrow_succeed() {
       reference_script: None,
     }
 
+  let empty_escrow_output =
+    transfer_escrow_output(
+      mock.module_output,
+      mock.transfer_escrow_shard_policy_id,
+      mock.channel_id,
+      "6c6f76656c616365",
+      0,
+    )
+
   let outputs =
     [
       mock.module_output,
-      mock.channel_output,
+      empty_escrow_output,
+      receive_channel_output(mock),
       receiver_output,
       mock.host_state_output,
     ]
@@ -1517,8 +1890,6 @@ test on_recv_packet_unescrow_succeed() {
       "6c6f76656c616365",
       transfer_amount,
     )
-  let shard_token_name =
-    transfer_escrow_shard.shard_token_name(mock.channel_id, "6c6f76656c616365")
   let inputs =
     [mock.module_input, escrow_input, mock.channel_input, mock.host_state_input]
 
@@ -1535,12 +1906,13 @@ test on_recv_packet_unescrow_succeed() {
       mock.channel_id,
     )
 
-  let packet_data = TransferModuleData(ftpd)
+  let packet_data = ModuleDataV1(ftpd)
 
   let module_redeemer: Redeemer =
     Callback(
       OnRecvPacket {
         channel_id: mock.channel_id,
+        packet_data: packet.data,
         acknowledgement,
         data: packet_data,
       },
@@ -1561,17 +1933,7 @@ test on_recv_packet_unescrow_succeed() {
 
   //==========================arrange context=========================
   let transaction =
-    Transaction {
-      ..transaction.placeholder,
-      inputs,
-      outputs,
-      redeemers,
-      mint: from_asset(
-        mock.transfer_escrow_shard_policy_id,
-        shard_token_name,
-        -1,
-      ),
-    }
+    Transaction { ..transaction.placeholder, inputs, outputs, redeemers }
 
   expect module_redeemer: IBCModuleRedeemer = module_redeemer
 
@@ -1611,7 +1973,7 @@ test on_recv_packet_unescrow_fail_unwanted_voucher() fail {
   let outputs =
     [
       mock.module_output,
-      mock.channel_output,
+      receive_channel_output(mock),
       receiver_output,
       mock.host_state_output,
     ]
@@ -1651,12 +2013,13 @@ test on_recv_packet_unescrow_fail_unwanted_voucher() fail {
       mock.channel_id,
     )
 
-  let packet_data = TransferModuleData(ftpd)
+  let packet_data = ModuleDataV1(ftpd)
 
   let module_redeemer: Redeemer =
     Callback(
       OnRecvPacket {
         channel_id: mock.channel_id,
+        packet_data: packet.data,
         acknowledgement,
         data: packet_data,
       },
@@ -1711,7 +2074,7 @@ test transfer_escrow_succeed() {
 
   let transfer_amount = 1234
 
-  let receiver = mock.cardano_public_key_hash
+  let receiver = mock.cosmos_address
 
   //==========================arrange inputs=========================
   let inputs = [mock.module_input, mock.channel_input, mock.host_state_input]
@@ -1737,29 +2100,28 @@ test transfer_escrow_succeed() {
 
   let outputs =
     [
-      mock.module_output,
+      module_output_with_registered_shard(mock.module_output),
       escrow_output,
       mock.channel_output,
       mock.host_state_output,
     ]
 
   let (ftpd, packet) =
-    build_packet(
+    build_prebuilt_packet(
       denom,
-      transfer_amount,
-      mock.cosmos_address,
+      "1234",
+      mock.cardano_public_key_hash,
       receiver,
       source_port,
       source_channel,
       mock.port_id,
       mock.channel_id,
+      #"7b22616d6f756e74223a2231323334222c2264656e6f6d223a2236633666373636353663363136333635222c227265636569766572223a226d6f636b20636f736d6f732061646472657373222c2273656e646572223a223532356636653262306638613135613363393564383263383131336239396466656266653430663132346362326263373165653939653232227d",
     )
 
   let module_redeemer: Redeemer =
     Operator(
-      TransferModuleOperator(
-        Transfer { channel_id: mock.channel_id, data: ftpd },
-      ),
+      ModuleOperatorV1(Transfer { channel_id: mock.channel_id, data: ftpd }),
     )
 
   let channel_redeemer: Redeemer = SendPacket { packet }
@@ -1805,7 +2167,7 @@ test transfer_escrow_fails_when_host_state_is_shutting_down() fail {
   let mock = setup()
 
   let transfer_amount = 1234
-  let receiver = mock.cardano_public_key_hash
+  let receiver = mock.cosmos_address
 
   let shutdown_host_state_output =
     Output {
@@ -1850,7 +2212,7 @@ test transfer_escrow_fails_when_host_state_is_shutting_down() fail {
     build_packet(
       denom,
       transfer_amount,
-      mock.cosmos_address,
+      mock.cardano_public_key_hash,
       receiver,
       source_port,
       source_channel,
@@ -1860,9 +2222,7 @@ test transfer_escrow_fails_when_host_state_is_shutting_down() fail {
 
   let module_redeemer: Redeemer =
     Operator(
-      TransferModuleOperator(
-        Transfer { channel_id: mock.channel_id, data: ftpd },
-      ),
+      ModuleOperatorV1(Transfer { channel_id: mock.channel_id, data: ftpd }),
     )
   let channel_redeemer: Redeemer = SendPacket { packet }
 
@@ -1905,7 +2265,7 @@ test transfer_escrow_fails_when_host_state_is_shutting_down() fail {
 test transfer_escrow_native_asset_fails_with_short_created_shard() fail {
   let mock = setup()
   let transfer_amount = 1234
-  let receiver = mock.cardano_public_key_hash
+  let receiver = mock.cosmos_address
   let native_policy_id: PolicyId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaa"
   let native_token_name = "coin"
   let denom = native_asset_denom()
@@ -1927,7 +2287,7 @@ test transfer_escrow_native_asset_fails_with_short_created_shard() fail {
     build_packet(
       denom,
       transfer_amount,
-      mock.cosmos_address,
+      mock.cardano_public_key_hash,
       receiver,
       "port-0",
       "channel-0",
@@ -1937,9 +2297,7 @@ test transfer_escrow_native_asset_fails_with_short_created_shard() fail {
 
   let module_redeemer: Redeemer =
     Operator(
-      TransferModuleOperator(
-        Transfer { channel_id: mock.channel_id, data: ftpd },
-      ),
+      ModuleOperatorV1(Transfer { channel_id: mock.channel_id, data: ftpd }),
     )
   let channel_redeemer: Redeemer = SendPacket { packet }
   let inputs = [mock.module_input, mock.channel_input, mock.host_state_input]
@@ -1987,7 +2345,7 @@ test transfer_escrow_native_asset_fails_with_short_created_shard() fail {
 test transfer_escrow_native_asset_fails_with_extra_created_shard() fail {
   let mock = setup()
   let transfer_amount = 1234
-  let receiver = mock.cardano_public_key_hash
+  let receiver = mock.cosmos_address
   let native_policy_id: PolicyId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaa"
   let native_token_name = "coin"
   let denom = native_asset_denom()
@@ -2009,7 +2367,7 @@ test transfer_escrow_native_asset_fails_with_extra_created_shard() fail {
     build_packet(
       denom,
       transfer_amount,
-      mock.cosmos_address,
+      mock.cardano_public_key_hash,
       receiver,
       "port-0",
       "channel-0",
@@ -2019,9 +2377,7 @@ test transfer_escrow_native_asset_fails_with_extra_created_shard() fail {
 
   let module_redeemer: Redeemer =
     Operator(
-      TransferModuleOperator(
-        Transfer { channel_id: mock.channel_id, data: ftpd },
-      ),
+      ModuleOperatorV1(Transfer { channel_id: mock.channel_id, data: ftpd }),
     )
   let channel_redeemer: Redeemer = SendPacket { packet }
   let inputs = [mock.module_input, mock.channel_input, mock.host_state_input]
@@ -2071,7 +2427,7 @@ test transfer_burn_voucher_succeed() {
 
   let transfer_amount = 1234
 
-  let receiver = mock.cardano_public_key_hash
+  let receiver = mock.cosmos_address
 
   //==========================arrange inputs=========================
   let inputs = [mock.module_input, mock.channel_input, mock.host_state_input]
@@ -2092,7 +2448,7 @@ test transfer_burn_voucher_succeed() {
     build_packet(
       denom,
       transfer_amount,
-      mock.cosmos_address,
+      mock.cardano_public_key_hash,
       receiver,
       source_port,
       source_channel,
@@ -2102,9 +2458,7 @@ test transfer_burn_voucher_succeed() {
 
   let module_redeemer: Redeemer =
     Operator(
-      TransferModuleOperator(
-        Transfer { channel_id: mock.channel_id, data: ftpd },
-      ),
+      ModuleOperatorV1(Transfer { channel_id: mock.channel_id, data: ftpd }),
     )
 
   let channel_redeemer: Redeemer = SendPacket { packet }
@@ -2148,7 +2502,7 @@ test transfer_burn_voucher_succeeds_when_host_state_is_shutting_down() {
   let mock = setup()
 
   let transfer_amount = 1234
-  let receiver = mock.cardano_public_key_hash
+  let receiver = mock.cosmos_address
 
   let shutdown_host_state_output =
     Output {
@@ -2178,7 +2532,7 @@ test transfer_burn_voucher_succeeds_when_host_state_is_shutting_down() {
     build_packet(
       denom,
       transfer_amount,
-      mock.cosmos_address,
+      mock.cardano_public_key_hash,
       receiver,
       source_port,
       source_channel,
@@ -2188,9 +2542,7 @@ test transfer_burn_voucher_succeeds_when_host_state_is_shutting_down() {
 
   let module_redeemer: Redeemer =
     Operator(
-      TransferModuleOperator(
-        Transfer { channel_id: mock.channel_id, data: ftpd },
-      ),
+      ModuleOperatorV1(Transfer { channel_id: mock.channel_id, data: ftpd }),
     )
   let channel_redeemer: Redeemer = SendPacket { packet }
   let mint_voucher_redeemer: Redeemer =
@@ -2227,7 +2579,7 @@ test transfer_burn_voucher_succeeds_when_host_state_is_shutting_down() {
   )
 }
 
-test on_timeout_packet_mint_voucher_succeed() {
+fn check_timeout_packet_mint_voucher(use_timeout_on_close: Bool) {
   let mock = setup()
 
   let receiver = mock.cardano_public_key_hash
@@ -2248,28 +2600,45 @@ test on_timeout_packet_mint_voucher_succeed() {
       |> bytearray.concat("atom")
 
   let (ftpd, packet) =
-    build_packet(
+    build_prebuilt_packet(
       denom,
-      1234,
+      "1234",
       mock.cosmos_address,
       receiver,
       source_port,
       source_channel,
       "port-0",
       "channel-0",
+      #"7b22616d6f756e74223a2231323334222c2264656e6f6d223a22706f72742d312f6368616e6e656c2d302f61746f6d222c227265636569766572223a223532356636653262306638613135613363393564383263383131336239396466656266653430663132346362326263373165653939653232222c2273656e646572223a226d6f636b20636f736d6f732061646472657373227d",
     )
 
-  let packet_data = TransferModuleData(ftpd)
+  let packet_data = ModuleDataV1(ftpd)
 
   let module_redeemer: Redeemer =
-    Callback(OnTimeoutPacket { channel_id: mock.channel_id, data: packet_data })
+    Callback(
+      OnTimeoutPacket {
+        channel_id: mock.channel_id,
+        packet_data: packet.data,
+        data: packet_data,
+      },
+    )
 
   let channel_redeemer: Redeemer =
-    TimeoutPacket {
-      packet,
-      proof_unreceived: mock.proof,
-      proof_height: mock.proof_height,
-      next_sequence_recv: 1,
+    if use_timeout_on_close {
+      TimeoutOnClose {
+        packet,
+        proof_unreceived: mock.proof,
+        proof_close: mock.proof,
+        proof_height: mock.proof_height,
+        next_sequence_recv: 1,
+      }
+    } else {
+      TimeoutPacket {
+        packet,
+        proof_unreceived: mock.proof,
+        proof_height: mock.proof_height,
+        next_sequence_recv: 1,
+      }
     }
 
   let mint_voucher_redeemer: Redeemer =
@@ -2308,6 +2677,14 @@ test on_timeout_packet_mint_voucher_succeed() {
   )
 }
 
+test on_timeout_packet_mint_voucher_succeed() {
+  check_timeout_packet_mint_voucher(False)
+}
+
+test on_timeout_on_close_packet_mint_voucher_succeed() {
+  check_timeout_packet_mint_voucher(True)
+}
+
 test on_timeout_packet_unescrow_succeed() {
   let mock = setup()
 
@@ -2329,9 +2706,19 @@ test on_timeout_packet_unescrow_succeed() {
       reference_script: None,
     }
 
+  let empty_escrow_output =
+    transfer_escrow_output(
+      mock.module_output,
+      mock.transfer_escrow_shard_policy_id,
+      "channel-0",
+      "6c6f76656c616365",
+      0,
+    )
+
   let outputs =
     [
       mock.module_output,
+      empty_escrow_output,
       mock.channel_output,
       receiver_output,
       mock.host_state_output,
@@ -2354,8 +2741,6 @@ test on_timeout_packet_unescrow_succeed() {
       denom,
       transfer_amount,
     )
-  let shard_token_name =
-    transfer_escrow_shard.shard_token_name(source_channel, denom)
   let inputs =
     [mock.module_input, escrow_input, mock.channel_input, mock.host_state_input]
 
@@ -2371,10 +2756,16 @@ test on_timeout_packet_unescrow_succeed() {
       mock.channel_id,
     )
 
-  let packet_data = TransferModuleData(ftpd)
+  let packet_data = ModuleDataV1(ftpd)
 
   let module_redeemer: Redeemer =
-    Callback(OnTimeoutPacket { channel_id: mock.channel_id, data: packet_data })
+    Callback(
+      OnTimeoutPacket {
+        channel_id: mock.channel_id,
+        packet_data: packet.data,
+        data: packet_data,
+      },
+    )
 
   let channel_redeemer: Redeemer =
     TimeoutPacket {
@@ -2392,17 +2783,7 @@ test on_timeout_packet_unescrow_succeed() {
 
   //==========================arrange context=========================
   let transaction =
-    Transaction {
-      ..transaction.placeholder,
-      inputs,
-      outputs,
-      redeemers,
-      mint: from_asset(
-        mock.transfer_escrow_shard_policy_id,
-        shard_token_name,
-        -1,
-      ),
-    }
+    Transaction { ..transaction.placeholder, inputs, outputs, redeemers }
 
   expect module_redeemer: IBCModuleRedeemer = module_redeemer
 
@@ -2480,9 +2861,15 @@ test on_timeout_packet_native_refund_fails_with_wrong_escrow_delta() fail {
       mock.port_id,
       mock.channel_id,
     )
-  let packet_data = TransferModuleData(ftpd)
+  let packet_data = ModuleDataV1(ftpd)
   let module_redeemer: Redeemer =
-    Callback(OnTimeoutPacket { channel_id: mock.channel_id, data: packet_data })
+    Callback(
+      OnTimeoutPacket {
+        channel_id: mock.channel_id,
+        packet_data: packet.data,
+        data: packet_data,
+      },
+    )
   let channel_redeemer: Redeemer =
     TimeoutPacket {
       packet,
@@ -2568,7 +2955,7 @@ test on_recv_packet_source_fails_with_short_native_payout() fail {
     [
       mock.module_output,
       escrow_output,
-      mock.channel_output,
+      receive_channel_output(mock),
       receiver_output,
       mock.host_state_output,
     ]
@@ -2588,8 +2975,9 @@ test on_recv_packet_source_fails_with_short_native_payout() fail {
     Callback(
       OnRecvPacket {
         channel_id: mock.channel_id,
+        packet_data: packet.data,
         acknowledgement,
-        data: TransferModuleData(ftpd),
+        data: ModuleDataV1(ftpd),
       },
     )
   let channel_redeemer: Redeemer =
@@ -2643,25 +3031,27 @@ test on_acknowledgement_packet_result_succeed() {
       |> bytearray.concat("atom")
 
   let (ftpd, packet) =
-    build_packet(
+    build_prebuilt_packet(
       denom,
-      1234,
+      "1234",
       mock.cosmos_address,
       receiver,
       source_port,
       source_channel,
       "port-0",
       "channel-0",
+      #"7b22616d6f756e74223a2231323334222c2264656e6f6d223a22706f72742d312f6368616e6e656c2d302f61746f6d222c227265636569766572223a223532356636653262306638613135613363393564383263383131336239396466656266653430663132346362326263373165653939653232222c2273656e646572223a226d6f636b20636f736d6f732061646472657373227d",
     )
 
   let acknowledgement = acknowledgement_mod.new_result_acknowledgement("AQ==")
 
-  let packet_data = TransferModuleData(ftpd)
+  let packet_data = ModuleDataV1(ftpd)
 
   let module_redeemer: Redeemer =
     Callback(
       OnAcknowledgementPacket {
         channel_id: mock.channel_id,
+        packet_data: packet.data,
         acknowledgement,
         data: packet_data,
       },
@@ -2738,12 +3128,13 @@ test on_acknowledgement_packet_error_mint_voucher_succeed() {
 
   let acknowledgement = acknowledgement_mod.new_error_acknowledgement("")
 
-  let packet_data = TransferModuleData(ftpd)
+  let packet_data = ModuleDataV1(ftpd)
 
   let module_redeemer: Redeemer =
     Callback(
       OnAcknowledgementPacket {
         channel_id: mock.channel_id,
+        packet_data: packet.data,
         acknowledgement,
         data: packet_data,
       },
@@ -2812,9 +3203,19 @@ test on_acknowledgement_packet_error_unescrow_succeed() {
       reference_script: None,
     }
 
+  let empty_escrow_output =
+    transfer_escrow_output(
+      mock.module_output,
+      mock.transfer_escrow_shard_policy_id,
+      "channel-0",
+      "6c6f76656c616365",
+      0,
+    )
+
   let outputs =
     [
       mock.module_output,
+      empty_escrow_output,
       mock.channel_output,
       receiver_output,
       mock.host_state_output,
@@ -2837,8 +3238,6 @@ test on_acknowledgement_packet_error_unescrow_succeed() {
       denom,
       transfer_amount,
     )
-  let shard_token_name =
-    transfer_escrow_shard.shard_token_name(source_channel, denom)
   let inputs =
     [mock.module_input, escrow_input, mock.channel_input, mock.host_state_input]
 
@@ -2857,12 +3256,13 @@ test on_acknowledgement_packet_error_unescrow_succeed() {
   let acknowledgement = acknowledgement_mod.new_error_acknowledgement("")
 
   // let acknowledgement = acknowledgement_mod.new_result_acknowledgement("AQ==")
-  let packet_data = TransferModuleData(ftpd)
+  let packet_data = ModuleDataV1(ftpd)
 
   let module_redeemer: Redeemer =
     Callback(
       OnAcknowledgementPacket {
         channel_id: mock.channel_id,
+        packet_data: packet.data,
         acknowledgement,
         data: packet_data,
       },
@@ -2886,17 +3286,7 @@ test on_acknowledgement_packet_error_unescrow_succeed() {
 
   //==========================arrange context=========================
   let transaction =
-    Transaction {
-      ..transaction.placeholder,
-      inputs,
-      outputs,
-      redeemers,
-      mint: from_asset(
-        mock.transfer_escrow_shard_policy_id,
-        shard_token_name,
-        -1,
-      ),
-    }
+    Transaction { ..transaction.placeholder, inputs, outputs, redeemers }
 
   expect module_redeemer: IBCModuleRedeemer = module_redeemer
 
@@ -2989,4 +3379,212 @@ test on_chan_close_confirm_given_any_input_returns_false() {
     fake_data.module_input.output_reference,
     transaction,
   ) == False
+}
+
+test transfer_escrow_zero_balance_shard_reuse_succeeds() {
+  let mock = setup()
+
+  let prior_escrow_amount = 0
+  let transfer_amount = 15_000_000
+  let receiver = mock.cosmos_address
+
+  let source_port = "port-0"
+  let source_channel = "channel-0"
+  let denom = native_asset_denom()
+  let token_policy_id: PolicyId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  let token_name = "coin"
+
+  let zero_balance_shard =
+    transfer_native_asset_escrow_input(
+      2,
+      mock.module_output,
+      mock.transfer_escrow_shard_policy_id,
+      mock.channel_id,
+      denom,
+      token_policy_id,
+      token_name,
+      prior_escrow_amount,
+    )
+  let shard_input =
+    Input {
+      ..zero_balance_shard,
+      output: Output {
+        ..zero_balance_shard.output,
+        value: zero_balance_shard.output.value
+          |> add(ada_policy_id, ada_asset_name, 2_000_000),
+      },
+    }
+  let inputs = [shard_input, mock.channel_input, mock.host_state_input]
+
+  let zero_balance_shard_output =
+    transfer_native_asset_escrow_output(
+      mock.module_output,
+      mock.transfer_escrow_shard_policy_id,
+      mock.channel_id,
+      denom,
+      token_policy_id,
+      token_name,
+      prior_escrow_amount + transfer_amount,
+    )
+  let shard_output =
+    Output {
+      ..zero_balance_shard_output,
+      value: zero_balance_shard_output.value
+        |> add(ada_policy_id, ada_asset_name, 2_000_000),
+    }
+  let outputs = [shard_output, mock.channel_output, mock.host_state_output]
+
+  let (ftpd, packet) =
+    build_packet(
+      denom,
+      transfer_amount,
+      mock.cardano_public_key_hash,
+      receiver,
+      source_port,
+      source_channel,
+      mock.port_id,
+      mock.channel_id,
+    )
+
+  let module_redeemer: Redeemer =
+    Operator(
+      ModuleOperatorV1(Transfer { channel_id: mock.channel_id, data: ftpd }),
+    )
+
+  let channel_redeemer: Redeemer = SendPacket { packet }
+
+  let redeemers: Pairs<ScriptPurpose, Redeemer> =
+    [
+      Pair(Spend(shard_input.output_reference), module_redeemer),
+      Pair(Spend(mock.channel_input.output_reference), channel_redeemer),
+    ]
+
+  let transaction =
+    Transaction { ..transaction.placeholder, inputs, outputs, redeemers }
+
+  expect module_redeemer: IBCModuleRedeemer = module_redeemer
+  let shard_datum: Data =
+    TransferEscrowDatum { channel_id: mock.channel_id, denom }
+
+  spending_transfer_module.spend_transfer_module.spend(
+    mock.port_token,
+    mock.module_token,
+    mock.port_id,
+    mock.transfer_escrow_shard_policy_id,
+    mock.channel_minting_policy_id,
+    mock.voucher_minting_policy_id,
+    mock.host_state_nft_policy_id,
+    Some(shard_datum),
+    module_redeemer,
+    shard_input.output_reference,
+    transaction,
+  )
+}
+
+fn check_init_channel_callback(
+  mock: MockData,
+  outputs: List<Output>,
+  redeemers: Pairs<ScriptPurpose, Redeemer>,
+) -> Bool {
+  let channel =
+    transfer_channel_callback.validate_channel_open_init(
+      redeemers,
+      mock.channel_minting_policy_id,
+      AuthToken {
+        policy_id: mock.host_state_nft_policy_id,
+        name: "ibc_host_state",
+      },
+      outputs,
+      mock.port_id,
+      mock.channel_id,
+    )
+  channel.version == transfer_module_keys.version
+}
+
+fn check_ack_channel_callback(
+  mock: MockData,
+  redeemers: Pairs<ScriptPurpose, Redeemer>,
+) -> Bool {
+  expect Some((channel, version)) =
+    transfer_channel_callback.validate_chan_open_ack(
+      [mock.channel_input],
+      redeemers,
+      mock.channel_minting_policy_id,
+      AuthToken {
+        policy_id: mock.host_state_nft_policy_id,
+        name: "ibc_host_state",
+      },
+      [mock.channel_output],
+      mock.port_id,
+      mock.channel_id,
+    )
+  channel.version == version
+}
+
+test channel_callback_helpers_accept_authenticated_channel() {
+  let mock = setup()
+  let init: Redeemer = ChanOpenInit
+  let ack: Redeemer =
+    ChanOpenAck {
+      counterparty_version: transfer_module_keys.version,
+      proof_try: mock.proof,
+      proof_height: mock.proof_height,
+    }
+  and {
+    check_init_channel_callback(
+      mock,
+      [mock.channel_output],
+      [Pair(Mint(mock.channel_minting_policy_id), init)],
+    ),
+    check_ack_channel_callback(
+      mock,
+      [Pair(Spend(mock.channel_input.output_reference), ack)],
+    ),
+  }
+}
+
+test channel_callback_rejects_duplicate_channel_outputs() fail {
+  let mock = setup()
+  let init: Redeemer = ChanOpenInit
+  check_init_channel_callback(
+    mock,
+    [mock.channel_output, mock.channel_output],
+    [Pair(Mint(mock.channel_minting_policy_id), init)],
+  )
+}
+
+test channel_callback_rejects_wrong_port_in_authenticated_output() fail {
+  let mock = setup()
+  let init: Redeemer = ChanOpenInit
+  expect InlineDatum(raw) = mock.channel_output.datum
+  expect datum: ChannelDatum = raw
+  let wrong_port_output =
+    Output {
+      ..mock.channel_output,
+      datum: InlineDatum(ChannelDatum { ..datum, port_id: "other-port" }),
+    }
+  check_init_channel_callback(
+    mock,
+    [wrong_port_output],
+    [Pair(Mint(mock.channel_minting_policy_id), init)],
+  )
+}
+
+test channel_callback_rejects_missing_mint_redeemer() fail {
+  let mock = setup()
+  check_init_channel_callback(mock, [mock.channel_output], [])
+}
+
+test channel_callback_rejects_missing_spend_redeemer() fail {
+  check_ack_channel_callback(setup(), [])
+}
+
+test channel_callback_rejects_wrong_spend_redeemer_constructor() fail {
+  let mock = setup()
+  let wrong: Redeemer =
+    ChanOpenConfirm { proof_ack: mock.proof, proof_height: mock.proof_height }
+  check_ack_channel_callback(
+    mock,
+    [Pair(Spend(mock.channel_input.output_reference), wrong)],
+  )
 }

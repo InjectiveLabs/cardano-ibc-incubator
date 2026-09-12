@@ -4,7 +4,7 @@ Author: Julius Tranquilli, https://github.com/floor-licker
 
 Date: April 7, 2026
 
-I would "the Cardano light client problem" in 2026 as:
+I would describe "the Cardano light client problem" in 2026 as:
 
 You can have at most two of these three:
 
@@ -20,9 +20,9 @@ i.e, If you insist on fast acceptance and do not want to implement native Cardan
 
 The probabilistic light client is implemented as client type `08-cardano-probabilistic`. This is an alternative to the deprecated Mithril light client, whose client type is `08-cardano-mithril`. This model is not a fast finality model or anything of that nature, rather it tries to heuristically attain faster IBC settlement by making certain risk tradeoffs via a heuristic notion of Cardano settlement. The exact parameters and thereby strength of the heuristic are tunable, and some are epoch context dependent.
 
-The Mithril light client was effectively non-viable from a UX perspective. Simple IBC swaps/transfers would currently take hundreds of Cardano blocks under mainnet conditions.
+The Mithril light client was effectively non-viable from a UX perspective. Under the cadence assumptions evaluated before that client was retired, simple IBC swaps or transfers could take hundreds of Cardano blocks.
 
-I think it is worth clarifying as well that comparing this model to the Mithril-based light client is not just a question of "faster means weaker." For example, a large factor in the security of the Mithril model is Mithril network participation, which I believe at the time of writing is even less than 20% of the network. So we can imagine comparing two assertions like the following:
+Comparing this model to the Mithril-based light client is not just a question of "faster means weaker." A large factor in the security of the Mithril model is network participation, which is time-varying and must be supported by dated measurements rather than assumed as a constant. We can imagine comparing two assertions like the following:
 
 A) A randomly selected subset selected out of a pool of a fixed + hard, proportion of the network agree on the ledger view at a height H, so we consider it "final"
 
@@ -163,7 +163,7 @@ The important thing to notice is that the header does **not** try to prove arbit
 
 The header no longer carries relayed score metrics or a relayed HostState transaction body. The verifier recomputes the probabilistic metrics locally for storage/telemetry, and it recovers the HostState transaction body directly from the authenticated anchor block witness before extracting `ibc_state_root`. On an adjacent epoch rollover update, the header also carries the authenticated epoch context for the new anchor epoch so the client can continue on the same client ID without operational redeployment.
 
-Each relayed `ProbabilisticBlock` now also carries raw `block_cbor`. The verifier decodes that raw Cardano block witness and cross-checks the claimed block hash, previous hash, height, slot, and issuer pool identity before it accepts the bridge or descendant window as the basis for scoring.
+Each relayed `ProbabilisticBlock` carries the evidence its role needs. A root-bearing `anchor_block` carries full `block_cbor` so the verifier can authenticate the HostState transaction against the signed block body, while `bridge_blocks`, `descendant_blocks`, and rootless checkpoint anchors carry compact `header_cbor`. The verifier derives the signed block metadata from that evidence and cross-checks the claimed block hash, previous hash, height, slot, and issuer pool identity before accepting the update.
 
 ### Latest Height
 
@@ -193,6 +193,49 @@ The Gateway:
 Client creation still starts from one epoch context, but updates are no longer single-epoch-only. Gateway now supports ordinary `epoch N -> epoch N+1` rollover updates on the same client ID by attaching `new_epoch_context` to the header when the anchor moves into the next epoch. The scored descendant window still remains single-epoch: bridge continuity may span the boundary, but the anchor and scored descendants must all live in the same anchor epoch.
 
 An accepted epoch context is canonical for that epoch. Later headers may repeat the same epoch context, but a different context for an already-known epoch is treated as misbehaviour and freezes the client. This does not make the first accepted epoch context cryptographically authenticated; it changes the failure mode so that contradictory observer views cannot silently replace or coexist with the stored stake context.
+
+The static local Caribic devnet explicitly sets
+`CARDANO_STABILITY_ASSUME_STATIC_STAKE=1`. With that opt-in, Gateway normalizes
+the Ogmios 6.12 live fractions across the positive-stake pool set because Ogmios
+reports each pool relative to total ledger stake, including stake that is not
+delegated to a pool. This gives the local Praos check active delegated stake,
+but it is not an epoch-frozen leader-election snapshot. The flag is only safe
+for a static local devnet and is removed when Caribic configures a public
+network. Public deployments use the configured current-epoch and historical
+stake snapshot sources and must not enable this fallback when delegations can
+change.
+
+## Substitute-Client Recovery
+
+An expired or frozen probabilistic client can be recovered from a compatible,
+active substitute through the ibc-go authority and governance path. Recovery
+updates the original subject client ID; it does not point the connection at the
+substitute. Existing connection and channel identifiers, packet state, ICS-20
+escrow, and voucher denominations therefore remain unchanged.
+
+The concrete protobuf client type must match. The subject and substitute must
+also have the same upgrade path, HostState NFT policy ID and token name, Cardano
+system start, slot length, slots per KES period, maximum KES evolutions,
+active-slot coefficient, and maximum clock drift. The
+substitute checkpoint must be strictly newer, its latest consensus and delay
+metadata must be present, and its operational-certificate counters may not
+regress. Recovery cannot be used to cross client types or move a route to a
+different HostState NFT deployment.
+
+The recovery handler installs the substitute's latest consensus state,
+processed time and height, consensus iteration entry, checkpoint cursor, epoch
+context, chain ID, trusting period, and operational-certificate counter snapshot
+on the subject. The first ordinary update after recovery is an important
+verification step: it proves that the copied checkpoint, epoch, and certificate
+state can authenticate a new Cardano header rather than only returning an
+active status.
+
+See the [probabilistic-client recovery runbook](./probabilistic-client-recovery.md)
+for the local v8/v10 Classic test, its membership and non-membership assertions,
+and the Injective-oriented operating procedure. Recovery is valid after genuine
+expiry or a freeze caused by independently verified cryptographic
+misbehaviour. Misbehaviour must never be fabricated simply to make an active
+client recoverable.
 
 ## HostState Root Authentication
 

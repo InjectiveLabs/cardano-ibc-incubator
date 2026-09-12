@@ -29,6 +29,7 @@ import {
 
 declare const cardanoHeightBrand: unique symbol;
 declare const epochNumberBrand: unique symbol;
+const MAX_SUPPORTED_KES_EVOLUTIONS = 64;
 
 export type CardanoHeight = bigint & {
   readonly [cardanoHeightBrand]: 'CardanoHeight';
@@ -125,6 +126,20 @@ function assertEpochVerificationContextAvailable(
   if (epochVerificationContext.slotsPerKesPeriod <= 0) {
     throw new GrpcInternalException(`Slots-per-KES-period unavailable for ${context} in epoch ${epoch}`);
   }
+  if (
+    !Number.isSafeInteger(epochVerificationContext.maxKesEvolutions) ||
+    epochVerificationContext.maxKesEvolutions <= 0 ||
+    epochVerificationContext.maxKesEvolutions > MAX_SUPPORTED_KES_EVOLUTIONS
+  ) {
+    throw new GrpcInternalException(`Max KES evolutions unavailable for ${context} in epoch ${epoch}`);
+  }
+  if (
+    epochVerificationContext.activeSlotCoefficientNumerator <= 0n ||
+    epochVerificationContext.activeSlotCoefficientDenominator <= 0n ||
+    epochVerificationContext.activeSlotCoefficientNumerator > epochVerificationContext.activeSlotCoefficientDenominator
+  ) {
+    throw new GrpcInternalException(`Invalid active-slot coefficient for ${context} in epoch ${epoch}`);
+  }
   if (epochVerificationContext.currentEpochEndSlotExclusive <= epochVerificationContext.currentEpochStartSlot) {
     throw new GrpcInternalException(`Invalid epoch slot bounds for ${context} in epoch ${epoch}`);
   }
@@ -139,6 +154,17 @@ function assertStakeVerificationContextAvailable(
   if (missingVrfKey) {
     throw new GrpcInternalException(
       `VRF key hash unavailable for pool ${missingVrfKey.poolId} in ${context} for epoch ${epoch}`,
+    );
+  }
+  const missingRelativeStake = epochStakeDistribution.find(
+    (entry) =>
+      entry.relativeStakeNumerator <= 0n ||
+      entry.relativeStakeDenominator <= 0n ||
+      entry.relativeStakeNumerator > entry.relativeStakeDenominator,
+  );
+  if (missingRelativeStake) {
+    throw new GrpcInternalException(
+      `Exact relative stake unavailable for pool ${missingRelativeStake.poolId} in ${context} for epoch ${epoch}`,
     );
   }
 }

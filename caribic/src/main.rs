@@ -13,6 +13,7 @@ mod commands;
 mod config;
 mod demos;
 mod install;
+mod light_client_test;
 mod logger;
 mod process;
 mod route_setup;
@@ -24,17 +25,21 @@ mod utils;
 
 #[derive(clap::ValueEnum, Clone, Debug, PartialEq)]
 enum DemoType {
-    /// Starts the message-exchange demo preset
-    MessageExchange,
     /// Starts the token-swap demo preset using a running bridge plus selected chain/network
     TokenSwap,
 }
 
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LightClientTest {
+    /// Recover an expired probabilistic client through the ibc-go governance authority path
+    RecoverClient,
+}
+
 #[derive(clap::ValueEnum, Clone, Debug, PartialEq)]
 enum StartTarget {
-    /// Starts everything (network + bridge)
+    /// Starts everything (network + bridge + IBC Swap dapp)
     All,
-    /// Starts the local Cardano network related services
+    /// Starts the managed Cardano network/runtime services
     Network,
     /// Deploys the light client contracts and starts the gateway and relayer
     Bridge,
@@ -50,12 +55,14 @@ enum StartTarget {
 
 #[derive(clap::ValueEnum, Clone, Debug, PartialEq)]
 enum StopTarget {
-    /// Stops everything (network + bridge + demos)
+    /// Stops everything (dapp + network + bridge + demos)
     All,
-    /// Stops the local Cardano network related services
+    /// Stops the managed Cardano network/runtime services
     Network,
     /// Tears down the gateway and relayer
     Bridge,
+    /// Stops only the IBC Swap dapp
+    Dapp,
     /// Stops the demo services
     Demo,
     /// Stops only the Gateway service
@@ -98,6 +105,8 @@ enum BenchmarkCommand {
 enum TransferRouteChainArg {
     /// Core Cardano chain currently selected by `caribic start --network`
     Cardano,
+    /// Local pinned ibc-go compatibility chain selected with --to-network
+    Cosmos,
     /// Injective optional chain
     Injective,
     /// Osmosis optional chain
@@ -111,7 +120,7 @@ enum SetupCommand {
         /// Source chain for the route
         #[arg(long = "from", value_enum, default_value_t = TransferRouteChainArg::Cardano)]
         from: TransferRouteChainArg,
-        /// Expected source network (for Cardano: local or preprod)
+        /// Expected source network (for Cardano: local, preprod, or preview)
         #[arg(long = "from-network")]
         from_network: Option<String>,
         /// Destination chain for the route
@@ -133,7 +142,7 @@ enum Commands {
     Check,
     /// Installs missing local prerequisites on macOS or Ubuntu Linux
     Install,
-    /// Starts bridge components. No argument starts everything; optionally specify: all, network, bridge, gateway, relayer
+    /// Starts bridge components. No argument starts the network, bridge, and IBC Swap dapp; optionally specify: all, network, bridge, gateway, dapp, relayer (mithril is disabled)
     Start {
         #[arg(value_enum)]
         target: Option<StartTarget>,
@@ -143,18 +152,18 @@ enum Commands {
         /// Deprecated and disabled; use the default stake-weighted-stability light-client mode
         #[arg(long, default_value_t = false)]
         with_mithril: bool,
-        /// Optional network profile for the managed Cardano runtime (local, preprod)
+        /// Optional network profile for the managed Cardano runtime (local, preprod, preview)
         #[arg(long)]
         network: Option<String>,
         /// Chain-specific KEY=VALUE flag (repeatable); use `caribic chain start --chain <id>` for optional chains
         #[arg(long = "chain-flag")]
         chain_flag: Vec<String>,
     },
-    /// Stops bridge components. No argument stops everything; optionally specify: all, network, bridge, demo, gateway, relayer, mithril
+    /// Stops bridge components. No argument stops everything; optionally specify: all, network, bridge, dapp, demo, gateway, relayer, mithril
     Stop {
         #[arg(value_enum)]
         target: Option<StopTarget>,
-        /// Optional network profile for the managed Cardano runtime (local, preprod)
+        /// Optional network profile for the managed Cardano runtime (local, preprod, preview)
         #[arg(long)]
         network: Option<String>,
         /// Chain-specific KEY=VALUE flag (repeatable); use `caribic chain stop --chain <id>` for optional chains
@@ -175,7 +184,7 @@ enum Commands {
     },
     /// Check health of bridge services
     HealthCheck {
-        /// Optional: specific service to check (gateway, cardano, postgres, yaci, kupo, ogmios, mithril, hermes, osmosis, redis, cheqd, injective)
+        /// Optional: specific service to check (gateway, dapp, cardano, postgres, yaci, kupo, ogmios, hermes, osmosis, redis, cheqd, injective)
         #[arg(long)]
         service: Option<String>,
     },
@@ -187,7 +196,7 @@ enum Commands {
         /// Select the first block of tip_epoch - epochs_back
         #[arg(long, default_value_t = 2)]
         epochs_back: u64,
-        /// Write YACI_SYNC_START_* values into cardano/gateway/.env and chains/cardano/.env
+        /// Write the network marker and YACI_SYNC_START_* values into cardano/gateway/.env
         #[arg(long, default_value_t = false)]
         write_env: bool,
     },
@@ -237,7 +246,7 @@ enum Commands {
         #[command(subcommand)]
         command: SetupCommand,
     },
-    /// Starts a demo preset. Usage: `caribic demo token-swap --chain osmosis --network local`
+    /// Starts a demo preset. Usage: `caribic demo token-swap --chain cosmos --network v8-classic`
     Demo {
         #[arg(value_enum)]
         use_case: DemoType,
@@ -258,8 +267,23 @@ enum Commands {
     /// Prerequisites: All services must be running. Use 'caribic start' first.
     Test {
         /// Optional test selector (examples: "9-12", "6", "5,9-12")
-        #[arg(long)]
+        #[arg(long, conflicts_with = "light_client")]
         tests: Option<String>,
+        /// Run a focused live light-client scenario (defaults to recover-client when omitted)
+        #[arg(
+            long,
+            value_enum,
+            num_args = 0..=1,
+            default_missing_value = "recover-client",
+            conflicts_with = "tests"
+        )]
+        light_client: Option<LightClientTest>,
+        /// Chain hosting the Cardano light client (focused tests currently require cosmos)
+        #[arg(long, value_enum, requires = "light_client")]
+        chain: Option<start::OptionalChainId>,
+        /// Local Cosmos compatibility profile (v8-classic or v10-classic)
+        #[arg(long, requires = "light_client")]
+        network: Option<String>,
     },
 }
 
@@ -304,7 +328,7 @@ enum KeysCommand {
 enum ChainCommand {
     /// Start an optional chain adapter
     Start {
-        /// Chain identifier (for example: osmosis, cheqd, injective)
+        /// Chain identifier (for example: cosmos, osmosis, cheqd, injective)
         #[arg(long)]
         chain: String,
         /// Optional network profile (for example: local, testnet)
@@ -316,7 +340,7 @@ enum ChainCommand {
     },
     /// Stop an optional chain adapter
     Stop {
-        /// Chain identifier (for example: osmosis, cheqd, injective)
+        /// Chain identifier (for example: cosmos, osmosis, cheqd, injective)
         #[arg(long)]
         chain: String,
         /// Optional network profile (for example: local, testnet)
@@ -328,7 +352,7 @@ enum ChainCommand {
     },
     /// Check health for an optional chain adapter
     Health {
-        /// Chain identifier (for example: osmosis, cheqd, injective)
+        /// Chain identifier (for example: cosmos, osmosis, cheqd, injective)
         #[arg(long)]
         chain: String,
         /// Optional network profile (for example: local, testnet)
@@ -424,12 +448,32 @@ async fn main() {
                 commands::run_denom_registry_benchmark(project_root_path, bucket, inserts)
             }
         },
-        Commands::Test { tests } => {
-            let test_result = commands::run_tests(project_root_path, tests.as_deref()).await;
+        Commands::Test {
+            tests,
+            light_client,
+            chain,
+            network,
+        } => {
+            let failure_context = if light_client.is_some() {
+                "Focused light-client test"
+            } else {
+                "Integration tests"
+            };
+            let test_result = if let Some(light_client_test) = light_client {
+                commands::run_light_client_test(
+                    project_root_path,
+                    light_client_test,
+                    chain,
+                    network.as_deref(),
+                )
+                .await
+            } else {
+                commands::run_tests(project_root_path, tests.as_deref()).await
+            };
             match test_result {
                 Ok(_) => Ok(()),
                 Err(error) => {
-                    logger::error(&format!("Integration tests failed: {}", error));
+                    logger::error(&format!("{failure_context} failed: {error}"));
                     Err(error)
                 }
             }
@@ -440,5 +484,53 @@ async fn main() {
     if let Err(error) = command_result {
         logger::error(&error);
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn light_client_flag_defaults_to_recover_client() {
+        let args = Args::try_parse_from([
+            "caribic",
+            "test",
+            "--light-client",
+            "--chain",
+            "cosmos",
+            "--network",
+            "v10-classic",
+        ])
+        .expect("focused light-client arguments should parse");
+
+        match args.command {
+            Commands::Test {
+                tests,
+                light_client,
+                chain,
+                network,
+            } => {
+                assert!(tests.is_none());
+                assert_eq!(light_client, Some(LightClientTest::RecoverClient));
+                assert_eq!(chain, Some(start::OptionalChainId::Cosmos));
+                assert_eq!(network.as_deref(), Some("v10-classic"));
+            }
+            _ => panic!("expected test command"),
+        }
+    }
+
+    #[test]
+    fn numbered_and_light_client_selectors_conflict() {
+        let result = Args::try_parse_from(["caribic", "test", "--tests", "9-13", "--light-client"]);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn light_client_network_requires_the_focused_mode() {
+        let result = Args::try_parse_from(["caribic", "test", "--network", "v8-classic"]);
+
+        assert!(result.is_err());
     }
 }

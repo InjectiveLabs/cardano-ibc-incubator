@@ -66,6 +66,7 @@ message BridgeManifest {
   BridgeManifestAuthToken host_state_nft = 4;
   BridgeManifestValidators validators = 6;
   BridgeManifestModules modules = 7;
+  string ics20_packet_codec = 9;
 }
 
 message BridgeManifestCardanoInfo {
@@ -104,6 +105,7 @@ message BridgeManifestSpendChannelRefValidators {
   BridgeManifestReferredValidator recv_packet = 6;
   BridgeManifestReferredValidator send_packet = 7;
   BridgeManifestReferredValidator timeout_packet = 8;
+  BridgeManifestReferredValidator prune_packet_history = 9;
 }
 
 message BridgeManifestSpendChannelValidator {
@@ -124,6 +126,7 @@ message BridgeManifestValidators {
   BridgeManifestValidator mint_connection_stt = 9;
   BridgeManifestValidator mint_channel_stt = 10;
   BridgeManifestValidator mint_voucher = 11;
+  BridgeManifestValidator recover_client = 12;
 }
 
 message BridgeManifestModule {

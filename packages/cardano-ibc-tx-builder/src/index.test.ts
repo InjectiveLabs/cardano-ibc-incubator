@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import type { TxBuilder, UTxO } from '@lucid-evolution/lucid';
 import {
   buildUnsignedSendPacketTx,
+  ICS20_CLASSIC_JSON_LIMITS,
+  MAX_PACKET_ENTRIES_PER_CHANNEL,
   type LoadedSendPacketContext,
   type SendPacketBuildDependencies,
   type SendPacketOperator,
@@ -52,6 +54,10 @@ function baseContext(): LoadedSendPacketContext {
       state: {
         next_sequence_send: 4n,
         packet_commitment: new Map([[1n, 'previous']]),
+        packet_receipt: new Map(),
+        packet_acknowledgement: new Map(),
+        minimum_receive_proof_height: { revisionNumber: 0n, revisionHeight: 0n },
+        maximum_receive_proof_height: { revisionNumber: 0n, revisionHeight: 0n },
         channel: {
           connection_hops: ['connection-0'],
           counterparty: {
@@ -124,8 +130,12 @@ function createDeps(overrides: Partial<SendPacketBuildDependencies> = {}) {
         requiredAmount,
       });
       return {
+        kind: 'missing',
+        transferModuleUtxo: utxo('scanned-transfer-module-root', 0),
         encodedDatum: 'transfer-escrow-datum',
         shardTokenUnit: `${'55'.repeat(28)}${channelId.slice(0, 8)}`,
+        registrySiblings: ['00'.repeat(32)],
+        encodedUpdatedTransferModuleDatum: 'updated-transfer-module-datum',
       };
     },
     createUnsignedSendPacketBurnTx: (dto) => {
@@ -178,6 +188,54 @@ describe('send-packet denom mapping', () => {
     );
     assert.equal(packetData.denom, Buffer.from('lovelace').toString('hex'));
     assert.equal(packetData.amount, '123');
+    const moduleRedeemer = harness.encodedValues.find(
+      (entry) => entry.kind === 'transferIBCModuleRedeemer',
+    )?.value as {
+      Callback: [
+        {
+          OnSendPacket: {
+            channel_id: string;
+            packet_data: string;
+            packet_commitment: string;
+            data: unknown;
+          };
+        },
+      ];
+    };
+    assert.deepEqual(moduleRedeemer.Callback[0].OnSendPacket, {
+      channel_id: Buffer.from('channel-7').toString('hex'),
+      packet_data: spendRedeemer.SendPacket.packet.data,
+      packet_commitment: 'packet-commitment',
+      data: {
+        ModuleDataV1: [
+          {
+            denom: Buffer.from(
+              Buffer.from('lovelace').toString('hex'),
+            ).toString('hex'),
+            amount: Buffer.from('123').toString('hex'),
+            sender: Buffer.from('addr_sender').toString('hex'),
+            receiver: Buffer.from('osmo1receiver').toString('hex'),
+            memo: '',
+          },
+        ],
+      },
+    });
+    assert.deepEqual(
+      captured.transferModuleReferenceUtxo,
+      utxo('scanned-transfer-module-root', 0),
+    );
+    assert.equal(
+      captured.encodedUpdatedTransferModuleDatum,
+      'updated-transfer-module-datum',
+    );
+    const shardRedeemer = harness.encodedValues.find(
+      (entry) => entry.kind === 'transferEscrowShardRedeemer',
+    )?.value as {
+      CreateEscrowShard: { registry_siblings: string[] };
+    };
+    assert.deepEqual(shardRedeemer.CreateEscrowShard.registry_siblings, [
+      '00'.repeat(32),
+    ]);
   });
 
   it('reverse-resolves ibc hashes to voucher burns and deduplicates wallet UTxOs', async () => {
@@ -215,6 +273,11 @@ describe('send-packet denom mapping', () => {
     assert.equal(captured.transferAmount, 456n);
     assert.equal(captured.walletUtxos?.length, 2);
     assert.equal(captured.voucherTokenUnit, requestedUnit);
+    assert.ok(captured.encodedSpendTransferModuleRedeemer);
+    assert.deepEqual(
+      captured.transferModuleReferenceUtxo,
+      baseContext().transferModuleReferenceUtxo,
+    );
     assert.match(
       captured.voucherTokenUnit,
       new RegExp(`^${'44'.repeat(28)}0014df10[0-9a-f]{56}$`),
@@ -246,6 +309,99 @@ describe('send-packet denom mapping', () => {
         ),
       /not found in denom traces/,
     );
+    assert.equal(harness.getCapturedEscrow(), undefined);
+    assert.equal(harness.getCapturedBurn(), undefined);
+  });
+
+  it('maps oversized outbound packet data to invalid argument', async () => {
+    class InvalidArgumentError extends Error {}
+
+    let invalidArgumentCalls = 0;
+    let packetCommits = 0;
+    const harness = createDeps({
+      invalidArgument: (message) => {
+        invalidArgumentCalls += 1;
+        return new InvalidArgumentError(message);
+      },
+      commitPacket: () => {
+        packetCommits += 1;
+        return 'packet-commitment';
+      },
+    });
+
+    await assert.rejects(
+      () =>
+        buildUnsignedSendPacketTx(
+          baseOperator({
+            memo: 'm'.repeat(ICS20_CLASSIC_JSON_LIMITS.memoBytes),
+          }),
+          harness.deps,
+        ),
+      (error: unknown) => {
+        assert.ok(error instanceof InvalidArgumentError);
+        assert.match(error.message, /Invalid ICS-20 packet data/);
+        assert.match(error.message, /exceeds 512 bytes/);
+        return true;
+      },
+    );
+    assert.equal(invalidArgumentCalls, 1);
+    assert.equal(packetCommits, 0);
+    assert.equal(harness.getCapturedEscrow(), undefined);
+    assert.equal(harness.getCapturedBurn(), undefined);
+  });
+
+  it('allows a deployment to supply its legacy packet serializer', async () => {
+    const legacyPacketJson = '{"amount":"123","denom":"legacy"}';
+    const harness = createDeps({
+      stringifyPacketData: () => legacyPacketJson,
+    });
+
+    await buildUnsignedSendPacketTx(
+      baseOperator({ memo: 'm'.repeat(ICS20_CLASSIC_JSON_LIMITS.memoBytes) }),
+      harness.deps,
+    );
+
+    const spendRedeemer = harness.encodedValues.find(
+      (entry) => entry.kind === 'spendChannelRedeemer',
+    )?.value as { SendPacket: { packet: { data: string } } };
+    assert.equal(
+      Buffer.from(spendRedeemer.SendPacket.packet.data, 'hex').toString('utf8'),
+      legacyPacketJson,
+    );
+  });
+
+  it('rejects sends before full combined packet state reaches the chain', async () => {
+    let hostStateBuilds = 0;
+    const fullContext = baseContext();
+    fullContext.channelDatum.state.packet_commitment = new Map();
+    fullContext.channelDatum.state.packet_receipt = new Map<bigint, string>(
+      Array.from({ length: MAX_PACKET_ENTRIES_PER_CHANNEL / 2 }, (_, index) => [
+        BigInt(index + 1),
+        `receipt-${index + 1}`,
+      ] as [bigint, string]),
+    );
+    fullContext.channelDatum.state.packet_acknowledgement = new Map<
+      bigint,
+      string
+    >(
+      Array.from({ length: MAX_PACKET_ENTRIES_PER_CHANNEL / 2 }, (_, index) => [
+        BigInt(index + 1),
+        `acknowledgement-${index + 1}`,
+      ] as [bigint, string]),
+    );
+    const harness = createDeps({
+      loadContext: async () => fullContext,
+      buildHostStateUpdate: async () => {
+        hostStateBuilds += 1;
+        throw new Error('must not build HostState after capacity rejection');
+      },
+    });
+
+    await assert.rejects(
+      () => buildUnsignedSendPacketTx(baseOperator(), harness.deps),
+      /retained packet state capacity of 64 is exhausted/,
+    );
+    assert.equal(hostStateBuilds, 0);
     assert.equal(harness.getCapturedEscrow(), undefined);
     assert.equal(harness.getCapturedBurn(), undefined);
   });

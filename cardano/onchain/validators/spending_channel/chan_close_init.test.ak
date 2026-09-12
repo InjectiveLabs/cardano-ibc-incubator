@@ -1,6 +1,8 @@
+use cardano/assets.{Value}
 use cardano/transaction.{
   Input, Mint, Redeemer, ScriptPurpose, Spend, Transaction,
 }
+use ibc/client/ics_007_tendermint_client/height as height_mod
 use ibc/core/ics_004/channel_datum.{ChannelDatum,
   ChannelDatumState} as channel_datum_mod
 use ibc/core/ics_004/channel_redeemer.{ChanCloseInit}
@@ -13,7 +15,7 @@ use ibc/utils/test_utils
 use spending_channel/chan_close_init
 use spending_channel/spending_channel_fixture.{MockData, setup}
 
-test chan_close_init_succeed() {
+fn check_chan_close_init(mint: Value) {
   let fake_data = setup()
 
   //========================arrange inputs=======================
@@ -32,6 +34,8 @@ test chan_close_init_succeed() {
   let input_channel_datum =
     ChannelDatum {
       state: ChannelDatumState {
+        maximum_receive_proof_height: height_mod.zero_height(),
+        minimum_receive_proof_height: height_mod.zero_height(),
         channel: input_channel,
         next_sequence_send: 1,
         next_sequence_recv: 1,
@@ -47,7 +51,8 @@ test chan_close_init_succeed() {
   let channel_input =
     test_utils.build_channel_input(input_channel_datum, fake_data.channel_token)
 
-  let inputs = [fake_data.module_input, channel_input]
+  let inputs =
+    [fake_data.host_state_input, fake_data.module_input, channel_input]
 
   //========================arrange reference_inputs=======================
   let reference_inputs = [fake_data.connection_input, fake_data.client_input]
@@ -99,19 +104,60 @@ test chan_close_init_succeed() {
     Transaction {
       ..transaction.placeholder,
       inputs,
+      mint,
       reference_inputs,
       outputs,
       redeemers,
       validity_range,
     }
 
-  chan_close_init.chan_close_init.spend(
+  chan_close_init.chan_close_init.mint(
     fake_data.client_minting_policy_id,
     fake_data.connection_minting_policy_id,
     fake_data.port_minting_policy_id,
-    None,
+    fake_data.host_state_nft_policy_id,
     fake_data.channel_token,
-    channel_input.output_reference,
+    fake_data.chan_close_init_policy_id,
     transaction,
+  )
+}
+
+test chan_close_init_succeed() {
+  let mock_data = setup()
+  check_chan_close_init(
+    assets.from_asset(mock_data.chan_close_init_policy_id, "", 1),
+  )
+}
+
+test chan_close_init_rejects_missing_marker() fail {
+  check_chan_close_init(assets.zero)
+}
+
+test chan_close_init_rejects_marker_burn() fail {
+  let mock_data = setup()
+  check_chan_close_init(
+    assets.from_asset(mock_data.chan_close_init_policy_id, "", -1),
+  )
+}
+
+test chan_close_init_rejects_multiple_markers() fail {
+  let mock_data = setup()
+  check_chan_close_init(
+    assets.from_asset(mock_data.chan_close_init_policy_id, "", 2),
+  )
+}
+
+test chan_close_init_rejects_wrong_marker_name() fail {
+  let mock_data = setup()
+  check_chan_close_init(
+    assets.from_asset(mock_data.chan_close_init_policy_id, "wrong", 1),
+  )
+}
+
+test chan_close_init_rejects_extra_marker_asset() fail {
+  let mock_data = setup()
+  check_chan_close_init(
+    assets.from_asset(mock_data.chan_close_init_policy_id, "", 1)
+      |> assets.add(mock_data.chan_close_init_policy_id, "extra", 1),
   )
 }

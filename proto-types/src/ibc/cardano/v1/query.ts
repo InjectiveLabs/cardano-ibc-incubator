@@ -81,6 +81,7 @@ export interface BridgeManifest {
   host_state_nft?: BridgeManifestAuthToken;
   validators?: BridgeManifestValidators;
   modules?: BridgeManifestModules;
+  ics20_packet_codec: string;
 }
 /**
  * @name BridgeManifestCardanoInfo
@@ -143,6 +144,7 @@ export interface BridgeManifestSpendChannelRefValidators {
   recv_packet?: BridgeManifestReferredValidator;
   send_packet?: BridgeManifestReferredValidator;
   timeout_packet?: BridgeManifestReferredValidator;
+  prune_packet_history?: BridgeManifestReferredValidator;
 }
 /**
  * @name BridgeManifestSpendChannelValidator
@@ -171,6 +173,7 @@ export interface BridgeManifestValidators {
   mint_connection_stt?: BridgeManifestValidator;
   mint_channel_stt?: BridgeManifestValidator;
   mint_voucher?: BridgeManifestValidator;
+  recover_client?: BridgeManifestValidator;
 }
 /**
  * @name BridgeManifestModule
@@ -500,6 +503,7 @@ function createBaseBridgeManifest(): BridgeManifest {
     host_state_nft: undefined,
     validators: undefined,
     modules: undefined,
+    ics20_packet_codec: "",
   };
 }
 /**
@@ -531,6 +535,9 @@ export const BridgeManifest = {
     if (message.modules !== undefined) {
       BridgeManifestModules.encode(message.modules, writer.uint32(58).fork()).ldelim();
     }
+    if (message.ics20_packet_codec !== "") {
+      writer.uint32(74).string(message.ics20_packet_codec);
+    }
     return writer;
   },
   decode(input: BinaryReader | Uint8Array, length?: number): BridgeManifest {
@@ -561,6 +568,9 @@ export const BridgeManifest = {
         case 7:
           message.modules = BridgeManifestModules.decode(reader, reader.uint32());
           break;
+        case 9:
+          message.ics20_packet_codec = reader.string();
+          break;
         default:
           reader.skipType(tag & 7);
           break;
@@ -578,6 +588,7 @@ export const BridgeManifest = {
       obj.host_state_nft = BridgeManifestAuthToken.fromJSON(object.host_state_nft);
     if (isSet(object.validators)) obj.validators = BridgeManifestValidators.fromJSON(object.validators);
     if (isSet(object.modules)) obj.modules = BridgeManifestModules.fromJSON(object.modules);
+    if (isSet(object.ics20_packet_codec)) obj.ics20_packet_codec = String(object.ics20_packet_codec);
     return obj;
   },
   toJSON(message: BridgeManifest): unknown {
@@ -595,6 +606,7 @@ export const BridgeManifest = {
       (obj.validators = message.validators ? BridgeManifestValidators.toJSON(message.validators) : undefined);
     message.modules !== undefined &&
       (obj.modules = message.modules ? BridgeManifestModules.toJSON(message.modules) : undefined);
+    message.ics20_packet_codec !== undefined && (obj.ics20_packet_codec = message.ics20_packet_codec);
     return obj;
   },
   fromPartial<I extends Exact<DeepPartial<BridgeManifest>, I>>(object: I): BridgeManifest {
@@ -614,6 +626,7 @@ export const BridgeManifest = {
     if (object.modules !== undefined && object.modules !== null) {
       message.modules = BridgeManifestModules.fromPartial(object.modules);
     }
+    message.ics20_packet_codec = object.ics20_packet_codec ?? "";
     return message;
   },
 };
@@ -970,6 +983,7 @@ function createBaseBridgeManifestSpendChannelRefValidators(): BridgeManifestSpen
     recv_packet: undefined,
     send_packet: undefined,
     timeout_packet: undefined,
+    prune_packet_history: undefined,
   };
 }
 /**
@@ -1007,6 +1021,9 @@ export const BridgeManifestSpendChannelRefValidators = {
     if (message.timeout_packet !== undefined) {
       BridgeManifestReferredValidator.encode(message.timeout_packet, writer.uint32(66).fork()).ldelim();
     }
+    if (message.prune_packet_history !== undefined) {
+      BridgeManifestReferredValidator.encode(message.prune_packet_history, writer.uint32(74).fork()).ldelim();
+    }
     return writer;
   },
   decode(input: BinaryReader | Uint8Array, length?: number): BridgeManifestSpendChannelRefValidators {
@@ -1040,6 +1057,9 @@ export const BridgeManifestSpendChannelRefValidators = {
         case 8:
           message.timeout_packet = BridgeManifestReferredValidator.decode(reader, reader.uint32());
           break;
+        case 9:
+          message.prune_packet_history = BridgeManifestReferredValidator.decode(reader, reader.uint32());
+          break;
         default:
           reader.skipType(tag & 7);
           break;
@@ -1065,6 +1085,8 @@ export const BridgeManifestSpendChannelRefValidators = {
       obj.send_packet = BridgeManifestReferredValidator.fromJSON(object.send_packet);
     if (isSet(object.timeout_packet))
       obj.timeout_packet = BridgeManifestReferredValidator.fromJSON(object.timeout_packet);
+    if (isSet(object.prune_packet_history))
+      obj.prune_packet_history = BridgeManifestReferredValidator.fromJSON(object.prune_packet_history);
     return obj;
   },
   toJSON(message: BridgeManifestSpendChannelRefValidators): unknown {
@@ -1101,6 +1123,10 @@ export const BridgeManifestSpendChannelRefValidators = {
       (obj.timeout_packet = message.timeout_packet
         ? BridgeManifestReferredValidator.toJSON(message.timeout_packet)
         : undefined);
+    message.prune_packet_history !== undefined &&
+      (obj.prune_packet_history = message.prune_packet_history
+        ? BridgeManifestReferredValidator.toJSON(message.prune_packet_history)
+        : undefined);
     return obj;
   },
   fromPartial<I extends Exact<DeepPartial<BridgeManifestSpendChannelRefValidators>, I>>(
@@ -1130,6 +1156,9 @@ export const BridgeManifestSpendChannelRefValidators = {
     }
     if (object.timeout_packet !== undefined && object.timeout_packet !== null) {
       message.timeout_packet = BridgeManifestReferredValidator.fromPartial(object.timeout_packet);
+    }
+    if (object.prune_packet_history !== undefined && object.prune_packet_history !== null) {
+      message.prune_packet_history = BridgeManifestReferredValidator.fromPartial(object.prune_packet_history);
     }
     return message;
   },
@@ -1244,6 +1273,7 @@ function createBaseBridgeManifestValidators(): BridgeManifestValidators {
     mint_connection_stt: undefined,
     mint_channel_stt: undefined,
     mint_voucher: undefined,
+    recover_client: undefined,
   };
 }
 /**
@@ -1284,6 +1314,9 @@ export const BridgeManifestValidators = {
     if (message.mint_voucher !== undefined) {
       BridgeManifestValidator.encode(message.mint_voucher, writer.uint32(90).fork()).ldelim();
     }
+    if (message.recover_client !== undefined) {
+      BridgeManifestValidator.encode(message.recover_client, writer.uint32(98).fork()).ldelim();
+    }
     return writer;
   },
   decode(input: BinaryReader | Uint8Array, length?: number): BridgeManifestValidators {
@@ -1323,6 +1356,9 @@ export const BridgeManifestValidators = {
         case 11:
           message.mint_voucher = BridgeManifestValidator.decode(reader, reader.uint32());
           break;
+        case 12:
+          message.recover_client = BridgeManifestValidator.decode(reader, reader.uint32());
+          break;
         default:
           reader.skipType(tag & 7);
           break;
@@ -1349,6 +1385,8 @@ export const BridgeManifestValidators = {
     if (isSet(object.mint_channel_stt))
       obj.mint_channel_stt = BridgeManifestValidator.fromJSON(object.mint_channel_stt);
     if (isSet(object.mint_voucher)) obj.mint_voucher = BridgeManifestValidator.fromJSON(object.mint_voucher);
+    if (isSet(object.recover_client))
+      obj.recover_client = BridgeManifestValidator.fromJSON(object.recover_client);
     return obj;
   },
   toJSON(message: BridgeManifestValidators): unknown {
@@ -1393,6 +1431,10 @@ export const BridgeManifestValidators = {
       (obj.mint_voucher = message.mint_voucher
         ? BridgeManifestValidator.toJSON(message.mint_voucher)
         : undefined);
+    message.recover_client !== undefined &&
+      (obj.recover_client = message.recover_client
+        ? BridgeManifestValidator.toJSON(message.recover_client)
+        : undefined);
     return obj;
   },
   fromPartial<I extends Exact<DeepPartial<BridgeManifestValidators>, I>>(
@@ -1428,6 +1470,9 @@ export const BridgeManifestValidators = {
     }
     if (object.mint_voucher !== undefined && object.mint_voucher !== null) {
       message.mint_voucher = BridgeManifestValidator.fromPartial(object.mint_voucher);
+    }
+    if (object.recover_client !== undefined && object.recover_client !== null) {
+      message.recover_client = BridgeManifestValidator.fromPartial(object.recover_client);
     }
     return message;
   },

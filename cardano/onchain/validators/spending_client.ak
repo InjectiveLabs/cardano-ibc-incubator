@@ -1,13 +1,14 @@
 use aiken/collection/list
 use aiken/collection/pairs
+use cardano/address.{Credential}
 use cardano/assets.{PolicyId}
-use cardano/transaction.{Input, OutputReference, Spend, Transaction}
+use cardano/transaction.{Input, OutputReference, Spend, Transaction, Withdraw}
 use ibc/auth
 use ibc/client/ics_007_tendermint_client/client_datum.{
   ClientDatum, ClientDatumState,
 } as client_datum_mod
 use ibc/client/ics_007_tendermint_client/client_redeemer.{
-  Other, SpendClientRedeemer, UpdateClient,
+  RecoverClient, RecoverClientWithdrawal, SpendClientRedeemer, UpdateClient,
 }
 use ibc/client/ics_007_tendermint_client/client_state as client_state_mod
 use ibc/client/ics_007_tendermint_client/misbehaviour_handle as misbehaviour_handle_mod
@@ -31,7 +32,10 @@ fn find_host_state_input(
   )
 }
 
-validator spend_client(host_state_nft_policy_id: PolicyId) {
+validator spend_client(
+  host_state_nft_policy_id: PolicyId,
+  recover_client_credential: Credential,
+) {
   spend(
     datum: Option<ClientDatum>,
     redeemer: SpendClientRedeemer,
@@ -119,11 +123,25 @@ validator spend_client(host_state_nft_policy_id: PolicyId) {
             updated_datum,
             header,
             tx_valid_from,
+            tx_valid_to,
           )?
         }
       }
 
-      Other -> False
+      RecoverClient { substitute_token } -> {
+        trace @"spend_client: RecoverClient branch"
+
+        expect Some(withdrawal_redeemer) =
+          pairs.get_first(redeemers, Withdraw(recover_client_credential))
+        let expected_withdrawal: Data =
+          RecoverClientWithdrawal {
+            subject_token: datum.token,
+            substitute_token,
+          }
+
+        // A withdrawal validating another client must not authorize this spend.
+        withdrawal_redeemer == expected_withdrawal
+      }
     }
   }
 

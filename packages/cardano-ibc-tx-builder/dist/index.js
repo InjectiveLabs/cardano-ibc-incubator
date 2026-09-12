@@ -1,32 +1,85 @@
 "use strict";
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __exportStar = (this && this.__exportStar) || function(m, exports) {
+    for (var p in m) if (p !== "default" && !Object.prototype.hasOwnProperty.call(exports, p)) __createBinding(exports, m, p);
+};
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.stringifyLegacyIcs20PacketData = exports.MAX_PACKET_ENTRIES_PER_CHANNEL = void 0;
 exports.buildUnsignedSendPacketTx = buildUnsignedSendPacketTx;
 const blake2b_1 = require("@noble/hashes/blake2b");
+const ics20_json_codec_1 = require("./ics20-json-codec");
+__exportStar(require("./ics20-json-codec"), exports);
 const LOVELACE = 'lovelace';
 const CIP67_FT_LABEL_HEX = '0014df10';
+exports.MAX_PACKET_ENTRIES_PER_CHANNEL = 64;
 const LOOKUP_RETRY_OPTIONS = {
     maxAttempts: 6,
     retryDelayMs: 1000,
 };
+// Preserve the exact sorted JSON representation used by deployments created
+// before the strict ICS-20 codec was introduced.
+const stringifyLegacyIcs20PacketData = (packetData) => {
+    const ordered = {};
+    if (packetData.amount)
+        ordered.amount = packetData.amount;
+    if (packetData.denom)
+        ordered.denom = packetData.denom;
+    if (packetData.memo)
+        ordered.memo = packetData.memo;
+    if (packetData.receiver)
+        ordered.receiver = packetData.receiver;
+    if (packetData.sender)
+        ordered.sender = packetData.sender;
+    return JSON.stringify(ordered);
+};
+exports.stringifyLegacyIcs20PacketData = stringifyLegacyIcs20PacketData;
 async function buildUnsignedSendPacketTx(sendPacketOperator, deps) {
     const context = await deps.loadContext(sendPacketOperator);
+    const retainedPacketEntryCount = context.channelDatum.state.packet_commitment.size +
+        context.channelDatum.state.packet_receipt.size +
+        context.channelDatum.state.packet_acknowledgement.size;
+    if (retainedPacketEntryCount >= exports.MAX_PACKET_ENTRIES_PER_CHANNEL) {
+        const packetCapacityError = deps.failedPrecondition ?? deps.invalidArgument;
+        throw packetCapacityError(`Channel ${sendPacketOperator.sourceChannel} retained packet state capacity ` +
+            `of ${exports.MAX_PACKET_ENTRIES_PER_CHANNEL} is exhausted`);
+    }
     const inputDenom = normalizeDenomTokenTransfer(sendPacketOperator.token.denom, deps);
     const resolvedDenom = await resolvePacketDenomForSend(inputDenom, deps);
     const packetDenom = normalizePacketDenom(resolvedDenom, sendPacketOperator.sourcePort, sendPacketOperator.sourceChannel, deps);
     const isVoucher = hasVoucherPrefix(resolvedDenom, sendPacketOperator.sourcePort, sendPacketOperator.sourceChannel);
+    let packetDataJson;
+    try {
+        packetDataJson = (deps.stringifyPacketData ?? ics20_json_codec_1.stringifyIcs20PacketData)({
+            denom: packetDenom,
+            amount: sendPacketOperator.token.amount.toString(),
+            sender: sendPacketOperator.sender,
+            receiver: sendPacketOperator.receiver,
+            memo: sendPacketOperator.memo,
+        });
+    }
+    catch (error) {
+        if (error instanceof ics20_json_codec_1.Ics20ClassicJsonCodecError) {
+            throw deps.invalidArgument(`Invalid ICS-20 packet data: ${error.message}`);
+        }
+        throw error;
+    }
     const packet = {
         sequence: context.channelDatum.state.next_sequence_send,
         source_port: convertStringToHex(sendPacketOperator.sourcePort),
         source_channel: convertStringToHex(sendPacketOperator.sourceChannel),
         destination_port: context.channelDatum.state.channel.counterparty.port_id,
         destination_channel: context.channelDatum.state.channel.counterparty.channel_id,
-        data: convertStringToHex(stringifyIcs20PacketData({
-            denom: packetDenom,
-            amount: sendPacketOperator.token.amount.toString(),
-            sender: sendPacketOperator.sender,
-            receiver: sendPacketOperator.receiver,
-            memo: sendPacketOperator.memo,
-        })),
+        data: convertStringToHex(packetDataJson),
         timeout_height: sendPacketOperator.timeoutHeight,
         timeout_timestamp: sendPacketOperator.timeoutTimestamp,
     };
@@ -37,31 +90,32 @@ async function buildUnsignedSendPacketTx(sendPacketOperator, deps) {
         receiver: convertStringToHex(sendPacketOperator.receiver),
         memo: convertStringToHex(sendPacketOperator.memo),
     };
+    const packetCommitment = deps.commitPacket(packet);
     const encodedSpendChannelRedeemer = await deps.encode({
         SendPacket: {
             packet,
         },
     }, 'spendChannelRedeemer');
     const encodedSpendTransferModuleRedeemer = await deps.encode({
-        Operator: [
+        Callback: [
             {
-                TransferModuleOperator: [
-                    {
-                        Transfer: {
-                            channel_id: convertStringToHex(sendPacketOperator.sourceChannel),
-                            data: fungibleTokenPacketData,
-                        },
+                OnSendPacket: {
+                    channel_id: convertStringToHex(sendPacketOperator.sourceChannel),
+                    packet_data: packet.data,
+                    packet_commitment: packetCommitment,
+                    data: {
+                        ModuleDataV1: [fungibleTokenPacketData],
                     },
-                ],
+                },
             },
         ],
-    }, 'iBCModuleRedeemer');
+    }, 'transferIBCModuleRedeemer');
     const updatedChannelDatum = {
         ...context.channelDatum,
         state: {
             ...context.channelDatum.state,
             next_sequence_send: context.channelDatum.state.next_sequence_send + 1n,
-            packet_commitment: insertSortMapWithNumberKey(context.channelDatum.state.packet_commitment, packet.sequence, deps.commitPacket(packet)),
+            packet_commitment: insertSortMapWithNumberKey(context.channelDatum.state.packet_commitment, packet.sequence, packetCommitment),
         },
     };
     const { hostStateUtxo, encodedHostStateRedeemer, encodedUpdatedHostStateDatum, newRoot, commit, } = await deps.buildHostStateUpdate(context.channelDatum, updatedChannelDatum, sendPacketOperator.sourceChannel);
@@ -76,8 +130,9 @@ async function buildUnsignedSendPacketTx(sendPacketOperator, deps) {
         const voucherTokenUnit = context.deployment.mintVoucherScriptHash +
             buildVoucherTokenName(resolvedDenom, deps);
         const senderAddress = sendPacketOperator.sender;
-        const senderVoucherTokenUtxo = await deps.findUtxoAtWithUnit(senderAddress, voucherTokenUnit);
-        const senderWalletUtxos = await deps.tryFindUtxosAt(senderAddress, LOOKUP_RETRY_OPTIONS);
+        const signerWalletAddress = sendPacketOperator.signer;
+        const senderVoucherTokenUtxo = await deps.findUtxoAtWithUnit(signerWalletAddress, voucherTokenUnit);
+        const senderWalletUtxos = await deps.tryFindUtxosAt(signerWalletAddress, LOOKUP_RETRY_OPTIONS);
         const walletUtxos = dedupeUtxos([
             ...senderWalletUtxos,
             senderVoucherTokenUtxo,
@@ -92,6 +147,8 @@ async function buildUnsignedSendPacketTx(sendPacketOperator, deps) {
             encodedHostStateRedeemer,
             encodedUpdatedHostStateDatum,
             encodedMintVoucherRedeemer,
+            encodedSpendTransferModuleRedeemer,
+            transferModuleReferenceUtxo: context.transferModuleReferenceUtxo,
             encodedSpendChannelRedeemer,
             encodedUpdatedChannelDatum: await deps.encode(updatedChannelDatum, 'channel'),
             transferAmount: sendPacketOperator.token.amount,
@@ -111,15 +168,16 @@ async function buildUnsignedSendPacketTx(sendPacketOperator, deps) {
                 commit,
             },
             walletOverride: {
-                address: senderAddress,
+                address: signerWalletAddress,
                 utxos: walletUtxos,
             },
         };
     }
     const senderAddress = sendPacketOperator.sender;
-    const senderWalletUtxos = await deps.tryFindUtxosAt(senderAddress, LOOKUP_RETRY_OPTIONS);
+    const signerWalletAddress = sendPacketOperator.signer;
+    const senderWalletUtxos = await deps.tryFindUtxosAt(signerWalletAddress, LOOKUP_RETRY_OPTIONS);
     if (senderWalletUtxos.length === 0) {
-        throw deps.internalError(`No spendable UTxOs found for sender ${senderAddress}`);
+        throw deps.internalError(`No spendable UTxOs found for signer ${signerWalletAddress}`);
     }
     const walletUtxos = dedupeUtxos(senderWalletUtxos);
     const denomToken = resolveEscrowDenomToken(inputDenom, resolvedDenom, walletUtxos, deps);
@@ -129,20 +187,19 @@ async function buildUnsignedSendPacketTx(sendPacketOperator, deps) {
         channelUTxO: context.channelUtxo,
         connectionUTxO: context.connectionUtxo,
         clientUTxO: context.clientUtxo,
-        transferModuleReferenceUtxo: transferEscrowShard.utxo
-            ? undefined
-            : context.transferModuleReferenceUtxo,
+        transferModuleReferenceUtxo: transferEscrowShard.transferModuleUtxo,
         encodedHostStateRedeemer,
         encodedUpdatedHostStateDatum,
         encodedSpendChannelRedeemer,
         encodedSpendTransferModuleRedeemer,
-        encodedMintTransferEscrowShardRedeemer: transferEscrowShard.utxo
+        encodedMintTransferEscrowShardRedeemer: transferEscrowShard.kind === 'existing'
             ? undefined
             : await deps.encode({
                 CreateEscrowShard: {
                     channel_id: convertStringToHex(sendPacketOperator.sourceChannel),
                     denom: convertStringToHex(packetDenom),
                     data: fungibleTokenPacketData,
+                    registry_siblings: transferEscrowShard.registrySiblings,
                 },
             }, 'transferEscrowShardRedeemer'),
         encodedUpdatedChannelDatum: await deps.encode(updatedChannelDatum, 'channel'),
@@ -155,7 +212,10 @@ async function buildUnsignedSendPacketTx(sendPacketOperator, deps) {
         channelTokenUnit: context.channelTokenUnit,
         transferModuleAddress: context.deployment.transferModuleAddress,
         denomToken,
-        transferEscrowUtxo: transferEscrowShard.utxo,
+        transferEscrowUtxo: transferEscrowShard.kind === 'existing' ? transferEscrowShard.utxo : undefined,
+        encodedUpdatedTransferModuleDatum: transferEscrowShard.kind === 'missing'
+            ? transferEscrowShard.encodedUpdatedTransferModuleDatum
+            : undefined,
         encodedTransferEscrowDatum: transferEscrowShard.encodedDatum,
         transferEscrowShardTokenUnit: transferEscrowShard.shardTokenUnit,
         sendPacketPolicyId: context.deployment.sendPacketPolicyId,
@@ -168,7 +228,7 @@ async function buildUnsignedSendPacketTx(sendPacketOperator, deps) {
             commit,
         },
         walletOverride: {
-            address: senderAddress,
+            address: signerWalletAddress,
             utxos: walletUtxos,
         },
     };
@@ -201,20 +261,6 @@ function insertSortMapWithNumberKey(inputMap, newKey, newValue) {
     const updatedMap = new Map(inputMap);
     updatedMap.set(newKey, newValue);
     return new Map(Array.from(updatedMap.entries()).sort(([keyA], [keyB]) => Number(keyA) - Number(keyB)));
-}
-function stringifyIcs20PacketData(packet) {
-    const ordered = {};
-    if (packet.denom)
-        ordered.denom = packet.denom;
-    if (packet.amount)
-        ordered.amount = packet.amount;
-    if (packet.sender)
-        ordered.sender = packet.sender;
-    if (packet.receiver)
-        ordered.receiver = packet.receiver;
-    if (packet.memo)
-        ordered.memo = packet.memo;
-    return JSON.stringify(ordered);
 }
 function convertStringToHex(value) {
     if (!value) {

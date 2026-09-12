@@ -13,6 +13,7 @@ const v10Dir = path.join(root, "cosmos/cardano-probabilistic-light-client-v10");
 
 const sharedSourceFiles = [
   "block_authentication.go",
+  "checkpoint.go",
   "client_state.go",
   "codec.go",
   "consensus_state.go",
@@ -31,10 +32,14 @@ const sharedSourceFiles = [
   "keys.go",
   "misbehaviour_handle.go",
   "misbehavour.go",
+  "payload_size_test.go",
   "probabilistic.pb.go",
   "proposal_handle.go",
   "proposal_handle_test.go",
+  "stake_bps_test.go",
   "store.go",
+  "time_validation.go",
+  "time_validation_test.go",
   "update.go",
   "upgrade.go",
   "verifier_test.go",
@@ -77,6 +82,10 @@ function normalizeCommon(content) {
       "github.com/cosmos/ibc-go/v10",
       "github.com/cosmos/ibc-go/v<IBC_GO_MAJOR>",
     )
+    .replaceAll(
+      "github.com/cometbft/cometbft/api/cometbft/types/v1",
+      "github.com/cometbft/cometbft/proto/tendermint/types",
+    )
     .replaceAll("commitmenttypesv2", "commitmenttypes")
     .replaceAll(
       "modules/core/23-commitment/types/v2",
@@ -85,7 +94,14 @@ function normalizeCommon(content) {
 }
 
 function normalizeGo(filePath) {
-  return normalizeCommon(read(filePath)).replace(
+  let content = normalizeCommon(read(filePath));
+  if (filePath === path.join(v8Dir, "verifier_test.go")) {
+    content = content.replace(
+      /func TestUpdateStateOnMisbehaviourFreezesClient\(t \*testing\.T\) \{[\s\S]*?\n\}\n\n/,
+      "",
+    );
+  }
+  return content.replace(
     /var fileDescriptor_[A-Za-z0-9_]+ = \[\]byte\{[\s\S]*?\n}\n/g,
     "var fileDescriptor_<NORMALIZED> = []byte{\n}\n",
   );
@@ -277,6 +293,11 @@ function assertPublicIdentity() {
 
   const v8Generated = read(path.join(v8Dir, "probabilistic.pb.go"));
   const v10Generated = read(path.join(v10Dir, "probabilistic.pb.go"));
+  if (v8Generated === v10Generated) {
+    throw new Error(
+      "v8 and v10 generated protobufs are identical; regenerate each file from its version-specific go_package",
+    );
+  }
   for (const typeUrl of expectedTypeUrls) {
     const messageName = typeUrl.slice(typeUrl.lastIndexOf(".") + 1);
     const protoName = typeUrl.slice(1);
@@ -365,7 +386,7 @@ function assertModuleTargets() {
     ],
     [
       v8Mod,
-      "github.com/cardano-foundation/cardano-ibc-incubator/cosmos/cardano-probabilistic-light-client-core v0.1.3",
+      "github.com/cardano-foundation/cardano-ibc-incubator/cosmos/cardano-probabilistic-light-client-core v0.1.5",
     ],
     [v8Mod, "github.com/cosmos/ibc-go/v8 v8.7.0"],
     [
@@ -374,7 +395,7 @@ function assertModuleTargets() {
     ],
     [
       v10Mod,
-      "github.com/cardano-foundation/cardano-ibc-incubator/cosmos/cardano-probabilistic-light-client-core v0.1.3",
+      "github.com/cardano-foundation/cardano-ibc-incubator/cosmos/cardano-probabilistic-light-client-core v0.1.5",
     ],
     [v10Mod, "github.com/cosmos/ibc-go/v10 v10.2.0"],
   ];

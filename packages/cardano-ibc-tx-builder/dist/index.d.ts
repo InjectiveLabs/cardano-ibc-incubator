@@ -1,4 +1,6 @@
 import { TxBuilder, UTxO } from '@lucid-evolution/lucid';
+export * from './ics20-json-codec';
+export declare const MAX_PACKET_ENTRIES_PER_CHANNEL = 64;
 export type Height = {
     revisionNumber: bigint;
     revisionHeight: bigint;
@@ -21,6 +23,14 @@ export type SendPacketOperator = {
     timeoutTimestamp: bigint;
     memo: string;
 };
+export type Ics20PacketDataStringifier = (packetData: {
+    denom: string;
+    amount: string;
+    sender: string;
+    receiver: string;
+    memo?: string;
+}) => string;
+export declare const stringifyLegacyIcs20PacketData: Ics20PacketDataStringifier;
 export type Packet = {
     sequence: bigint;
     source_port: string;
@@ -36,6 +46,10 @@ export type ChannelDatumLike = {
     state: {
         next_sequence_send: bigint;
         packet_commitment: Map<bigint, string>;
+        packet_receipt: Map<bigint, string>;
+        packet_acknowledgement: Map<bigint, string>;
+        minimum_receive_proof_height: Height;
+        maximum_receive_proof_height: Height;
         channel: {
             connection_hops: string[];
             counterparty: {
@@ -67,24 +81,24 @@ export type LoadedSendPacketContext = {
         transferModuleAddress: string;
     };
 };
-export type HostStateUpdate = {
+export type HostStateUpdate<TreeCommit = () => void> = {
     hostStateUtxo: UTxO;
     encodedHostStateRedeemer: string;
     encodedUpdatedHostStateDatum: string;
     newRoot: string;
-    commit: () => void;
+    commit: TreeCommit;
 };
-export type PendingTreeUpdate = {
+export type PendingTreeUpdate<TreeCommit = () => void> = {
     expectedNewRoot: string;
-    commit: () => void;
+    commit: TreeCommit;
 };
 export type VoucherDenomTrace = {
     path: string;
     baseDenom: string;
 };
-export type SendPacketBuildResult = {
+export type SendPacketBuildResult<TreeCommit = () => void> = {
     unsignedTx: TxBuilder;
-    pendingTreeUpdate: PendingTreeUpdate;
+    pendingTreeUpdate: PendingTreeUpdate<TreeCommit>;
     walletOverride?: {
         address: string;
         utxos: UTxO[];
@@ -101,6 +115,8 @@ export type UnsignedSendPacketBurnTxInput = {
     encodedUpdatedChannelDatum: string;
     channelTokenUnit: string;
     encodedMintVoucherRedeemer: string;
+    encodedSpendTransferModuleRedeemer: string;
+    transferModuleReferenceUtxo: UTxO;
     transferAmount: bigint;
     constructedAddress: string;
     sendPacketPolicyId: string;
@@ -119,12 +135,13 @@ export type UnsignedSendPacketEscrowTxInput = {
     channelUTxO: UTxO;
     connectionUTxO: UTxO;
     clientUTxO: UTxO;
-    transferModuleReferenceUtxo?: UTxO;
+    transferModuleReferenceUtxo: UTxO;
     encodedSpendChannelRedeemer: string;
     encodedUpdatedChannelDatum: string;
     channelTokenUnit: string;
     encodedSpendTransferModuleRedeemer: string;
     encodedMintTransferEscrowShardRedeemer?: string;
+    encodedUpdatedTransferModuleDatum?: string;
     transferAmount: bigint;
     constructedAddress: string;
     sendPacketPolicyId: string;
@@ -139,25 +156,37 @@ export type UnsignedSendPacketEscrowTxInput = {
     encodedTransferEscrowDatum?: string;
     transferEscrowShardTokenUnit?: string;
 };
-export type SendPacketBuildDependencies = {
+export type TransferEscrowShardLookup = {
+    kind: 'existing';
+    transferModuleUtxo: UTxO;
+    utxo: UTxO;
+    encodedDatum: string;
+    shardTokenUnit: string;
+} | {
+    kind: 'missing';
+    transferModuleUtxo: UTxO;
+    encodedDatum: string;
+    shardTokenUnit: string;
+    registrySiblings: string[];
+    encodedUpdatedTransferModuleDatum: string;
+};
+export type SendPacketBuildDependencies<TreeCommit = () => void> = {
     loadContext: (sendPacketOperator: SendPacketOperator) => Promise<LoadedSendPacketContext>;
-    buildHostStateUpdate: (inputChannelDatum: ChannelDatumLike, outputChannelDatum: ChannelDatumLike, channelIdForRoot: string) => Promise<HostStateUpdate>;
+    buildHostStateUpdate: (inputChannelDatum: ChannelDatumLike, outputChannelDatum: ChannelDatumLike, channelIdForRoot: string) => Promise<HostStateUpdate<TreeCommit>>;
     resolveIbcDenomHash: (denomHash: string) => Promise<VoucherDenomTrace | null>;
     commitPacket: (packet: Packet) => string;
+    stringifyPacketData?: Ics20PacketDataStringifier;
     encode: (value: unknown, kind: string) => Promise<string>;
     findUtxoAtWithUnit: (address: string, unit: string) => Promise<UTxO>;
     tryFindUtxosAt: (address: string, options: {
         maxAttempts: number;
         retryDelayMs: number;
     }) => Promise<UTxO[]>;
-    findTransferEscrowShard: (channelId: string, packetDenom: string, denomToken: string, requiredAmount?: bigint) => Promise<{
-        utxo?: UTxO;
-        encodedDatum: string;
-        shardTokenUnit: string;
-    }>;
+    findTransferEscrowShard: (channelId: string, packetDenom: string, denomToken: string, requiredAmount?: bigint) => Promise<TransferEscrowShardLookup>;
     createUnsignedSendPacketBurnTx: (dto: UnsignedSendPacketBurnTxInput) => TxBuilder;
     createUnsignedSendPacketEscrowTx: (dto: UnsignedSendPacketEscrowTxInput) => TxBuilder;
     invalidArgument: (message: string) => Error;
+    failedPrecondition?: (message: string) => Error;
     internalError: (message: string) => Error;
 };
-export declare function buildUnsignedSendPacketTx(sendPacketOperator: SendPacketOperator, deps: SendPacketBuildDependencies): Promise<SendPacketBuildResult>;
+export declare function buildUnsignedSendPacketTx<TreeCommit = () => void>(sendPacketOperator: SendPacketOperator, deps: SendPacketBuildDependencies<TreeCommit>): Promise<SendPacketBuildResult<TreeCommit>>;

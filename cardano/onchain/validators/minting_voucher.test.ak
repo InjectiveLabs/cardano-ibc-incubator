@@ -1,4 +1,5 @@
 use aiken/builtin
+use aiken/collection/list
 use aiken/crypto
 use aiken/fuzz
 use aiken/primitive/bytearray
@@ -16,6 +17,7 @@ use ibc/apps/transfer/trace_registry.{
   Directory, InsertTrace, Shard, TraceRegistryDatum,
   TraceRegistryDirectoryBucket, TraceRegistryDirectoryDatum, TraceRegistryEntry,
   TraceRegistryRedeemer, TraceRegistryShardDatum, bucket_index_for_hash,
+  entry_is_admissible, max_archived_shards_per_bucket, max_entries_per_shard,
 }
 use ibc/apps/transfer/transfer_module_redeemer.{Transfer}
 use ibc/apps/transfer/types/coin as transfer_coin
@@ -25,14 +27,14 @@ use ibc/apps/transfer/voucher_metadata
 use ibc/auth.{AuthToken}
 use ibc/client/ics_007_tendermint_client/height.{Height}
 use ibc/core/ics_004/channel_redeemer.{
-  AcknowledgePacket, RecvPacket, SendPacket, TimeoutPacket,
+  AcknowledgePacket, RecvPacket, SendPacket, TimeoutOnClose, TimeoutPacket,
 }
 use ibc/core/ics_004/types/acknowledgement
 use ibc/core/ics_004/types/keys as channel_keys
 use ibc/core/ics_004/types/packet.{Packet}
 use ibc/core/ics_005/types/ibc_module_redeemer.{
-  Callback, OnAcknowledgementPacket, OnRecvPacket, OnTimeoutPacket, Operator,
-  TransferModuleData, TransferModuleOperator,
+  Callback, ModuleDataV1, ModuleOperatorV1, OnAcknowledgementPacket,
+  OnRecvPacket, OnTimeoutPacket, Operator,
 }
 use ibc/core/ics_023_vector_commitments/merkle.{MerkleProof}
 use ibc/core/ics_025_handler_interface/host_state.{host_state_token_name}
@@ -224,6 +226,22 @@ fn make_shard_reference_input_with_output_index(
   full_denom: ByteArray,
   output_index: Int,
 ) -> Input {
+  make_shard_reference_input_with_entries(
+    shard_policy_id,
+    shard_name,
+    bucket_index,
+    [TraceRegistryEntry { voucher_hash, full_denom }],
+    output_index,
+  )
+}
+
+fn make_shard_reference_input_with_entries(
+  shard_policy_id: PolicyId,
+  shard_name: ByteArray,
+  bucket_index: Int,
+  entries: List<TraceRegistryEntry>,
+  output_index: Int,
+) -> Input {
   Input {
     output_reference: OutputReference {
       transaction_id: #"27b9c5259b2a19052508957a025b5f150204027f1c6545fd886da6d281f6e926",
@@ -233,12 +251,7 @@ fn make_shard_reference_input_with_output_index(
       address: from_script("trace registry script hash"),
       value: from_asset(shard_policy_id, shard_name, 1),
       datum: InlineDatum(
-        Shard(
-          TraceRegistryShardDatum {
-            bucket_index,
-            entries: [TraceRegistryEntry { voucher_hash, full_denom }],
-          },
-        ),
+        Shard(TraceRegistryShardDatum { bucket_index, entries }),
       ),
       reference_script: None,
     },
@@ -318,6 +331,28 @@ fn make_metadata_output_with_datum(
     value: from_asset(voucher_policy_id, reference_token_name, 1),
     datum: InlineDatum(metadata_datum),
     reference_script: None,
+  }
+}
+
+fn make_metadata_reference_input(
+  voucher_metadata_script_hash: crypto.ScriptHash,
+  full_denom: ByteArray,
+  voucher_policy_id: PolicyId,
+  voucher_token_name: ByteArray,
+  reference_token_name: ByteArray,
+) -> Input {
+  Input {
+    output_reference: OutputReference {
+      transaction_id: #"47b9c5259b2a19052508957a025b5f150204027f1c6545fd886da6d281f6e926",
+      output_index: 0,
+    },
+    output: make_metadata_output(
+      voucher_metadata_script_hash,
+      full_denom,
+      voucher_policy_id,
+      voucher_token_name,
+      reference_token_name,
+    ),
   }
 }
 
@@ -467,8 +502,9 @@ fn first_seen_voucher_fixture(
     Callback(
       OnRecvPacket {
         channel_id: packet_dest_channel,
+        packet_data: fungible_token_packet_data.get_bytes(ftpd),
         acknowledgement: acknowledgement.new_result_acknowledgement(#[1]),
-        data: TransferModuleData(ftpd),
+        data: ModuleDataV1(ftpd),
       },
     )
   let spend_channel_redeemer_in_data: Redeemer = channel_redeemer
@@ -660,14 +696,14 @@ test prop_voucher_first_mint_policy_accepts_valid_metadata(_seed via fuzz.int())
     fuzz_dsl.no_mutation(),
   )
     |> run_first_seen_voucher_mint_transition
-    |> fuzz_dsl.assert_protocol_valid
+    |> fuzz_dsl.assert_protocol_checks_accept
 }
 
 test prop_tx_first_seen_voucher_mint_couples_registry_append(
   _seed via fuzz.int(),
 ) {
-  fuzz.label(@"regression.tx.voucher.first_mint.valid_registry_coupled")
-  fuzz.label(@"regression.tx.packet.recv.valid_sink_mints_voucher")
+  fuzz.label(@"regression.contract.voucher.first_mint.valid_registry_coupled")
+  fuzz.label(@"regression.contract.packet.recv.valid_sink_mints_voucher")
 
   // tx.* depth: voucher mint and trace-registry append are checked together so
   // metadata cannot be minted without the matching denom trace entry.
@@ -676,14 +712,14 @@ test prop_tx_first_seen_voucher_mint_couples_registry_append(
     fuzz_dsl.no_mutation(),
   )
     |> run_first_seen_voucher_mint_tx
-    |> fuzz_dsl.assert_protocol_valid
+    |> fuzz_dsl.assert_protocol_checks_accept
 }
 
 test prop_tx_first_seen_voucher_mint_rejects_wrong_metadata_registry_coupled(
   _seed via fuzz.int(),
 ) {
   fuzz.label(
-    @"regression.tx.voucher.first_mint.invalid_wrong_metadata_registry_coupled",
+    @"regression.contract.voucher.first_mint.invalid_wrong_metadata_registry_coupled",
   )
 
   // The trace-registry append still matches the minted denom, but the CIP-68
@@ -714,7 +750,7 @@ test prop_tx_first_seen_voucher_mint_rejects_wrong_metadata_registry_coupled(
     fuzz_dsl.mutation("wrong_metadata_registry_coupled"),
   )
     |> run_first_seen_voucher_mint_tx
-    |> fuzz_dsl.assert_protocol_rejected
+    |> fuzz_dsl.assert_protocol_checks_reject
 }
 
 test prop_voucher_first_mint_policy_rejects_wrong_name(_seed via fuzz.int()) {
@@ -745,7 +781,7 @@ test prop_voucher_first_mint_policy_rejects_wrong_name(_seed via fuzz.int()) {
     fuzz_dsl.mutation("wrong_name"),
   )
     |> run_first_seen_voucher_mint_transition
-    |> fuzz_dsl.assert_protocol_rejected
+    |> fuzz_dsl.assert_protocol_checks_reject
 }
 
 test prop_voucher_first_mint_policy_rejects_wrong_ticker(_seed via fuzz.int()) {
@@ -777,7 +813,7 @@ test prop_voucher_first_mint_policy_rejects_wrong_ticker(_seed via fuzz.int()) {
     fuzz_dsl.mutation("wrong_ticker"),
   )
     |> run_first_seen_voucher_mint_transition
-    |> fuzz_dsl.assert_protocol_rejected
+    |> fuzz_dsl.assert_protocol_checks_reject
 }
 
 test prop_voucher_first_mint_policy_rejects_wrong_description(
@@ -813,7 +849,7 @@ test prop_voucher_first_mint_policy_rejects_wrong_description(
     fuzz_dsl.mutation("wrong_description"),
   )
     |> run_first_seen_voucher_mint_transition
-    |> fuzz_dsl.assert_protocol_rejected
+    |> fuzz_dsl.assert_protocol_checks_reject
 }
 
 test prop_voucher_first_mint_policy_rejects_wrong_full_denom(
@@ -849,7 +885,7 @@ test prop_voucher_first_mint_policy_rejects_wrong_full_denom(
     fuzz_dsl.mutation("wrong_full_denom"),
   )
     |> run_first_seen_voucher_mint_transition
-    |> fuzz_dsl.assert_protocol_rejected
+    |> fuzz_dsl.assert_protocol_checks_reject
 }
 
 test prop_voucher_first_mint_policy_rejects_wrong_policy(_seed via fuzz.int()) {
@@ -880,7 +916,7 @@ test prop_voucher_first_mint_policy_rejects_wrong_policy(_seed via fuzz.int()) {
     fuzz_dsl.mutation("wrong_policy"),
   )
     |> run_first_seen_voucher_mint_transition
-    |> fuzz_dsl.assert_protocol_rejected
+    |> fuzz_dsl.assert_protocol_checks_reject
 }
 
 test prop_voucher_first_mint_policy_rejects_wrong_reference_asset(
@@ -913,10 +949,141 @@ test prop_voucher_first_mint_policy_rejects_wrong_reference_asset(
     fuzz_dsl.mutation("wrong_reference_asset"),
   )
     |> run_first_seen_voucher_mint_transition
-    |> fuzz_dsl.assert_protocol_rejected
+    |> fuzz_dsl.assert_protocol_checks_reject
 }
 
-test test_mint_voucher() {
+fn mint_voucher_succeeds(
+  memo: ByteArray,
+  authenticated_packet_data: ByteArray,
+  expected_packet_bytes: Int,
+) -> Bool {
+  mint_voucher_succeeds_with_archive_profile(
+    memo,
+    authenticated_packet_data,
+    expected_packet_bytes,
+    NoArchiveHistory,
+  )
+}
+
+type VoucherArchiveProfile {
+  NoArchiveHistory
+  ArchivesAtEntryLimit
+  ArchivesNearByteLimit
+}
+
+const near_byte_limit_entries_per_shard = 10
+
+fn maximum_archive_names() -> List<ByteArray> {
+  let names =
+    [
+      "archive-0", "archive-1", "archive-2", "archive-3", "archive-4",
+      "archive-5", "archive-6", "archive-7",
+    ]
+  expect list.length(names) == max_archived_shards_per_bucket
+  names
+}
+
+fn short_archive_decoy_entry() -> TraceRegistryEntry {
+  TraceRegistryEntry {
+    voucher_hash: #"3a136c94898983c5024f7899ffad2c26221506aca6b2d1dea403d706",
+    full_denom: "u7",
+  }
+}
+
+fn near_byte_limit_archive_decoy_entry() -> TraceRegistryEntry {
+  TraceRegistryEntry {
+    voucher_hash: #"30d60a79fc0499ac2540f2d4c6a23019a0a032ed9da1c6d5d919bb9c",
+    full_denom: "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxe",
+  }
+}
+
+test archive_decoy_entries_are_admissible_and_match_target_bucket() {
+  let target_hash =
+    voucher_asset_name.voucher_denom_hash("port-99/channel-99/ibc/usdt")
+  let short_decoy = short_archive_decoy_entry()
+  let near_byte_limit_decoy = near_byte_limit_archive_decoy_entry()
+
+  and {
+    entry_is_admissible(short_decoy),
+    entry_is_admissible(near_byte_limit_decoy),
+    short_decoy.voucher_hash != target_hash,
+    near_byte_limit_decoy.voucher_hash != target_hash,
+    bucket_index_for_hash(short_decoy.voucher_hash) == bucket_index_for_hash(
+      target_hash,
+    ),
+    bucket_index_for_hash(near_byte_limit_decoy.voucher_hash) == bucket_index_for_hash(
+      target_hash,
+    ),
+  }
+}
+
+fn maximum_archive_reference_inputs(
+  shard_policy_id: PolicyId,
+  bucket_index: Int,
+  shard_names: List<ByteArray>,
+  entries_per_shard: Int,
+  decoy_entry: TraceRegistryEntry,
+) -> List<Input> {
+  shard_names
+    |> list.indexed_map(
+        fn(index, shard_name) {
+          // Mirror the trace-registry capacity fixtures: repeating one
+          // individually admissible, same-bucket decoy isolates the bounded
+          // entry/byte scan workload. It does not model a reachable set of
+          // duplicate mappings.
+          make_shard_reference_input_with_entries(
+            shard_policy_id,
+            shard_name,
+            bucket_index,
+            list.repeat(decoy_entry, entries_per_shard),
+            index + 10,
+          )
+        },
+      )
+}
+
+fn archive_history(
+  profile: VoucherArchiveProfile,
+  shard_policy_id: PolicyId,
+  bucket_index: Int,
+) -> (List<ByteArray>, List<Input>) {
+  when profile is {
+    NoArchiveHistory -> ([], [])
+    ArchivesAtEntryLimit -> {
+      let shard_names = maximum_archive_names()
+      (
+        shard_names,
+        maximum_archive_reference_inputs(
+          shard_policy_id,
+          bucket_index,
+          shard_names,
+          max_entries_per_shard,
+          short_archive_decoy_entry(),
+        ),
+      )
+    }
+    ArchivesNearByteLimit -> {
+      let shard_names = maximum_archive_names()
+      (
+        shard_names,
+        maximum_archive_reference_inputs(
+          shard_policy_id,
+          bucket_index,
+          shard_names,
+          near_byte_limit_entries_per_shard,
+          near_byte_limit_archive_decoy_entry(),
+        ),
+      )
+    }
+  }
+}
+
+fn mint_voucher_succeeds_with_archive_profile(
+  memo: ByteArray,
+  authenticated_packet_data: ByteArray,
+  expected_packet_bytes: Int,
+  archive_profile: VoucherArchiveProfile,
+) -> Bool {
   let mock_data = prepare_mock_data()
 
   let packet_source_port = "transfer"
@@ -935,8 +1102,9 @@ test test_mint_voucher() {
       amount: string.from_int(transfer_amount) |> string.to_bytearray(),
       sender: "cosmos sender address",
       receiver,
-      memo: "",
+      memo,
     }
+  expect bytearray.length(authenticated_packet_data) == expected_packet_bytes
 
   let mint_voucher_redeemer =
     MintVoucher {
@@ -947,12 +1115,13 @@ test test_mint_voucher() {
       data: ftpd,
     }
 
-  let packet_data = TransferModuleData(ftpd)
+  let packet_data = ModuleDataV1(ftpd)
 
   let spend_module_redeemer =
     Callback(
       OnRecvPacket {
         channel_id: packet_dest_channel,
+        packet_data: authenticated_packet_data,
         acknowledgement: acknowledgement.new_result_acknowledgement(#[1]),
         data: packet_data,
       },
@@ -974,11 +1143,18 @@ test test_mint_voucher() {
     )
   let bucket_index = bucket_index_for_hash(voucher_denom_hash)
   let active_shard_name = "active-shard-0a"
+  let (archived_shard_names, archived_shard_reference_inputs) =
+    archive_history(
+      archive_profile,
+      mock_data.directory_auth_token.policy_id,
+      bucket_index,
+    )
   let directory_input =
-    make_directory_input(
+    make_directory_input_with_archived(
       mock_data.directory_auth_token,
       bucket_index,
       active_shard_name,
+      archived_shard_names,
     )
   let active_shard_input =
     make_shard_spend_input(
@@ -999,7 +1175,7 @@ test test_mint_voucher() {
         packet_source_channel,
         packet_dest_port,
         packet_dest_channel,
-        fungible_token_packet_data.get_bytes(ftpd),
+        authenticated_packet_data,
       ),
       proof_commitment: mock_proof(),
       proof_height: Height { revision_number: 1, revision_height: 1 },
@@ -1062,7 +1238,7 @@ test test_mint_voucher() {
     Transaction {
       ..transaction.placeholder,
       inputs: [mock_data.module_input, channel_input, active_shard_input],
-      reference_inputs: [directory_input],
+      reference_inputs: [directory_input, ..archived_shard_reference_inputs],
       outputs: [voucher_output, metadata_output],
       redeemers,
       mint,
@@ -1077,6 +1253,90 @@ test test_mint_voucher() {
     mint_voucher_redeemer,
     mock_data.voucher_minting_policy_id,
     transaction,
+  )
+}
+
+test test_mint_voucher() {
+  mint_voucher_succeeds(
+    "",
+    #"7b22616d6f756e74223a22313030222c2264656e6f6d223a226962632f75736474222c227265636569766572223a223532356636653262306638613135613363393564383263383131336239396466656266653430663132346362326263373165653939653232222c2273656e646572223a22636f736d6f732073656e6465722061646472657373227d",
+    138,
+  )
+}
+
+test test_mint_voucher_maximum_ics20_packet() {
+  // The lowercase long control makes the ibc-rs candidate build and reject its
+  // uppercase form before the v10 candidate succeeds.
+  let (memo, authenticated_packet_data) = maximum_v10_ics20_packet()
+  mint_voucher_succeeds(
+    memo,
+    authenticated_packet_data,
+    fungible_token_packet_data.max_packet_bytes,
+  )
+}
+
+test test_mint_voucher_maximum_v8_ics20_packet() {
+  // A single HTML-safe escape keeps the raw memo long and makes the Cardano
+  // candidate fail before the v8 candidate succeeds.
+  let (memo, authenticated_packet_data) = maximum_v8_ics20_packet()
+  mint_voucher_succeeds(
+    memo,
+    authenticated_packet_data,
+    fungible_token_packet_data.max_packet_bytes,
+  )
+}
+
+fn maximum_v10_ics20_packet() -> (ByteArray, ByteArray) {
+  (
+    #"0b61616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161",
+    #"7b2264656e6f6d223a226962632f75736474222c22616d6f756e74223a22313030222c2273656e646572223a22636f736d6f732073656e6465722061646472657373222c227265636569766572223a223532356636653262306638613135613363393564383263383131336239396466656266653430663132346362326263373165653939653232222c226d656d6f223a225c753030306261616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161227d",
+  )
+}
+
+fn maximum_v8_ics20_packet() -> (ByteArray, ByteArray) {
+  (
+    #"3c61616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161",
+    #"7b22616d6f756e74223a22313030222c2264656e6f6d223a226962632f75736474222c226d656d6f223a225c753030336361616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161222c227265636569766572223a223532356636653262306638613135613363393564383263383131336239396466656266653430663132346362326263373165653939653232222c2273656e646572223a22636f736d6f732073656e6465722061646472657373227d",
+  )
+}
+
+test test_mint_voucher_maximum_v10_ics20_packet_with_eight_archives_at_entry_limit() {
+  let (memo, authenticated_packet_data) = maximum_v10_ics20_packet()
+  mint_voucher_succeeds_with_archive_profile(
+    memo,
+    authenticated_packet_data,
+    fungible_token_packet_data.max_packet_bytes,
+    ArchivesAtEntryLimit,
+  )
+}
+
+test test_mint_voucher_maximum_v10_ics20_packet_with_eight_archives_near_byte_limit() {
+  let (memo, authenticated_packet_data) = maximum_v10_ics20_packet()
+  mint_voucher_succeeds_with_archive_profile(
+    memo,
+    authenticated_packet_data,
+    fungible_token_packet_data.max_packet_bytes,
+    ArchivesNearByteLimit,
+  )
+}
+
+test test_mint_voucher_maximum_v8_ics20_packet_with_eight_archives_at_entry_limit() {
+  let (memo, authenticated_packet_data) = maximum_v8_ics20_packet()
+  mint_voucher_succeeds_with_archive_profile(
+    memo,
+    authenticated_packet_data,
+    fungible_token_packet_data.max_packet_bytes,
+    ArchivesAtEntryLimit,
+  )
+}
+
+test test_mint_voucher_maximum_v8_ics20_packet_with_eight_archives_near_byte_limit() {
+  let (memo, authenticated_packet_data) = maximum_v8_ics20_packet()
+  mint_voucher_succeeds_with_archive_profile(
+    memo,
+    authenticated_packet_data,
+    fungible_token_packet_data.max_packet_bytes,
+    ArchivesNearByteLimit,
   )
 }
 
@@ -1112,8 +1372,9 @@ test test_mint_voucher_fails_with_wrong_mint_quantity() fail {
     Callback(
       OnRecvPacket {
         channel_id: packet_dest_channel,
+        packet_data: fungible_token_packet_data.get_bytes(ftpd),
         acknowledgement: acknowledgement.new_result_acknowledgement(#[1]),
-        data: TransferModuleData(ftpd),
+        data: ModuleDataV1(ftpd),
       },
     )
   let purpose = Mint(mock_data.voucher_minting_policy_id)
@@ -1264,12 +1525,13 @@ test test_mint_voucher_fails_with_noncanonical_metadata_datum() fail {
       data: ftpd,
     }
 
-  let packet_data = TransferModuleData(ftpd)
+  let packet_data = ModuleDataV1(ftpd)
 
   let spend_module_redeemer =
     Callback(
       OnRecvPacket {
         channel_id: packet_dest_channel,
+        packet_data: fungible_token_packet_data.get_bytes(ftpd),
         acknowledgement: acknowledgement.new_result_acknowledgement(#[1]),
         data: packet_data,
       },
@@ -1458,8 +1720,9 @@ test test_mint_voucher_fails_without_trace_registry_witness() fail {
     Callback(
       OnRecvPacket {
         channel_id: packet_dest_channel,
+        packet_data: fungible_token_packet_data.get_bytes(ftpd),
         acknowledgement: acknowledgement.new_result_acknowledgement(#[1]),
-        data: TransferModuleData(ftpd),
+        data: ModuleDataV1(ftpd),
       },
     )
 
@@ -1533,7 +1796,7 @@ test test_burn_voucher() {
 
   let spend_module_redeemer =
     Operator(
-      TransferModuleOperator(
+      ModuleOperatorV1(
         Transfer { channel_id: packet_source_channel, data: packet_data },
       ),
     )
@@ -1620,7 +1883,7 @@ test test_burn_voucher_fails_with_wrong_burn_quantity() fail {
     BurnVoucher { packet_source_port, packet_source_channel, data: packet_data }
   let spend_module_redeemer =
     Operator(
-      TransferModuleOperator(
+      ModuleOperatorV1(
         Transfer { channel_id: packet_source_channel, data: packet_data },
       ),
     )
@@ -1682,7 +1945,7 @@ test test_burn_voucher_fails_with_wrong_burn_quantity() fail {
   )
 }
 
-test test_refund_voucher() {
+fn check_refund_voucher(use_timeout_on_close: Bool) {
   let mock_data = prepare_mock_data()
 
   let packet_source_port = "port-99"
@@ -1710,21 +1973,17 @@ test test_refund_voucher() {
     voucher_asset_name.voucher_user_token_name_from_denom_hash(
       voucher_denom_hash,
     )
-  let bucket_index = bucket_index_for_hash(voucher_denom_hash)
-  let active_shard_name = "active-shard-0f"
-  let directory_input =
-    make_directory_input(
-      mock_data.directory_auth_token,
-      bucket_index,
-      active_shard_name,
-    )
-  let shard_reference_input =
-    make_shard_reference_input(
-      mock_data.directory_auth_token.policy_id,
-      active_shard_name,
-      bucket_index,
+  let reference_token_name =
+    voucher_asset_name.voucher_reference_token_name_from_denom_hash(
       voucher_denom_hash,
+    )
+  let metadata_reference_input =
+    make_metadata_reference_input(
+      mock_data.voucher_metadata_script_hash,
       ftpd.denom,
+      mock_data.voucher_minting_policy_id,
+      token_name,
+      reference_token_name,
     )
 
   expect Some(sender_public_key_hash) = string_utils.hex_string_to_bytes(sender)
@@ -1742,7 +2001,8 @@ test test_refund_voucher() {
     Callback(
       OnTimeoutPacket {
         channel_id: packet_source_channel,
-        data: TransferModuleData(ftpd),
+        packet_data: fungible_token_packet_data.get_bytes(ftpd),
+        data: ModuleDataV1(ftpd),
       },
     )
   let channel_input =
@@ -1751,18 +2011,30 @@ test test_refund_voucher() {
       mock_data.host_state_nft_policy_id,
       packet_source_channel,
     )
+  let packet =
+    make_packet(
+      packet_source_port,
+      packet_source_channel,
+      "transfer",
+      "channel-1",
+      fungible_token_packet_data.get_bytes(ftpd),
+    )
   let channel_redeemer =
-    TimeoutPacket {
-      packet: make_packet(
-        packet_source_port,
-        packet_source_channel,
-        "transfer",
-        "channel-1",
-        fungible_token_packet_data.get_bytes(ftpd),
-      ),
-      proof_unreceived: mock_proof(),
-      proof_height: Height { revision_number: 1, revision_height: 1 },
-      next_sequence_recv: 1,
+    if use_timeout_on_close {
+      TimeoutOnClose {
+        packet,
+        proof_unreceived: mock_proof(),
+        proof_close: mock_proof(),
+        proof_height: Height { revision_number: 1, revision_height: 1 },
+        next_sequence_recv: 1,
+      }
+    } else {
+      TimeoutPacket {
+        packet,
+        proof_unreceived: mock_proof(),
+        proof_height: Height { revision_number: 1, revision_height: 1 },
+        next_sequence_recv: 1,
+      }
     }
   let mint_voucher_redeemer_in_data: Redeemer = mint_voucher_redeemer
   let spend_module_redeemer_in_data: Redeemer = spend_module_redeemer
@@ -1772,7 +2044,7 @@ test test_refund_voucher() {
     Transaction {
       ..transaction.placeholder,
       inputs: [mock_data.module_input, channel_input],
-      reference_inputs: [directory_input, shard_reference_input],
+      reference_inputs: [metadata_reference_input],
       outputs: [
         Output {
           address: from_verification_key(sender_public_key_hash),
@@ -1810,6 +2082,14 @@ test test_refund_voucher() {
   )
 }
 
+test test_refund_voucher() {
+  check_refund_voucher(False)
+}
+
+test test_refund_voucher_on_close() {
+  check_refund_voucher(True)
+}
+
 test test_refund_voucher_fails_with_wrong_mint_quantity() fail {
   let mock_data = prepare_mock_data()
 
@@ -1838,21 +2118,17 @@ test test_refund_voucher_fails_with_wrong_mint_quantity() fail {
     voucher_asset_name.voucher_user_token_name_from_denom_hash(
       voucher_denom_hash,
     )
-  let bucket_index = bucket_index_for_hash(voucher_denom_hash)
-  let active_shard_name = "active-shard-0f"
-  let directory_input =
-    make_directory_input(
-      mock_data.directory_auth_token,
-      bucket_index,
-      active_shard_name,
-    )
-  let shard_reference_input =
-    make_shard_reference_input(
-      mock_data.directory_auth_token.policy_id,
-      active_shard_name,
-      bucket_index,
+  let reference_token_name =
+    voucher_asset_name.voucher_reference_token_name_from_denom_hash(
       voucher_denom_hash,
+    )
+  let metadata_reference_input =
+    make_metadata_reference_input(
+      mock_data.voucher_metadata_script_hash,
       ftpd.denom,
+      mock_data.voucher_minting_policy_id,
+      token_name,
+      reference_token_name,
     )
 
   expect Some(sender_public_key_hash) = string_utils.hex_string_to_bytes(sender)
@@ -1874,7 +2150,8 @@ test test_refund_voucher_fails_with_wrong_mint_quantity() fail {
     Callback(
       OnTimeoutPacket {
         channel_id: packet_source_channel,
-        data: TransferModuleData(ftpd),
+        packet_data: fungible_token_packet_data.get_bytes(ftpd),
+        data: ModuleDataV1(ftpd),
       },
     )
   let channel_input =
@@ -1904,7 +2181,7 @@ test test_refund_voucher_fails_with_wrong_mint_quantity() fail {
     Transaction {
       ..transaction.placeholder,
       inputs: [mock_data.module_input, channel_input],
-      reference_inputs: [directory_input, shard_reference_input],
+      reference_inputs: [metadata_reference_input],
       outputs: [
         Output {
           address: from_verification_key(sender_public_key_hash),
@@ -1942,7 +2219,7 @@ test test_refund_voucher_fails_with_wrong_mint_quantity() fail {
   )
 }
 
-test test_refund_voucher_fails_when_hash_is_duplicated_in_archived_shard() fail {
+test test_refund_voucher_fails_with_wrong_metadata_mapping() fail {
   let mock_data = prepare_mock_data()
 
   let packet_source_port = "port-99"
@@ -1970,33 +2247,17 @@ test test_refund_voucher_fails_when_hash_is_duplicated_in_archived_shard() fail 
     voucher_asset_name.voucher_user_token_name_from_denom_hash(
       voucher_denom_hash,
     )
-  let bucket_index = bucket_index_for_hash(voucher_denom_hash)
-  let active_shard_name = "active-shard-0f"
-  let archived_shard_name = "archived-shard-0f"
-  let directory_input =
-    make_directory_input_with_archived(
-      mock_data.directory_auth_token,
-      bucket_index,
-      active_shard_name,
-      [archived_shard_name],
-    )
-  let active_shard_reference_input =
-    make_shard_reference_input_with_output_index(
-      mock_data.directory_auth_token.policy_id,
-      active_shard_name,
-      bucket_index,
+  let reference_token_name =
+    voucher_asset_name.voucher_reference_token_name_from_denom_hash(
       voucher_denom_hash,
-      ftpd.denom,
-      1,
     )
-  let archived_duplicate_reference_input =
-    make_shard_reference_input_with_output_index(
-      mock_data.directory_auth_token.policy_id,
-      archived_shard_name,
-      bucket_index,
-      voucher_denom_hash,
-      ftpd.denom,
-      2,
+  let wrong_metadata_reference_input =
+    make_metadata_reference_input(
+      mock_data.voucher_metadata_script_hash,
+      "transfer/channel-0/not-the-voucher-denom",
+      mock_data.voucher_minting_policy_id,
+      token_name,
+      reference_token_name,
     )
 
   expect Some(sender_public_key_hash) = string_utils.hex_string_to_bytes(sender)
@@ -2014,7 +2275,8 @@ test test_refund_voucher_fails_when_hash_is_duplicated_in_archived_shard() fail 
     Callback(
       OnTimeoutPacket {
         channel_id: packet_source_channel,
-        data: TransferModuleData(ftpd),
+        packet_data: fungible_token_packet_data.get_bytes(ftpd),
+        data: ModuleDataV1(ftpd),
       },
     )
   let channel_input =
@@ -2044,10 +2306,7 @@ test test_refund_voucher_fails_when_hash_is_duplicated_in_archived_shard() fail 
     Transaction {
       ..transaction.placeholder,
       inputs: [mock_data.module_input, channel_input],
-      reference_inputs: [
-        directory_input, active_shard_reference_input,
-        archived_duplicate_reference_input,
-      ],
+      reference_inputs: [wrong_metadata_reference_input],
       outputs: [
         Output {
           address: from_verification_key(sender_public_key_hash),
@@ -2148,8 +2407,9 @@ test test_refund_voucher_fail() fail {
     Callback(
       OnAcknowledgementPacket {
         channel_id: packet_dest_channel,
+        packet_data: fungible_token_packet_data.get_bytes(ftpd),
         acknowledgement: success_ack,
-        data: TransferModuleData(ftpd),
+        data: ModuleDataV1(ftpd),
       },
     )
   let channel_input =

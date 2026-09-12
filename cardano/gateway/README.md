@@ -94,6 +94,10 @@ Related diagrams:
 
 The Gateway can expose a public bridge manifest at `GET /api/bridge-manifest` and the Cardano gRPC `Query/BridgeManifest` method. That manifest is the operator-facing bootstrap document for reconnecting another Gateway/relayer stack to the same deployed Cardano bridge, including the deployment timestamp, script hashes, reference UTxOs, modules, and auth tokens. At startup, the Gateway accepts either `HANDLER_JSON_PATH` or `BRIDGE_MANIFEST_PATH` and normalizes both sources into the same internal deployment config. If you already have a `handler.json`, you can export the equivalent public manifest with `npm run export:bridge-manifest -- <handler-json-path> <output-path>`.
 
+Manifest schema v4 adds the packet-history-prune reference validator and is intentionally incompatible with older deployments. The pruning replay floor and receive high-water mark extend `ChannelDatum`, so adopting v4 requires a fresh Cardano protocol deployment and new channels rather than reusing v2/v3 script UTxOs.
+
+The strict ICS-20 Classic JSON codec also changes the transfer-module and voucher-policy script hashes. New deployments publish `ics20_packet_codec: "ics20-classic-json-v1"`; older schema-v4 manifests without that field are treated as `legacy-cardano-json`. The Gateway uses this deployment capability for receive, send, acknowledgement, and timeout construction, so packets committed under legacy scripts can still settle after a Gateway upgrade. A deployment adopting the strict codec must publish a newly generated manifest, register the new transfer module, and open new channels against that deployment. Existing module registrations and channels remain tied to the script hashes with which they were created.
+
 ## Historical Backend
 
 The Gateway's historical Cardano reads now go through the Yaci-backed bridge history service.
@@ -126,11 +130,12 @@ So the runtime split is:
 
 Stake-weighted stability also needs a pool-age lookup because active pools can have registered long before a bridge
 deployment checkpoint. The Gateway first uses `bridge_pool_registration_cache`, then local Yaci registration tables, then
-the optional `CARDANO_POOL_REGISTRATION_HISTORY_ENDPOINT` for cache misses. Preprod defaults that endpoint to Koios so a
-checkpointed stack can resolve old pool registrations without replaying the full chain history.
+the optional `CARDANO_POOL_REGISTRATION_HISTORY_ENDPOINT` for cache misses. Preprod and preview default that endpoint to
+Koios so a checkpointed stack can resolve old pool registrations without replaying the full chain history.
 
 Stake-weighted stability uses Koios via `CARDANO_EPOCH_PARAMS_ENDPOINT` for epoch nonces because Demeter Ogmios
-endpoints consistently time out after 20 seconds on `queryLedgerState/nonces`.
+endpoints consistently time out after 20 seconds on `queryLedgerState/nonces`. If Koios rate limits the public tier, set
+`CARDANO_KOIOS_API_KEY` (or `KOIOS_API_KEY`) and Gateway will send it as `Authorization: Bearer <token>` on Koios calls.
 
 ## Installation
 
@@ -150,6 +155,47 @@ $ npm run start:dev
 # production mode
 $ npm run start:prod
 ```
+
+### Transaction diagnostics
+
+Detailed `evaluateTx`, `connectionOpenAck`, and `recvPacket` diagnostics are disabled by default.
+Set `GATEWAY_DEBUG_DIAGNOSTICS=true` to enable them while investigating a failure. Records may
+contain full transaction CBOR, additional UTxOs, packet data, and proofs, so treat them as private.
+
+The Gateway writes asynchronously to `diagnostic-0.json` through `diagnostic-7.json` in
+`cardano-ibc-gateway-diagnostics` under the OS temporary directory. Each file is at most 64 KiB
+and the same slots are reused after restarts, limiting retained diagnostics to 512 KiB.
+At most eight records can be queued or in flight. Extra records, oversized records, and write
+failures are dropped without failing the request. Recent records may be lost on shutdown.
+
+Set `GATEWAY_DEBUG_DIAGNOSTICS_DIR` to use another directory. The Gateway creates it with mode
+`0700` and writes files with mode `0600`. An existing directory must be owned by the Gateway
+user and have no group or other permissions. Use a separate directory for each Gateway process.
+
+### Securing the Hermes gRPC connection
+
+The default local stack publishes Gateway gRPC on host loopback and Hermes connects to
+`http://localhost:5001`. Hermes rejects plaintext Gateway URLs whose host is not a loopback
+address. A remote Gateway must therefore use an `https://` URL with a certificate whose name
+matches that URL.
+
+To terminate TLS in the Gateway itself, set both `GRPC_TLS_CERT_FILE` and
+`GRPC_TLS_KEY_FILE` to PEM files visible inside the Gateway process. Setting only one makes
+startup fail. Alternatively, terminate HTTP/2 TLS at a trusted gRPC-capable reverse proxy and
+keep the proxy-to-Gateway hop on an isolated network. Hermes uses native trust roots and can add
+a private CA with `gateway_tls_ca_file` in its Cardano chain configuration.
+
+Transaction-building and submission RPCs can additionally require a bearer token. Put the same
+non-empty token in files readable only by the Gateway and Hermes, then configure
+`GRPC_AUTH_TOKEN_FILE` for the Gateway and `gateway_auth_token_file` for Hermes. The token is
+client authentication and must be used with TLS whenever the connection is not loopback.
+
+Hermes submits signed transactions directly through its trusted Ogmios connection. After
+submission it calls `ibc.cardano.v1.CardanoMsg/ObserveTx` with only the canonical lowercase
+transaction hash. Gateway waits for exact transaction evidence in the historical backend,
+recomputes the confirmed transaction-body hash, verifies its HostState root against the exact
+pending update created while building that transaction, and only then commits the update and
+returns the inclusion height and events. Signed CBOR is not part of this RPC contract.
 
 ## Test
 

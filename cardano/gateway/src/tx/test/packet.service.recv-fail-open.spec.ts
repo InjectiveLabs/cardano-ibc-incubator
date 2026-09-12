@@ -1,3 +1,4 @@
+import { createTestTreeStore } from '../../shared/testing/ibc-tree-test-store';
 import { Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { convertString2Hex } from '@shared/helpers/hex';
@@ -94,10 +95,14 @@ describe('PacketService recv packet fail-open regression', () => {
       {} as DenomTraceService,
       {} as any,
       { executePacket: jest.fn() } as any,
+      createTestTreeStore(),
     );
   });
 
-  it('rejects malformed ICS-20 JSON instead of falling back to generic recv processing', async () => {
+  it.each([
+    ['malformed ICS-20 JSON', '{bad}'],
+    ['well-formed unsupported JSON', '{"query":"unsupported"}'],
+  ])('rejects %s instead of falling back to callback-free recv processing', async (_case, packetData) => {
     const fallbackUnsignedTx = { tag: 'fallback-non-ics20' };
 
     lucidServiceMock.createUnsignedRecvPacketTx.mockReturnValue(fallbackUnsignedTx);
@@ -127,6 +132,7 @@ describe('PacketService recv packet fail-open regression', () => {
           connection_hops: [convertString2Hex('connection-0')],
         },
         next_sequence_recv: 1n,
+        packet_commitment: new Map<bigint, string>(),
         packet_receipt: new Map<bigint, string>(),
         packet_acknowledgement: new Map<bigint, string>(),
       },
@@ -169,7 +175,7 @@ describe('PacketService recv packet fail-open regression', () => {
     const recvPacketOperator = {
       channelId: 'channel-1',
       packetSequence: 1n,
-      packetData: convertString2Hex('{bad}'),
+      packetData: convertString2Hex(packetData),
       proofCommitment: { proofs: [] },
       proofHeight,
       timeoutHeight: {
@@ -205,6 +211,7 @@ describe('PacketService recv packet fail-open regression', () => {
           connection_hops: [convertString2Hex('connection-0')],
         },
         next_sequence_recv: 1n,
+        packet_commitment: new Map<bigint, string>(),
         packet_receipt: new Map<bigint, string>(),
         packet_acknowledgement: new Map<bigint, string>(),
       },

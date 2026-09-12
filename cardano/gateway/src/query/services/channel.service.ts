@@ -9,7 +9,7 @@ import {
   QueryChannelsResponse,
   QueryConnectionChannelsRequest,
   QueryConnectionChannelsResponse,
-} from '@plus/proto-types/build/ibc/core/channel/v1/query';
+} from '@cardano-ibc/proto-types/build/ibc/core/channel/v1/query';
 import { decodePaginationKey, generatePaginationKey, getPaginationParams } from '../../shared/helpers/pagination';
 import { ChannelDatum, decodeChannelDatum } from '../../shared/types/channel/channel-datum';
 import {
@@ -19,7 +19,7 @@ import {
   State,
   orderFromJSON,
   stateFromJSON,
-} from '@plus/proto-types/build/ibc/core/channel/v1/channel';
+} from '@cardano-ibc/proto-types/build/ibc/core/channel/v1/channel';
 import { PaginationKeyDto } from '../dtos/pagination.dto';
 import { CHANNEL_ID_PREFIX, ORDER_MAPPING_CHANNEL, STATE_MAPPING_CHANNEL } from '../../constant/channel';
 import { convertHex2String } from '../../shared/helpers/hex';
@@ -27,14 +27,13 @@ import { validQueryChannelParam, validQueryConnectionChannelsParam } from '../he
 import { validPagination } from '../helpers/helper';
 import { MithrilService } from '~@/shared/modules/mithril/mithril.service';
 import { GrpcInternalException, GrpcInvalidArgumentException } from '~@/exception/grpc_exceptions';
-import { alignTreeWithChain, getCurrentTree, isTreeAligned } from '../../shared/helpers/ibc-state-root';
+import { IbcTreeStateStore } from '../../shared/helpers/ibc-state-root';
 import { serializeExistenceProof } from '../../shared/helpers/ics23-proof-serialization';
-import { HostStateDatum } from '../../shared/types/host-state-datum';
 import { AuthToken } from '../../shared/types/auth-token';
 import { CHANNEL_TOKEN_PREFIX } from '../../constant';
 import { getChannelIdByTokenName } from '../../shared/helpers/channel';
 import { HISTORY_SERVICE, HistoryService } from './history.service';
-import { resolveProofContextForQuery, resolveProofHeightForCurrentRoot } from './proof-context';
+import { assertProofContextHostState, resolveProofContextForQuery, resolveProofHeightForCurrentRoot } from './proof-context';
 import { IbcTreeCacheService } from '../../shared/services/ibc-tree-cache.service';
 import { ProofQueryOptions } from '../helpers/query-height';
 
@@ -61,24 +60,8 @@ export class ChannelService {
     @Inject(MithrilService) private mithrilService: MithrilService,
     @Inject(HISTORY_SERVICE) private historyService: HistoryService,
     @Inject(IbcTreeCacheService) private ibcTreeCacheService: IbcTreeCacheService,
+    private readonly ibcTreeStore: IbcTreeStateStore,
   ) {}
-
-  private async ensureTreeAligned(): Promise<void> {
-    const hostStateUtxo = await this.lucidService.findUtxoAtHostStateNFT();
-    if (!hostStateUtxo?.datum) {
-      throw new GrpcInternalException('IBC infrastructure error: HostState UTxO missing datum');
-    }
-
-    const hostStateDatum = await this.lucidService.decodeDatum<HostStateDatum>(hostStateUtxo.datum, 'host_state');
-    const onChainRoot = hostStateDatum.state.ibc_state_root;
-
-    if (isTreeAligned(onChainRoot)) return;
-
-    this.logger.warn(
-      `Tree out of sync with on-chain root ${onChainRoot.substring(0, 16)}..., rebuilding from chain...`,
-    );
-    await alignTreeWithChain();
-  }
 
   private async getProofHeight(): Promise<bigint> {
     return resolveProofHeightForCurrentRoot({
@@ -108,6 +91,7 @@ export class ChannelService {
       'stake-weighted-stability';
 
     return resolveProofContextForQuery({
+      ibcTreeStore: this.ibcTreeStore,
       logger: this.logger,
       lucidService: this.lucidService,
       mithrilService: this.mithrilService,
@@ -135,10 +119,7 @@ export class ChannelService {
 
   private async findChannelUtxo(channelTokenUnit: string) {
     const deploymentConfig = this.configService.get('deployment');
-    return this.lucidService.findUtxoAtWithUnit(
-      deploymentConfig.validators.spendChannel.address,
-      channelTokenUnit,
-    );
+    return this.lucidService.findUtxoAtWithUnit(deploymentConfig.validators.spendChannel.address, channelTokenUnit);
   }
 
   async getChannelHealth(channelId: string, expectedPortId = 'transfer'): Promise<CardanoChannelHealthResponse> {
@@ -185,16 +166,18 @@ export class ChannelService {
     };
   }
 
-  async queryChannels(request: QueryChannelsRequest): Promise<QueryChannelsResponse> {
-    this.logger.log('', 'queryChannels');
+  async listCurrentChannelEnds(
+    request: QueryChannelsRequest,
+  ): Promise<Pick<QueryChannelsResponse, 'channels' | 'pagination'>> {
+    this.logger.log('', 'listCurrentChannelEnds');
     const pagination = getPaginationParams(validPagination(request.pagination));
     const {
-      'pagination.key': key,
-      'pagination.limit': limit,
-      'pagination.count_total': count_total,
-      'pagination.reverse': reverse,
+      'pagination.key': key = '',
+      'pagination.limit': limit = '100',
+      'pagination.count_total': count_total = false,
+      'pagination.reverse': reverse = false,
     } = pagination;
-    let { 'pagination.offset': offset } = pagination;
+    let { 'pagination.offset': offset = '0' } = pagination;
     if (key) offset = decodePaginationKey(key);
 
     const {
@@ -246,7 +229,7 @@ export class ChannelService {
       }),
     );
 
-    const channelFilters = identifiedChannels.reduce((accumulator, currentValue) => {
+    const channelFilters = identifiedChannels.reduce<Record<string, IdentifiedChannel>>((accumulator, currentValue) => {
       const key = `${currentValue.channel_id}_${currentValue.port_id}`;
       if (!accumulator[key] || accumulator[key].state < currentValue.state) accumulator[key] = currentValue;
       return accumulator;
@@ -266,20 +249,27 @@ export class ChannelService {
       nextKey = to < Object.values(channelFilters).length ? generatePaginationKey(pageKeyDto) : '';
     }
 
-    const queryHeight = await this.getQueryHeight();
-    const response = {
+    return {
       channels: channels,
       pagination: {
         next_key: nextKey,
         total: count_total ? Object.values(channelFilters).length : 0,
       },
+    } as unknown as Pick<QueryChannelsResponse, 'channels' | 'pagination'>;
+  }
+
+  async queryChannels(request: QueryChannelsRequest): Promise<QueryChannelsResponse> {
+    this.logger.log('', 'queryChannels');
+    const channelEnds = await this.listCurrentChannelEnds(request);
+    const queryHeight = await this.getQueryHeight();
+
+    return {
+      ...channelEnds,
       height: {
-        revision_number: BigInt(0), // Cardano uses fixed revision 0; semantic height is Mithril snapshot block_number.
+        revision_number: BigInt(0), // Cardano uses revision 0; revision_height is an accepted anchor block number.
         revision_height: queryHeight,
       },
     } as unknown as QueryChannelsResponse;
-
-    return response;
   }
 
   async queryChannel(request: QueryChannelRequest, options: ProofQueryOptions = {}): Promise<QueryChannelResponse> {
@@ -289,20 +279,15 @@ export class ChannelService {
       const [mintChannelPolicyId, channelTokenName] = this.lucidService.getChannelTokenUnit(BigInt(channelId));
       const channelTokenUnit = mintChannelPolicyId + channelTokenName;
       const proofContext = await this.getProofContext('queryChannel', options.queryHeight);
-      const utxo = proofContext.historical
-        ? await this.historyService.findUtxoByUnitAtOrBeforeBlockNo(channelTokenUnit, proofContext.proofHeight)
-        : await this.findChannelUtxo(channelTokenUnit);
+      const utxo = await this.historyService.findUtxoByUnitAtOrBeforeBlockNo(channelTokenUnit, proofContext.proofHeight);
       const channelDatumDecoded: ChannelDatum = await decodeChannelDatum(utxo.datum!, this.lucidService.LucidImporter);
-
-      if (!proofContext.historical) {
-        await this.ensureTreeAligned();
-      }
 
       // Generate ICS-23 proof from the IBC state tree
       // Channel path: channelEnds/ports/{portId}/channels/{channelId}
       const portId = convertHex2String(channelDatumDecoded.port || 'transfer');
       const ibcPath = `channelEnds/ports/${portId}/channels/channel-${channelId}`;
-      const tree = proofContext.historical ? proofContext.tree : getCurrentTree();
+      await assertProofContextHostState(proofContext, this.historyService, this.lucidService);
+      const tree = proofContext.tree;
       let channelProof: Buffer;
       try {
         const existenceProof = tree.generateProof(ibcPath);
@@ -354,14 +339,14 @@ export class ChannelService {
   async queryConnectionChannels(request: QueryConnectionChannelsRequest): Promise<QueryConnectionChannelsResponse> {
     this.logger.log('queryConnectionChannels');
     const { connection: connectionId, pagination: paginationReq } = validQueryConnectionChannelsParam(request);
-    const pagination = getPaginationParams(paginationReq);
+    const pagination = getPaginationParams(validPagination(paginationReq));
     const {
-      'pagination.key': key,
-      'pagination.limit': limit,
-      'pagination.count_total': count_total,
-      'pagination.reverse': reverse,
+      'pagination.key': key = '',
+      'pagination.limit': limit = '100',
+      'pagination.count_total': count_total = false,
+      'pagination.reverse': reverse = false,
     } = pagination;
-    let { 'pagination.offset': offset } = pagination;
+    let { 'pagination.offset': offset = '0' } = pagination;
     if (key) offset = decodePaginationKey(key);
 
     const {
@@ -415,7 +400,7 @@ export class ChannelService {
 
     const channelFilters = identifiedChannels
       .filter((idChannel) => idChannel.connection_hops[0] === connectionId)
-      .reduce((accumulator, currentValue) => {
+      .reduce<Record<string, IdentifiedChannel>>((accumulator, currentValue) => {
         const key = `${currentValue.channel_id}_${currentValue.port_id}`;
         if (!accumulator[key] || accumulator[key].state < currentValue.state) accumulator[key] = currentValue;
         return accumulator;
@@ -443,7 +428,7 @@ export class ChannelService {
         total: count_total ? Object.values(channelFilters).length : 0,
       },
       height: {
-        revision_number: BigInt(0), // Cardano uses fixed revision 0; semantic height is Mithril snapshot block_number.
+        revision_number: BigInt(0), // Cardano uses revision 0; revision_height is an accepted anchor block number.
         revision_height: queryHeight,
       },
     } as unknown as QueryConnectionChannelsResponse;

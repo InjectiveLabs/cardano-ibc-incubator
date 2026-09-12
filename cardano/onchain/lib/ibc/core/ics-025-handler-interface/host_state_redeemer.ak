@@ -1,3 +1,5 @@
+use ibc/core/ics_025_handler_interface/host_state.{ModuleRegistration}
+
 pub type HostStateRedeemer {
   CreateClient {
     client_state_siblings: List<ByteArray>,
@@ -15,7 +17,10 @@ pub type HostStateRedeemer {
     next_sequence_ack_siblings: List<ByteArray>,
   }
   BindPort {
-    port: Int,
+    // Exact canonical IBC port identifier used in commitment paths.
+    port_id: ByteArray,
+    // Immutable module credential and capability tokens for this port.
+    registration: ModuleRegistration,
     // Sibling hashes for the `ports/{portId}` key update.
     port_siblings: List<ByteArray>,
   }
@@ -70,4 +75,8 @@ pub type HostStateRedeemer {
     grace_period_end: Int,
   }
   FinalizeShutdown
+  // Re-create the HostState UTxO without changing the IBC commitment. This
+  // provides one proof anchor per Cardano epoch when no ordinary IBC state
+  // transition occurs.
+  Heartbeat
 }

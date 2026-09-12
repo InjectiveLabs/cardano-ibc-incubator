@@ -31,6 +31,7 @@ type DeploymentSpendChannelValidator = DeploymentValidator & {
     chan_open_ack: DeploymentRefValidator;
     chan_open_confirm: DeploymentRefValidator;
     recv_packet: DeploymentRefValidator;
+    prune_packet_history: DeploymentRefValidator;
     send_packet: DeploymentRefValidator;
     timeout_packet: DeploymentRefValidator;
   };
@@ -52,11 +53,20 @@ type DeploymentTraceRegistry = {
   directory: DeploymentTraceRegistryShard;
 };
 
+export const ICS20_PACKET_CODEC = {
+  LEGACY: 'legacy-cardano-json',
+  STRICT: 'ics20-classic-json-v1',
+} as const;
+
+export type Ics20PacketCodec = (typeof ICS20_PACKET_CODEC)[keyof typeof ICS20_PACKET_CODEC];
+
 export type DeploymentConfig = {
   deployedAt: string;
+  ics20PacketCodec: Ics20PacketCodec;
   hostStateNFT: AuthToken;
   validators: {
     hostStateStt: DeploymentValidator;
+    recoverClient?: DeploymentValidator;
     spendClient: DeploymentValidator;
     spendConnection: DeploymentValidator;
     spendChannel: DeploymentSpendChannelValidator;
@@ -114,6 +124,7 @@ type BridgeManifestSpendChannelValidator = BridgeManifestValidator & {
     chan_open_ack: BridgeManifestRefValidator;
     chan_open_confirm: BridgeManifestRefValidator;
     recv_packet: BridgeManifestRefValidator;
+    prune_packet_history: BridgeManifestRefValidator;
     send_packet: BridgeManifestRefValidator;
     timeout_packet: BridgeManifestRefValidator;
   };
@@ -142,6 +153,7 @@ export type BridgeManifest = {
   schema_version: number;
   deployment_id: string;
   deployed_at: string;
+  ics20_packet_codec: Ics20PacketCodec;
   cardano: {
     chain_id: string;
     network_magic: number;
@@ -150,6 +162,7 @@ export type BridgeManifest = {
   host_state_nft: BridgeManifestAuthToken;
   validators: {
     host_state_stt: BridgeManifestValidator;
+    recover_client?: BridgeManifestValidator;
     spend_client: BridgeManifestValidator;
     spend_connection: BridgeManifestValidator;
     spend_channel: BridgeManifestSpendChannelValidator;
@@ -233,6 +246,14 @@ function requireIsoTimestamp(value: unknown, path: string): string {
   const timestamp = requireNonEmptyString(value, path);
   assert(!Number.isNaN(Date.parse(timestamp)), `Invalid bridge config: "${path}" must be an ISO-8601 timestamp`);
   return timestamp;
+}
+
+function requireIcs20PacketCodec(value: unknown, path: string): Ics20PacketCodec {
+  assert(
+    value === ICS20_PACKET_CODEC.LEGACY || value === ICS20_PACKET_CODEC.STRICT,
+    `Invalid bridge config: "${path}" must be "${ICS20_PACKET_CODEC.LEGACY}" or "${ICS20_PACKET_CODEC.STRICT}"`,
+  );
+  return value;
 }
 
 function requireRefUtxo(value: unknown, path: string): RefUtxo {
@@ -337,6 +358,10 @@ function requireDeploymentSpendChannelValidator(value: unknown, path: string): D
         `${path}.refValidator.chan_open_confirm`,
       ),
       recv_packet: requireDeploymentRefValidator(refValidator.recv_packet, `${path}.refValidator.recv_packet`),
+      prune_packet_history: requireDeploymentRefValidator(
+        refValidator.prune_packet_history,
+        `${path}.refValidator.prune_packet_history`,
+      ),
       send_packet: requireDeploymentRefValidator(refValidator.send_packet, `${path}.refValidator.send_packet`),
       timeout_packet: requireDeploymentRefValidator(refValidator.timeout_packet, `${path}.refValidator.timeout_packet`),
     },
@@ -365,6 +390,10 @@ function requireManifestSpendChannelValidator(value: unknown, path: string): Bri
         `${path}.ref_validator.chan_open_confirm`,
       ),
       recv_packet: requireManifestRefValidator(refValidator.recv_packet, `${path}.ref_validator.recv_packet`),
+      prune_packet_history: requireManifestRefValidator(
+        refValidator.prune_packet_history,
+        `${path}.ref_validator.prune_packet_history`,
+      ),
       send_packet: requireManifestRefValidator(refValidator.send_packet, `${path}.ref_validator.send_packet`),
       timeout_packet: requireManifestRefValidator(refValidator.timeout_packet, `${path}.ref_validator.timeout_packet`),
     },
@@ -533,6 +562,7 @@ function deploymentSpendChannelToManifest(validator: DeploymentSpendChannelValid
       chan_open_ack: deploymentRefValidatorToManifest(validator.refValidator.chan_open_ack),
       chan_open_confirm: deploymentRefValidatorToManifest(validator.refValidator.chan_open_confirm),
       recv_packet: deploymentRefValidatorToManifest(validator.refValidator.recv_packet),
+      prune_packet_history: deploymentRefValidatorToManifest(validator.refValidator.prune_packet_history),
       send_packet: deploymentRefValidatorToManifest(validator.refValidator.send_packet),
       timeout_packet: deploymentRefValidatorToManifest(validator.refValidator.timeout_packet),
     },
@@ -549,6 +579,7 @@ function manifestSpendChannelToDeployment(validator: BridgeManifestSpendChannelV
       chan_open_ack: manifestRefValidatorToDeployment(validator.ref_validator.chan_open_ack),
       chan_open_confirm: manifestRefValidatorToDeployment(validator.ref_validator.chan_open_confirm),
       recv_packet: manifestRefValidatorToDeployment(validator.ref_validator.recv_packet),
+      prune_packet_history: manifestRefValidatorToDeployment(validator.ref_validator.prune_packet_history),
       send_packet: manifestRefValidatorToDeployment(validator.ref_validator.send_packet),
       timeout_packet: manifestRefValidatorToDeployment(validator.ref_validator.timeout_packet),
     },
@@ -562,9 +593,19 @@ export function requireSttDeploymentConfig(deployment: unknown): DeploymentConfi
 
   return {
     deployedAt: requireIsoTimestamp(deploymentAny.deployedAt, 'deployedAt'),
+    // Handler files created before the codec capability existed describe the
+    // legacy validators. Defaulting them to legacy keeps their open packets
+    // settleable after a Gateway upgrade.
+    ics20PacketCodec:
+      deploymentAny.ics20PacketCodec === undefined
+        ? ICS20_PACKET_CODEC.LEGACY
+        : requireIcs20PacketCodec(deploymentAny.ics20PacketCodec, 'ics20PacketCodec'),
     hostStateNFT: requireAuthToken(deploymentAny.hostStateNFT, 'hostStateNFT'),
     validators: {
       hostStateStt: requireDeploymentValidator(validators.hostStateStt, 'validators.hostStateStt'),
+      ...(validators.recoverClient
+        ? { recoverClient: requireDeploymentValidator(validators.recoverClient, 'validators.recoverClient') }
+        : {}),
       spendClient: requireDeploymentValidator(validators.spendClient, 'validators.spendClient'),
       spendConnection: requireDeploymentValidator(validators.spendConnection, 'validators.spendConnection'),
       spendChannel: requireDeploymentSpendChannelValidator(validators.spendChannel, 'validators.spendChannel'),
@@ -613,13 +654,17 @@ export function normalizeHandlerJsonDeploymentConfig(
   return {
     deployment: normalizedDeployment,
     bridgeManifest: {
-      schema_version: 3,
+      schema_version: 4,
       deployment_id: buildDeploymentId(normalizedCardano, normalizedDeployment.hostStateNFT),
       deployed_at: normalizedDeployment.deployedAt,
+      ics20_packet_codec: normalizedDeployment.ics20PacketCodec,
       cardano: normalizedCardano,
       host_state_nft: deploymentAuthTokenToManifest(normalizedDeployment.hostStateNFT),
       validators: {
         host_state_stt: deploymentValidatorToManifest(normalizedDeployment.validators.hostStateStt),
+        ...(normalizedDeployment.validators.recoverClient
+          ? { recover_client: deploymentValidatorToManifest(normalizedDeployment.validators.recoverClient) }
+          : {}),
         spend_client: deploymentValidatorToManifest(normalizedDeployment.validators.spendClient),
         spend_connection: deploymentValidatorToManifest(normalizedDeployment.validators.spendConnection),
         spend_channel: deploymentSpendChannelToManifest(normalizedDeployment.validators.spendChannel),
@@ -672,10 +717,19 @@ export function normalizeBridgeManifestConfig(manifest: unknown): LoadedBridgeCo
     schema_version: requireNonNegativeInteger(manifestAny.schema_version, 'schema_version'),
     deployment_id: requireNonEmptyString(manifestAny.deployment_id, 'deployment_id'),
     deployed_at: requireIsoTimestamp(manifestAny.deployed_at, 'deployed_at'),
+    // Existing schema-v4 manifests predate this field and therefore refer to
+    // legacy validators. New manifests always emit the capability explicitly.
+    ics20_packet_codec:
+      manifestAny.ics20_packet_codec === undefined
+        ? ICS20_PACKET_CODEC.LEGACY
+        : requireIcs20PacketCodec(manifestAny.ics20_packet_codec, 'ics20_packet_codec'),
     cardano: requireCardanoIdentity(requireObject(manifestAny.cardano, 'cardano') as unknown as BridgeManifestCardanoIdentity),
     host_state_nft: requireManifestAuthToken(manifestAny.host_state_nft, 'host_state_nft'),
     validators: {
       host_state_stt: requireManifestValidator(validators.host_state_stt, 'validators.host_state_stt'),
+      ...(validators.recover_client
+        ? { recover_client: requireManifestValidator(validators.recover_client, 'validators.recover_client') }
+        : {}),
       spend_client: requireManifestValidator(validators.spend_client, 'validators.spend_client'),
       spend_connection: requireManifestValidator(validators.spend_connection, 'validators.spend_connection'),
       spend_channel: requireManifestSpendChannelValidator(validators.spend_channel, 'validators.spend_channel'),
@@ -717,17 +771,21 @@ export function normalizeBridgeManifestConfig(manifest: unknown): LoadedBridgeCo
   };
 
   assert(
-    bridgeManifest.schema_version === 2 || bridgeManifest.schema_version === 3,
-    'Invalid bridge config: "schema_version" must be 2 or 3',
+    bridgeManifest.schema_version === 4,
+    'Invalid bridge config: "schema_version" must be 4',
   );
 
   return {
     bridgeManifest,
     deployment: {
       deployedAt: bridgeManifest.deployed_at,
+      ics20PacketCodec: bridgeManifest.ics20_packet_codec,
       hostStateNFT: manifestAuthTokenToDeployment(bridgeManifest.host_state_nft),
       validators: {
         hostStateStt: manifestValidatorToDeployment(bridgeManifest.validators.host_state_stt),
+        ...(bridgeManifest.validators.recover_client
+          ? { recoverClient: manifestValidatorToDeployment(bridgeManifest.validators.recover_client) }
+          : {}),
         spendClient: manifestValidatorToDeployment(bridgeManifest.validators.spend_client),
         spendConnection: manifestValidatorToDeployment(bridgeManifest.validators.spend_connection),
         spendChannel: manifestSpendChannelToDeployment(bridgeManifest.validators.spend_channel),

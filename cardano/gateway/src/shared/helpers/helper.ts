@@ -84,48 +84,23 @@ export const deleteKeySortMap = <K, V>(inputMap: Map<K, V>, deleteKey: K): Map<K
   updatedMap.delete(deleteKey);
   return updatedMap;
 };
-export function sortedStringify(obj) {
+export function sortedStringify(obj: unknown): string | undefined {
   if (typeof obj !== 'object' || obj === null) {
     return JSON.stringify(obj);
   }
 
-  const sortedObj = {};
+  const sortedObj: Record<string, unknown> = {};
+  const record = obj as Record<string, unknown>;
   Object.keys(obj)
     .sort()
     .forEach((key) => {
-      sortedObj[key] = obj[key];
+      sortedObj[key] = record[key];
     });
 
   return JSON.stringify(sortedObj);
 }
 
-export function stringifyIcs20PacketData(packet: {
-  denom?: string;
-  amount?: string;
-  sender?: string;
-  receiver?: string;
-  memo?: string;
-}) {
-  const ordered: Record<string, string> = {};
-
-  if (packet.amount !== undefined && packet.amount !== '') {
-    ordered.amount = packet.amount;
-  }
-  if (packet.denom !== undefined && packet.denom !== '') {
-    ordered.denom = packet.denom;
-  }
-  if (packet.memo !== undefined && packet.memo !== '') {
-    ordered.memo = packet.memo;
-  }
-  if (packet.receiver !== undefined && packet.receiver !== '') {
-    ordered.receiver = packet.receiver;
-  }
-  if (packet.sender !== undefined && packet.sender !== '') {
-    ordered.sender = packet.sender;
-  }
-
-  return JSON.stringify(ordered);
-}
+export { stringifyIcs20PacketData } from '@cardano-ibc/tx-builder';
 
 export const prependToMap = <K, V>(map: Map<K, V>, key: K, val: V): Map<K, V> => {
   const newMap = new Map<K, V>([[key, val]]);

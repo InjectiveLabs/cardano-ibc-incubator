@@ -38,4 +38,16 @@ pub type SpendChannelRedeemer {
   SendPacket { packet: Packet }
   ChanCloseInit
   ChanCloseConfirm { proof_init: MerkleProof, proof_height: Height }
+  PrunePacketHistory {
+    sequence: Int,
+    proof_commitment_absence: MerkleProof,
+    proof_height: Height,
+  }
+  TimeoutOnClose {
+    packet: Packet,
+    proof_unreceived: MerkleProof,
+    proof_close: MerkleProof,
+    proof_height: Height,
+    next_sequence_recv: Int,
+  }
 }

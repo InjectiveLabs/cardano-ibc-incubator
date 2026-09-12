@@ -1,8 +1,6 @@
 use aiken/collection/pairs
 use cardano/assets.{PolicyId}
-use cardano/transaction.{
-  Mint, OutputReference, Redeemer, ScriptPurpose, Transaction,
-}
+use cardano/transaction.{Mint, Redeemer, ScriptPurpose, Transaction}
 use ibc/auth.{AuthToken}
 use ibc/client/ics_007_tendermint_client/client_datum.{
   ClientDatum, ClientDatumState,
@@ -38,21 +36,20 @@ validator chan_open_confirm(
   connection_minting_policy_id: PolicyId,
   port_minting_policy_id: PolicyId,
   verify_proof_policy_id: PolicyId,
+  host_state_nft_policy_id: PolicyId,
 ) {
-  spend(
-    _datum: Option<Data>,
-    channel_token: AuthToken,
-    _spent_output: OutputReference,
-    transaction: Transaction,
-  ) {
+  mint(channel_token: AuthToken, policy_id: PolicyId, transaction: Transaction) {
     let Transaction {
       inputs,
+      mint,
       outputs,
       redeemers,
       reference_inputs,
       validity_range,
       ..
     } = transaction
+
+    expect validator_utils.require_exact_marker_mint(mint, policy_id, "", 1)
 
     let (datum, channel_redeemer, spent_output) =
       validator_utils.extract_channel(inputs, redeemers, channel_token)
@@ -77,10 +74,11 @@ validator chan_open_confirm(
 
     trace @"chan_open_confirm: tx context extracted"
 
-    let connection_datum =
-      validator_utils.validate_referred_connection(
+    let (connection_datum, client_datum) =
+      validator_utils.validate_referred_connection_and_client(
         reference_inputs,
         datum.token.name,
+        client_minting_policy_id,
         connection_minting_policy_id,
         connection_id,
       )
@@ -95,13 +93,6 @@ validator chan_open_confirm(
         |> version_mod.verify_supported_feature(connection_version, _)
     trace @"chan_open_confirm: connection support channel ordering"
 
-    let client_datum =
-      validator_utils.validate_referred_client(
-        reference_inputs,
-        datum.token.name,
-        client_minting_policy_id,
-        connection_datum.state.client_id,
-      )
     trace @"chan_open_confirm: validator_utils.validate_referred_client"
 
     expect
@@ -129,9 +120,9 @@ validator chan_open_confirm(
       validator_utils.extract_module_redeemer(
         inputs,
         redeemers,
-        datum.token.name,
         port_minting_policy_id,
         datum.port_id,
+        host_state_nft_policy_id,
       )
     expect Callback(ibc_module_callback) = ibc_module_redeemer
     expect ibc_module_callback == OnChanOpenConfirm { channel_id }

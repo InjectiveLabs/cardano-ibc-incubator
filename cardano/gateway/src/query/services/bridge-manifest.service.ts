@@ -3,7 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { BridgeManifest } from '../../config/bridge-manifest';
 import {
   QueryBridgeManifestResponse,
-} from '@plus/proto-types/build/ibc/cardano/v1/query';
+} from '@cardano-ibc/proto-types/build/ibc/cardano/v1/query';
 
 @Injectable()
 export class BridgeManifestService {
@@ -36,6 +36,9 @@ export class BridgeManifestService {
         validators: {
           ...manifest.validators,
           host_state_stt: this.toGrpcValidator(manifest.validators.host_state_stt),
+          recover_client: manifest.validators.recover_client
+            ? this.toGrpcValidator(manifest.validators.recover_client)
+            : undefined,
           spend_client: this.toGrpcValidator(manifest.validators.spend_client),
           spend_connection: this.toGrpcValidator(manifest.validators.spend_connection),
           spend_channel: {
@@ -49,6 +52,9 @@ export class BridgeManifestService {
                 manifest.validators.spend_channel.ref_validator.chan_open_confirm,
               ),
               recv_packet: this.toGrpcRefValidator(manifest.validators.spend_channel.ref_validator.recv_packet),
+              prune_packet_history: this.toGrpcRefValidator(
+                manifest.validators.spend_channel.ref_validator.prune_packet_history,
+              ),
               send_packet: this.toGrpcRefValidator(manifest.validators.spend_channel.ref_validator.send_packet),
               timeout_packet: this.toGrpcRefValidator(manifest.validators.spend_channel.ref_validator.timeout_packet),
             },

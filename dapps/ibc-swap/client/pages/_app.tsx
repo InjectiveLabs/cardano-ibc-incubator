@@ -18,22 +18,29 @@ import {
 } from 'osmojs';
 import { useEffect, useMemo, useState } from 'react';
 
-import type { AppProps } from 'next/app';
+import App, {
+  type AppContext,
+  type AppInitialProps,
+  type AppProps,
+} from 'next/app';
 import { ChakraProvider } from '@chakra-ui/react';
 import { ChainProvider } from '@cosmos-kit/react';
+import type { SignerOptions } from '@cosmos-kit/core';
+import { wallets as cosmostationWallets } from '@cosmos-kit/cosmostation-extension';
+import { wallets as keplrWallets } from '@cosmos-kit/keplr-extension';
+import { wallets as leapWallets } from '@cosmos-kit/leap-extension';
 import { QueryClientProvider, QueryClient } from '@tanstack/react-query';
-import { SignerOptions, wallets } from 'cosmos-kit';
 import { MeshProvider } from '@meshsdk/react';
 import { manrope } from 'styles/font';
 import { theme } from 'styles/theme';
 import { Layout } from '@/components/common';
 import { CustomAppProvider } from '@/contexts';
-import { customChainassets, customChains } from '@/configs/customChainInfo';
-import { CosmosWalletModal } from '@/components/common/Header/CosmosWalletModal';
 import {
-  LOCAL_OSMOSIS_REST_ENDPOINT,
-  LOCAL_OSMOSIS_RPC_ENDPOINT,
-} from '@/configs/runtime';
+  cosmosEndpointOptions,
+  customChainassets,
+  customChains,
+} from '@/configs/customChainInfo';
+import { CosmosWalletModal } from '@/components/common/Header/CosmosWalletModal';
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -67,9 +74,9 @@ const isExtensionWallet = (wallet: any) => {
 };
 
 const extensionWallets = [
-  ...wallets.keplr.filter(isExtensionWallet),
-  ...wallets.leap.filter(isExtensionWallet),
-  ...wallets.cosmostation.filter(isExtensionWallet),
+  ...keplrWallets.filter(isExtensionWallet),
+  ...leapWallets.filter(isExtensionWallet),
+  ...cosmostationWallets.filter(isExtensionWallet),
 ];
 
 const getAvailableCosmosExtensionWallets = () => {
@@ -127,16 +134,6 @@ const getGasPrice = (chainId: string): string => {
     fixed_min_gas_price: 0.0025,
   };
   return `${fee?.fixed_min_gas_price}${fee?.denom}`;
-};
-
-const endpointOptions = {
-  endpoints: {
-    localosmosis: {
-      isLazy: true,
-      rpc: [LOCAL_OSMOSIS_RPC_ENDPOINT],
-      rest: [LOCAL_OSMOSIS_REST_ENDPOINT],
-    },
-  },
 };
 
 function MyApp({ Component, pageProps }: AppProps) {
@@ -206,8 +203,9 @@ function MyApp({ Component, pageProps }: AppProps) {
           chains={customChains as any}
           assetLists={customChainassets as any}
           wallets={availableCosmosWallets}
+          throwErrors={false}
           signerOptions={signerOptions}
-          endpointOptions={endpointOptions}
+          endpointOptions={cosmosEndpointOptions}
           walletModal={CosmosWalletModal}
         >
           <QueryClientProvider client={queryClient}>
@@ -227,5 +225,12 @@ function MyApp({ Component, pageProps }: AppProps) {
     </ChakraProvider>
   );
 }
+
+// Runtime chain identity is supplied when the container starts. Rendering
+// every page per request prevents build-time local defaults from being baked
+// into HTML that a Preview/Preprod browser would then try to hydrate.
+MyApp.getInitialProps = async (
+  appContext: AppContext,
+): Promise<AppInitialProps> => App.getInitialProps(appContext);
 
 export default MyApp;

@@ -9,8 +9,6 @@ use ibc/apps/transfer/escrow.{TransferModuleSpend}
 use ibc/apps/transfer/mint_voucher_redeemer.{MintVoucherRedeemer, RefundVoucher}
 use ibc/apps/transfer/types/coin as transfer_coin
 use ibc/apps/transfer/types/fungible_token_packet_data.{FungibleTokenPacketData}
-use ibc/apps/transfer/value_delta
-use ibc/core/ics_004/types/packet.{Packet}
 use ibc/utils/string as string_utils
 use ibc/utils/validator_utils
 
@@ -24,11 +22,12 @@ pub fn validate_refund_packet_token(
   shard_policy_id: PolicyId,
   mint: Value,
   data: FungibleTokenPacketData,
-  packet: Packet,
+  source_port: ByteArray,
+  source_channel: ByteArray,
 ) -> Bool {
   if transfer_coin.sender_chain_is_source(
-    packet.source_port,
-    packet.source_channel,
+    source_port,
+    source_channel,
     data.denom,
   ) {
     // Source-side packets locked native funds, so timeout/ack-error refunds
@@ -62,7 +61,7 @@ pub fn validate_refund_packet_token(
         spend,
         inputs,
         outputs,
-        transfer_escrow.transfer_escrow_datum(packet.source_channel, data.denom),
+        transfer_escrow.transfer_escrow_datum(source_channel, data.denom),
         shard_policy_id,
         mint,
         0 - transfer_amount,
@@ -78,43 +77,25 @@ pub fn validate_refund_packet_token(
 
     // Check the sender's balance delta across all outputs at their address; this
     // avoids relying on a particular output index or a single payout output.
+    let accumulate_receiver_token =
+      fn(acc: Int, output: Output) {
+        if output.address == receiver_address {
+          acc + quantity_of(
+            output.value,
+            escrowed_token_policy_id,
+            escrowed_token_name,
+          )
+        } else {
+          acc
+        }
+      }
     let prev_receiver_token =
       list.reduce(
         inputs,
         0,
-        fn(acc, input) {
-          let output = input.output
-          if output.address == receiver_address {
-            let output_token =
-              quantity_of(
-                output.value,
-                escrowed_token_policy_id,
-                escrowed_token_name,
-              )
-            acc + output_token
-          } else {
-            acc
-          }
-        },
+        fn(acc, input) { accumulate_receiver_token(acc, input.output) },
       )
-    let post_receiver_token =
-      list.reduce(
-        outputs,
-        0,
-        fn(acc, output) {
-          if output.address == receiver_address {
-            let output_token =
-              quantity_of(
-                output.value,
-                escrowed_token_policy_id,
-                escrowed_token_name,
-              )
-            acc + output_token
-          } else {
-            acc
-          }
-        },
-      )
+    let post_receiver_token = list.reduce(outputs, 0, accumulate_receiver_token)
     let receiver_delta = post_receiver_token - prev_receiver_token
     let correct_receiver_amount =
       if escrowed_token_unit == "lovelace" {
@@ -135,16 +116,10 @@ pub fn validate_refund_packet_token(
       mint_voucher_redeemer
     trace @"mint_voucher (validate_refund_packet_token): tx mint voucher token"
 
-    let updated_output = transfer_escrow.expect_module_state(spend)
-
     and {
-      value_delta.validate_output_amount(
-        spent_input,
-        updated_output,
-        assets.zero,
-      )?,
-      (packet_source_port == packet.source_port)?,
-      (packet_source_channel == packet.source_channel)?,
+      transfer_escrow.validate_preserved_module_state(spent_input, spend)?,
+      (packet_source_port == source_port)?,
+      (packet_source_channel == source_channel)?,
     }
   }
 }

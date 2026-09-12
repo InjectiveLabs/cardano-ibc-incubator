@@ -9,12 +9,16 @@ import {
   WithOptionalTraceRegistryUpdate,
   WithPacketPolicyAndChannelToken,
   WithTransferAmount,
+  WithTransferModuleSpend,
+  WithTransferModuleUtxo,
   WithVoucherMetadataOutput,
   WithVerifyProof,
 } from './fragments';
 
 export type UnsignedRecvPacketDto = WithHostStateUpdate &
   WithChannelContext &
+  WithModuleContext &
+  WithModuleSpend &
   WithChannelSpend &
   WithConstructedAddress &
   WithPacketPolicyAndChannelToken<'recvPacketPolicyId'> &
@@ -31,6 +35,8 @@ export type UnsignedRecvPacketModuleDto = WithHostStateUpdate &
 export type UnsignedRecvPacketMintDto = WithHostStateUpdate &
   WithChannelContext &
   WithChannelSpend &
+  WithTransferModuleUtxo &
+  WithTransferModuleSpend &
   WithMintVoucherRedeemer &
   WithVoucherMetadataOutput &
   WithOptionalTraceRegistryUpdate &

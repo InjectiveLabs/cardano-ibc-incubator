@@ -1,15 +1,21 @@
 import WebSocket from 'ws';
+import { bech32 } from 'bech32';
 import { resolveManagedOgmiosWsEndpoint, resolveManagedOgmiosWsOptions } from './managed-cardano-endpoints';
 
 type OgmiosShelleyGenesisConfig = {
   era?: unknown;
+  activeSlotsCoefficient?: unknown;
   slotsPerKesPeriod?: unknown;
+  maxKesEvolutions?: unknown;
 };
 
 type OgmiosCurrentEpochVerificationData = {
   currentEpoch: number;
   epochNonce: string;
   slotsPerKesPeriod: number;
+  maxKesEvolutions: number;
+  activeSlotCoefficientNumerator: bigint;
+  activeSlotCoefficientDenominator: bigint;
 };
 
 type OgmiosStakePool = {
@@ -30,6 +36,8 @@ type OgmiosCurrentEpochStakeDistributionEntry = {
   poolId: string;
   stake: bigint;
   vrfKeyHash: string;
+  relativeStakeNumerator: bigint;
+  relativeStakeDenominator: bigint;
 };
 
 type OgmiosLedgerPoint = {
@@ -45,7 +53,18 @@ type OgmiosSession = {
   request<T>(methodname: string, args?: unknown): Promise<T>;
 };
 
+type OgmiosShelleyGenesisVerificationConfig = {
+  slotsPerKesPeriod: number;
+  maxKesEvolutions: number;
+  activeSlotCoefficientNumerator: bigint;
+  activeSlotCoefficientDenominator: bigint;
+};
+
+type OgmiosOperationalCertificateCounters = Map<string, bigint>;
+
 const STAKE_DISTRIBUTION_WEIGHT_SCALE = 1_000_000_000_000n;
+const MAX_UINT64 = (1n << 64n) - 1n;
+const MAX_SUPPORTED_KES_EVOLUTIONS = 64;
 const OGMIOS_OPEN_TIMEOUT_MS = readPositiveIntegerEnv('OGMIOS_OPEN_TIMEOUT_MS', 10_000);
 const OGMIOS_REQUEST_TIMEOUT_MS = readPositiveIntegerEnv('OGMIOS_REQUEST_TIMEOUT_MS', 20_000);
 const OGMIOS_TRANSIENT_MAX_ATTEMPTS = 10;
@@ -94,10 +113,7 @@ const retryOgmiosOperation = async <T>(operationName: string, operation: () => P
         throw error;
       }
 
-      const delayMs = Math.min(
-        OGMIOS_TRANSIENT_MAX_DELAY_MS,
-        OGMIOS_TRANSIENT_BASE_DELAY_MS * 2 ** (attempt - 1),
-      );
+      const delayMs = Math.min(OGMIOS_TRANSIENT_MAX_DELAY_MS, OGMIOS_TRANSIENT_BASE_DELAY_MS * 2 ** (attempt - 1));
       // Bounded retry for managed-endpoint transport/auth races; deterministic failure after the budget.
       await sleep(delayMs);
     }
@@ -107,12 +123,8 @@ const retryOgmiosOperation = async <T>(operationName: string, operation: () => P
 };
 
 const openOgmiosConnection = async (ogmiosUrl: string): Promise<WebSocket> => {
-  const resolvedUrl =
-    resolveManagedOgmiosWsEndpoint(ogmiosUrl, process.env.OGMIOS_API_KEY) ?? ogmiosUrl;
-  const client = new WebSocket(
-    resolvedUrl,
-    resolveManagedOgmiosWsOptions(ogmiosUrl, process.env.OGMIOS_API_KEY),
-  );
+  const resolvedUrl = resolveManagedOgmiosWsEndpoint(ogmiosUrl, process.env.OGMIOS_API_KEY) ?? ogmiosUrl;
+  const client = new WebSocket(resolvedUrl, resolveManagedOgmiosWsOptions(ogmiosUrl, process.env.OGMIOS_API_KEY));
 
   await new Promise<void>((resolve, reject) => {
     let settled = false;
@@ -173,7 +185,7 @@ const parseInteger = (value: unknown, field: string): number => {
     throw new Error(`Ogmios returned invalid ${field}`);
   }
 
-  if (!Number.isInteger(parsed) || parsed < 0) {
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
     throw new Error(`Ogmios returned invalid ${field}`);
   }
 
@@ -193,43 +205,157 @@ const parseEpochNonce = (epochNonce: unknown): string => {
   return normalized;
 };
 
-const parseShelleyGenesisConfig = (config: OgmiosShelleyGenesisConfig): number => {
-  if (config.era !== 'shelley') {
+const parsePositiveInteger = (value: unknown, field: string): number => {
+  const parsed = parseInteger(value, field);
+  if (parsed === 0) {
+    throw new Error(`Ogmios returned invalid ${field}`);
+  }
+  return parsed;
+};
+
+const parseShelleyGenesisConfig = (config: OgmiosShelleyGenesisConfig): OgmiosShelleyGenesisVerificationConfig => {
+  if (!config || config.era !== 'shelley') {
     throw new Error('Ogmios returned a non-Shelley genesis configuration');
   }
 
-  return parseInteger(config.slotsPerKesPeriod, 'slotsPerKesPeriod');
+  const maxKesEvolutions = parsePositiveInteger(config.maxKesEvolutions, 'maxKesEvolutions');
+  if (maxKesEvolutions > MAX_SUPPORTED_KES_EVOLUTIONS) {
+    throw new Error('Ogmios returned invalid maxKesEvolutions');
+  }
+
+  const activeSlotCoefficient = parseUnitIntervalFraction(
+    config.activeSlotsCoefficient,
+    'activeSlotsCoefficient',
+    false,
+  );
+
+  return {
+    slotsPerKesPeriod: parsePositiveInteger(config.slotsPerKesPeriod, 'slotsPerKesPeriod'),
+    maxKesEvolutions,
+    activeSlotCoefficientNumerator: activeSlotCoefficient.numerator,
+    activeSlotCoefficientDenominator: activeSlotCoefficient.denominator,
+  };
 };
 
-const parseStakeFraction = (value: unknown): { numerator: bigint; denominator: bigint } => {
+const parseUint64 = (value: unknown, field: string): bigint => {
+  let parsed: bigint;
+  if (typeof value === 'bigint') {
+    parsed = value;
+  } else if (typeof value === 'number') {
+    if (!Number.isSafeInteger(value)) {
+      throw new Error(`Ogmios returned invalid ${field}`);
+    }
+    parsed = BigInt(value);
+  } else if (typeof value === 'string' && /^(0|[1-9][0-9]*)$/.test(value)) {
+    parsed = BigInt(value);
+  } else {
+    throw new Error(`Ogmios returned invalid ${field}`);
+  }
+
+  if (parsed < 0n || parsed > MAX_UINT64) {
+    throw new Error(`Ogmios returned invalid ${field}`);
+  }
+  return parsed;
+};
+
+const parseOperationalCertificateCounters = (value: unknown): OgmiosOperationalCertificateCounters => {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new Error('Ogmios returned invalid operational certificate counters');
+  }
+
+  const counters = new Map<string, bigint>();
+  for (const [poolId, counter] of Object.entries(value)) {
+    const normalizedPoolId = poolId.trim().toLowerCase();
+    operationalCertificatePoolIdBytes(normalizedPoolId);
+    if (counters.has(normalizedPoolId)) {
+      throw new Error(`Ogmios returned duplicate operational certificate pool id: ${normalizedPoolId}`);
+    }
+    counters.set(
+      normalizedPoolId,
+      parseUint64(counter, `operational certificate counter for pool ${normalizedPoolId}`),
+    );
+  }
+
+  return counters;
+};
+
+const operationalCertificatePoolIdBytes = (poolId: string): Buffer => {
+  const normalizedPoolId = poolId.trim().toLowerCase();
+  try {
+    const decoded = bech32.decode(normalizedPoolId, 1023);
+    const bytes = Buffer.from(bech32.fromWords(decoded.words));
+    if (decoded.prefix !== 'pool' || bytes.length !== 28) {
+      throw new Error('invalid pool id payload');
+    }
+    return bytes;
+  } catch {
+    throw new Error(`Ogmios returned an invalid operational certificate pool id: ${poolId}`);
+  }
+};
+
+const parseUnitIntervalFraction = (
+  value: unknown,
+  field: string,
+  allowZero: boolean,
+): { numerator: bigint; denominator: bigint } => {
   if (typeof value !== 'string') {
-    throw new Error('Ogmios returned an invalid live stake fraction');
+    throw new Error(`Ogmios returned an invalid ${field}`);
   }
 
   const parts = value.split('/');
-  if (parts.length !== 2) {
-    throw new Error('Ogmios returned an invalid live stake fraction');
+  if (parts.length !== 2 || !parts.every((part) => /^\d+$/.test(part))) {
+    throw new Error(`Ogmios returned an invalid ${field}`);
   }
 
   const numerator = BigInt(parts[0]);
   const denominator = BigInt(parts[1]);
-  if (numerator < 0n || denominator <= 0n) {
-    throw new Error('Ogmios returned an invalid live stake fraction');
+  if (
+    denominator <= 0n ||
+    numerator > denominator ||
+    numerator > MAX_UINT64 ||
+    denominator > MAX_UINT64 ||
+    (!allowZero && numerator === 0n)
+  ) {
+    throw new Error(`Ogmios returned an invalid ${field}`);
   }
 
   return { numerator, denominator };
 };
 
+const parseStakeFraction = (value: unknown): { numerator: bigint; denominator: bigint } =>
+  parseUnitIntervalFraction(value, 'live stake fraction', true);
+
 const stakeFractionToWeight = (numerator: bigint, denominator: bigint): bigint => {
   if (numerator === 0n) {
     return 0n;
   }
-  if (numerator > denominator) {
-    throw new Error('Ogmios returned an invalid live stake fraction');
-  }
-
   const rounded = (numerator * STAKE_DISTRIBUTION_WEIGHT_SCALE + denominator / 2n) / denominator;
   return rounded > 0n ? rounded : 1n;
+};
+
+const greatestCommonDivisor = (left: bigint, right: bigint): bigint => {
+  let a = left < 0n ? -left : left;
+  let b = right < 0n ? -right : right;
+  while (b !== 0n) {
+    [a, b] = [b, a % b];
+  }
+  return a;
+};
+
+const addFractions = (
+  left: { numerator: bigint; denominator: bigint },
+  right: { numerator: bigint; denominator: bigint },
+): { numerator: bigint; denominator: bigint } => {
+  const denominatorGcd = greatestCommonDivisor(left.denominator, right.denominator);
+  const leftScale = right.denominator / denominatorGcd;
+  const rightScale = left.denominator / denominatorGcd;
+  const numerator = left.numerator * leftScale + right.numerator * rightScale;
+  const denominator = left.denominator * leftScale;
+  const fractionGcd = greatestCommonDivisor(numerator, denominator);
+  return {
+    numerator: numerator / fractionGcd,
+    denominator: denominator / fractionGcd,
+  };
 };
 
 const parseStakePoolId = (poolId: string): string => {
@@ -242,6 +368,7 @@ const parseStakePoolId = (poolId: string): string => {
 const parseStakeDistributionRows = (
   stakePools: OgmiosStakePools,
   liveStakeDistribution: OgmiosLiveStakeDistribution,
+  normalizeToActiveStake = false,
 ): OgmiosCurrentEpochStakeDistributionEntry[] => {
   const rows = Object.entries(liveStakeDistribution).map(([poolId, entry]) => {
     const normalizedPoolId = parseStakePoolId(poolId);
@@ -268,13 +395,54 @@ const parseStakeDistributionRows = (
     return [];
   }
 
-  return rows
-    .map((row) => ({
+  const positiveStakeRows = rows.filter((row) => row.numerator > 0n);
+  if (positiveStakeRows.length === 0) {
+    return [];
+  }
+
+  if (!normalizeToActiveStake) {
+    return positiveStakeRows.map((row) => ({
       poolId: row.poolId,
       stake: stakeFractionToWeight(row.numerator, row.denominator),
       vrfKeyHash: row.vrfKeyHash,
-    }))
-    .filter((row) => row.stake > 0n);
+      relativeStakeNumerator: row.numerator,
+      relativeStakeDenominator: row.denominator,
+    }));
+  }
+
+  const totalRelativeStake = positiveStakeRows.reduce((total, row) => addFractions(total, row), {
+    numerator: 0n,
+    denominator: 1n,
+  });
+  if (totalRelativeStake.numerator > totalRelativeStake.denominator) {
+    throw new Error('Ogmios live stake fractions exceed one');
+  }
+
+  // Ogmios 6.12 reports each pool's live stake against all ledger stake, which
+  // can include undelegated stake. Praos leader eligibility instead uses the
+  // pool's share of the active, delegated stake. Normalize the exact rational
+  // values as a group; renormalizing each rounded scoring weight would lose
+  // the precision required by native header verification. This converts the
+  // explicitly opted-in static-devnet fallback only; a live distribution is
+  // not an epoch-frozen one and must not be used this way on dynamic networks.
+  return positiveStakeRows.map((row) => {
+    const numerator = row.numerator * totalRelativeStake.denominator;
+    const denominator = row.denominator * totalRelativeStake.numerator;
+    const fractionGcd = greatestCommonDivisor(numerator, denominator);
+    const relativeStakeNumerator = numerator / fractionGcd;
+    const relativeStakeDenominator = denominator / fractionGcd;
+    if (relativeStakeNumerator > MAX_UINT64 || relativeStakeDenominator > MAX_UINT64) {
+      throw new Error(`Ogmios normalized live stake fraction for pool ${row.poolId} exceeds protobuf uint64 bounds`);
+    }
+
+    return {
+      poolId: row.poolId,
+      stake: stakeFractionToWeight(relativeStakeNumerator, relativeStakeDenominator),
+      vrfKeyHash: row.vrfKeyHash,
+      relativeStakeNumerator,
+      relativeStakeDenominator,
+    };
+  });
 };
 
 const createOgmiosSession = async (ogmiosUrl: string): Promise<{ client: WebSocket; session: OgmiosSession }> => {
@@ -348,7 +516,7 @@ const createOgmiosSession = async (ogmiosUrl: string): Promise<{ client: WebSock
           method: methodname,
           params: args,
         });
-        client.send(payload, (error) => {
+        client.send(payload, (error?: Error) => {
           if (!error || settled) {
             return;
           }
@@ -430,6 +598,7 @@ const queryEpochContextAtPoint = async (
   ogmiosUrl: string,
   point: OgmiosLedgerPoint,
   epochNonce: string,
+  normalizeToActiveStake = false,
 ): Promise<OgmiosEpochContextAtPoint> => {
   return withAcquiredLedgerState(ogmiosUrl, point, async (session) => {
     const currentEpoch = await session.request<unknown>('queryLedgerState/epoch', {});
@@ -444,12 +613,26 @@ const queryEpochContextAtPoint = async (
       {},
     );
 
+    const genesisVerificationConfig = parseShelleyGenesisConfig(shelleyGenesisConfig);
     return {
       currentEpoch: parseInteger(currentEpoch, 'epoch'),
       epochNonce: parseEpochNonce(epochNonce),
-      slotsPerKesPeriod: parseShelleyGenesisConfig(shelleyGenesisConfig),
-      stakeDistribution: parseStakeDistributionRows(stakePools, liveStakeDistribution),
+      slotsPerKesPeriod: genesisVerificationConfig.slotsPerKesPeriod,
+      maxKesEvolutions: genesisVerificationConfig.maxKesEvolutions,
+      activeSlotCoefficientNumerator: genesisVerificationConfig.activeSlotCoefficientNumerator,
+      activeSlotCoefficientDenominator: genesisVerificationConfig.activeSlotCoefficientDenominator,
+      stakeDistribution: parseStakeDistributionRows(stakePools, liveStakeDistribution, normalizeToActiveStake),
     };
+  });
+};
+
+const queryOperationalCertificateCountersAtPoint = async (
+  ogmiosUrl: string,
+  point: OgmiosLedgerPoint,
+): Promise<OgmiosOperationalCertificateCounters> => {
+  return withAcquiredLedgerState(ogmiosUrl, point, async (session) => {
+    const counters = await session.request<unknown>('queryLedgerState/operationalCertificates', {});
+    return parseOperationalCertificateCounters(counters);
   });
 };
 
@@ -462,29 +645,39 @@ const queryCurrentEpochVerificationData = async (
     ogmiosRequest<OgmiosShelleyGenesisConfig>(ogmiosUrl, 'queryNetwork/genesisConfiguration', { era: 'shelley' }),
   ]);
 
+  const genesisVerificationConfig = parseShelleyGenesisConfig(shelleyGenesisConfig);
   return {
     currentEpoch: parseInteger(currentEpoch, 'epoch'),
     epochNonce: parseEpochNonce(epochNonce),
-    slotsPerKesPeriod: parseShelleyGenesisConfig(shelleyGenesisConfig),
+    slotsPerKesPeriod: genesisVerificationConfig.slotsPerKesPeriod,
+    maxKesEvolutions: genesisVerificationConfig.maxKesEvolutions,
+    activeSlotCoefficientNumerator: genesisVerificationConfig.activeSlotCoefficientNumerator,
+    activeSlotCoefficientDenominator: genesisVerificationConfig.activeSlotCoefficientDenominator,
   };
 };
 
 const queryCurrentEpochStakeDistribution = async (
   ogmiosUrl: string,
+  normalizeToActiveStake = false,
 ): Promise<OgmiosCurrentEpochStakeDistributionEntry[]> => {
   const [stakePools, liveStakeDistribution] = await Promise.all([
     ogmiosRequest<OgmiosStakePools>(ogmiosUrl, 'queryLedgerState/stakePools', {}),
     ogmiosRequest<OgmiosLiveStakeDistribution>(ogmiosUrl, 'queryLedgerState/liveStakeDistribution', {}),
   ]);
 
-  return parseStakeDistributionRows(stakePools, liveStakeDistribution);
+  return parseStakeDistributionRows(stakePools, liveStakeDistribution, normalizeToActiveStake);
 };
 
 export {
   ogmiosRequest,
+  operationalCertificatePoolIdBytes,
+  parseOperationalCertificateCounters,
+  parseShelleyGenesisConfig,
+  parseStakeDistributionRows,
   queryCurrentEpochStakeDistribution,
   queryCurrentEpochVerificationData,
   queryEpochContextAtPoint,
+  queryOperationalCertificateCountersAtPoint,
   type OgmiosCurrentEpochStakeDistributionEntry,
   type OgmiosCurrentEpochVerificationData,
   type OgmiosEpochContextAtPoint,

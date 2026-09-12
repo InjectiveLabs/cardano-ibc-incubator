@@ -3,18 +3,25 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.AsyncMutex = void 0;
+exports.OGMIOS_WEBSOCKET_REQUEST_TIMEOUT_MS = exports.OGMIOS_PROTOCOL_PARAMETERS_REQUEST_TIMEOUT_MS = exports.transferEscrowShardTokenName = exports.AsyncMutex = void 0;
+exports.withKupoStringQuantityHeader = withKupoStringQuantityHeader;
+exports.ogmiosRequest = ogmiosRequest;
+exports.mapOgmiosProtocolParameters = mapOgmiosProtocolParameters;
+exports.queryProtocolParametersCompat = queryProtocolParametersCompat;
+exports.retryWithBackoff = retryWithBackoff;
 exports.createTxBuilderRuntime = createTxBuilderRuntime;
 const crypto_1 = __importDefault(require("crypto"));
 const tx_builder_1 = require("@cardano-ibc/tx-builder");
 const trace_registry_1 = require("@cardano-ibc/trace-registry");
-const blake2b_1 = require("@noble/hashes/blake2b");
 const ws_1 = __importDefault(require("ws"));
 const asyncMutex_1 = require("./asyncMutex");
 const ibcStateRoot_1 = require("./ibcStateRoot");
 const lucidIbcAdapter_1 = require("./lucidIbcAdapter");
+const transferEscrowShard_1 = require("./transferEscrowShard");
 var asyncMutex_2 = require("./asyncMutex");
 Object.defineProperty(exports, "AsyncMutex", { enumerable: true, get: function () { return asyncMutex_2.AsyncMutex; } });
+var transferEscrowShard_2 = require("./transferEscrowShard");
+Object.defineProperty(exports, "transferEscrowShardTokenName", { enumerable: true, get: function () { return transferEscrowShard_2.transferEscrowShardTokenName; } });
 const LOOKUP_RETRY_OPTIONS = {
     maxAttempts: 6,
     retryDelayMs: 1000,
@@ -24,8 +31,12 @@ const TRANSACTION_TIME_TO_LIVE = 10 * 60 * 1000;
 // Lucid still raises this when protocol collateral requirements exceed the floor.
 const TRANSACTION_SET_COLLATERAL = BigInt(5_000_000);
 const MAX_SAFE_COST_MODEL_VALUE = Number.MAX_SAFE_INTEGER;
+exports.OGMIOS_PROTOCOL_PARAMETERS_REQUEST_TIMEOUT_MS = 10_000;
+exports.OGMIOS_WEBSOCKET_REQUEST_TIMEOUT_MS = 10_000;
 const PROTOCOL_PARAMETERS_MAX_ATTEMPTS = 5;
 const PROTOCOL_PARAMETERS_BASE_DELAY_MS = 1000;
+// Respect provider rate limits without allowing one response to stall startup indefinitely.
+const PROTOCOL_PARAMETERS_RETRY_AFTER_MAX_MS = 60_000;
 const TRANSIENT_STARTUP_ERROR_MARKERS = [
     'timeoutexception',
     'timeout',
@@ -41,6 +52,14 @@ const TRANSIENT_STARTUP_ERROR_MARKERS = [
     'network error',
     'fetch failed',
 ];
+function withKupoStringQuantityHeader(headers) {
+    const kupoHeader = Object.fromEntries(Object.entries(headers?.kupoHeader ?? {}).filter(([name]) => name.toLowerCase() !== 'accept'));
+    kupoHeader.accept = 'application/json;asset-quantity=string';
+    return {
+        ...(headers ?? {}),
+        kupoHeader,
+    };
+}
 const LUCID_NETWORKS = ['Mainnet', 'Preprod', 'Preview', 'Custom'];
 function defaultLogger(scope) {
     return {
@@ -120,10 +139,22 @@ function mapValidator(validator) {
     };
 }
 function normalizeBridgeManifest(manifest) {
+    if (manifest.schema_version !== 4) {
+        throw new Error('Unsupported bridge manifest schema_version: expected 4');
+    }
+    const ics20PacketCodec = manifest.ics20_packet_codec ?? 'legacy-cardano-json';
+    if (ics20PacketCodec !== 'legacy-cardano-json' &&
+        ics20PacketCodec !== 'ics20-classic-json-v1') {
+        throw new Error(`Unsupported ICS-20 packet codec: ${String(ics20PacketCodec)}`);
+    }
     return {
-        bridgeManifest: manifest,
+        bridgeManifest: {
+            ...manifest,
+            ics20_packet_codec: ics20PacketCodec,
+        },
         deployment: {
             deployedAt: manifest.deployed_at,
+            ics20PacketCodec,
             hostStateNFT: {
                 policyId: manifest.host_state_nft.policy_id,
                 name: manifest.host_state_nft.token_name,
@@ -158,6 +189,10 @@ function normalizeBridgeManifest(manifest) {
                         recv_packet: {
                             scriptHash: manifest.validators.spend_channel.ref_validator.recv_packet.script_hash,
                             refUtxo: mapRefUtxo(manifest.validators.spend_channel.ref_validator.recv_packet.ref_utxo),
+                        },
+                        prune_packet_history: {
+                            scriptHash: manifest.validators.spend_channel.ref_validator.prune_packet_history.script_hash,
+                            refUtxo: mapRefUtxo(manifest.validators.spend_channel.ref_validator.prune_packet_history.ref_utxo),
                         },
                         send_packet: {
                             scriptHash: manifest.validators.spend_channel.ref_validator.send_packet.script_hash,
@@ -215,13 +250,16 @@ function isDemeterHost(hostname) {
 }
 function normalizeDemeterOgmiosEndpoint(ogmiosEndpoint, headers) {
     const apiKey = headers?.ogmiosHeader?.['dmtr-api-key']?.trim();
-    if (!apiKey) {
-        return { ogmiosEndpoint, headers };
-    }
     try {
         const parsed = new URL(ogmiosEndpoint);
-        if (!isDemeterHost(parsed.hostname)) {
-            return { ogmiosEndpoint, headers };
+        if (parsed.protocol === 'wss:') {
+            parsed.protocol = 'https:';
+        }
+        else if (parsed.protocol === 'ws:') {
+            parsed.protocol = 'http:';
+        }
+        if (!apiKey || !isDemeterHost(parsed.hostname)) {
+            return { ogmiosEndpoint: parsed.toString().replace(/\/$/, ''), headers };
         }
         if (!parsed.host.startsWith(`${apiKey}.`)) {
             parsed.host = `${apiKey}.${parsed.host}`;
@@ -370,41 +408,107 @@ function appendBuffer(left, right) {
     result.set(right, left.length);
     return result;
 }
-function ogmiosRequest(ogmiosUrl, methodName, args, headers) {
-    return new Promise(async (resolve, reject) => {
-        const client = new ws_1.default(ogmiosUrl, headers ? { headers } : undefined);
-        const cleanup = () => {
-            if (client.readyState === ws_1.default.OPEN || client.readyState === ws_1.default.CONNECTING) {
-                client.close();
+function ogmiosRequest(ogmiosUrl, methodName, args, headers, timeoutMs = exports.OGMIOS_WEBSOCKET_REQUEST_TIMEOUT_MS) {
+    return new Promise((resolve, reject) => {
+        let client;
+        try {
+            client = new ws_1.default(ogmiosUrl, headers ? { headers } : undefined);
+        }
+        catch (error) {
+            reject(error);
+            return;
+        }
+        let requestSent = false;
+        let settled = false;
+        let timeout;
+        const removeRequestListeners = () => {
+            client.off('open', handleOpen);
+            client.off('message', handleMessage);
+            client.off('error', handleError);
+            client.off('close', handleClose);
+        };
+        const destroyClient = () => {
+            if (client.readyState === ws_1.default.CLOSED) {
+                return;
+            }
+            // `ws` emits an error when a connecting socket is terminated. Keep a
+            // temporary listener until close so cleanup cannot create an unhandled error.
+            const ignoreCleanupError = () => undefined;
+            const removeCleanupErrorListener = () => client.off('error', ignoreCleanupError);
+            client.once('error', ignoreCleanupError);
+            client.once('close', removeCleanupErrorListener);
+            try {
+                client.terminate();
+            }
+            catch {
+                client.off('error', ignoreCleanupError);
+                client.off('close', removeCleanupErrorListener);
             }
         };
-        client.once('open', () => {
-            client.send(JSON.stringify({
-                jsonrpc: '2.0',
-                method: methodName,
-                params: args,
-            }));
-        });
-        client.once('message', (rawMessage) => {
+        const settle = (result) => {
+            if (settled) {
+                return;
+            }
+            settled = true;
+            if (timeout !== undefined) {
+                clearTimeout(timeout);
+            }
+            removeRequestListeners();
+            destroyClient();
+            if ('error' in result) {
+                reject(result.error);
+            }
+            else {
+                resolve(result.value);
+            }
+        };
+        const handleOpen = () => {
+            requestSent = true;
+            try {
+                client.send(JSON.stringify({
+                    jsonrpc: '2.0',
+                    method: methodName,
+                    params: args,
+                }), (error) => {
+                    if (error) {
+                        settle({ error });
+                    }
+                });
+            }
+            catch (error) {
+                settle({ error });
+            }
+        };
+        const handleMessage = (rawMessage) => {
             try {
                 const payload = JSON.parse(rawMessage.toString());
                 if (payload?.error) {
-                    reject(new Error(payload.error.message ?? JSON.stringify(payload.error)));
+                    settle({ error: new Error(payload.error.message ?? JSON.stringify(payload.error)) });
                     return;
                 }
-                resolve(payload.result);
+                settle({ value: payload.result });
             }
             catch (error) {
-                reject(error);
+                settle({ error });
             }
-            finally {
-                cleanup();
-            }
-        });
-        client.once('error', (error) => {
-            cleanup();
-            reject(error);
-        });
+        };
+        const handleError = (error) => settle({ error });
+        const handleClose = (code, reason) => {
+            const reasonText = reason.length > 0 ? `: ${reason.toString()}` : '';
+            settle({
+                error: new Error(`Ogmios ${methodName} WebSocket closed before a response was received (code ${code}${reasonText})`),
+            });
+        };
+        client.once('open', handleOpen);
+        client.once('message', handleMessage);
+        client.once('error', handleError);
+        client.once('close', handleClose);
+        timeout = setTimeout(() => {
+            const phase = requestSent ? 'waiting for a response' : 'opening the WebSocket';
+            settle({
+                error: new Error(`Ogmios ${methodName} request timed out after ${timeoutMs}ms while ${phase}`),
+            });
+        }, timeoutMs);
     });
 }
 async function querySystemStart(ogmiosUrl, headers) {
@@ -485,22 +589,209 @@ function toSafeCostModelInteger(value) {
     }
     return parsedValue;
 }
+function costModelRecordEntries(values) {
+    const entries = Object.entries(values);
+    const hasOnlyNumericIndexes = entries.every(([index]) => /^\d+$/.test(index));
+    return hasOnlyNumericIndexes
+        ? entries.sort(([left], [right]) => Number(left) - Number(right))
+        : entries;
+}
+function toCostModelArray(values) {
+    if (!values) {
+        return [];
+    }
+    const rawValues = Array.isArray(values)
+        ? values
+        : costModelRecordEntries(values).map(([, value]) => value);
+    return rawValues.map((value) => toSafeCostModelInteger(value));
+}
+function mapOgmiosCostModels(plutusCostModels) {
+    // Lucid's cost-model constructor iterates all three language keys
+    // unconditionally. Keep unavailable models empty so the object has the
+    // shape Lucid requires without copying another language's parameters.
+    const mappedModels = {
+        PlutusV1: [],
+        PlutusV2: [],
+        PlutusV3: [],
+    };
+    if (plutusCostModels !== undefined &&
+        plutusCostModels !== null &&
+        (typeof plutusCostModels !== 'object' || Array.isArray(plutusCostModels))) {
+        throw new Error('Ogmios protocol parameters response contains invalid plutusCostModels');
+    }
+    const rawModels = (plutusCostModels ?? {});
+    const modelNames = [
+        ['plutus:v1', 'PlutusV1'],
+        ['plutus:v2', 'PlutusV2'],
+        ['plutus:v3', 'PlutusV3'],
+    ];
+    for (const [ogmiosName, lucidName] of modelNames) {
+        const rawModel = rawModels[ogmiosName];
+        if (rawModel === undefined || rawModel === null) {
+            continue;
+        }
+        if (!Array.isArray(rawModel) && typeof rawModel !== 'object') {
+            throw new Error(`Ogmios protocol parameters response contains invalid ${ogmiosName} cost model`);
+        }
+        mappedModels[lucidName] = toCostModelArray(rawModel);
+    }
+    for (const [ogmiosName, lucidName] of modelNames.slice(0, 2)) {
+        if (mappedModels[lucidName].length === 0) {
+            throw new Error(`Ogmios protocol parameters response is missing a non-empty ${ogmiosName} cost model`);
+        }
+    }
+    return mappedModels;
+}
 function sanitizeProtocolParameters(protocolParameters) {
     if (!protocolParameters?.costModels) {
         return protocolParameters;
     }
     const sanitizedCostModels = {};
     for (const [version, model] of Object.entries(protocolParameters.costModels)) {
-        const sanitizedModel = {};
-        for (const [index, value] of Object.entries(model ?? {})) {
-            sanitizedModel[index] = toSafeCostModelInteger(value);
+        if (Array.isArray(model) || (typeof model === 'object' && model !== null)) {
+            sanitizedCostModels[version] = toCostModelArray(model);
         }
-        sanitizedCostModels[version] = sanitizedModel;
     }
     return {
         ...protocolParameters,
         costModels: sanitizedCostModels,
     };
+}
+function parseOgmiosRatio(value, label) {
+    if (Array.isArray(value) && value.length >= 2) {
+        const numerator = Number(value[0]);
+        const denominator = Number(value[1]);
+        if (Number.isFinite(numerator) && Number.isFinite(denominator) && denominator !== 0) {
+            return numerator / denominator;
+        }
+    }
+    if (typeof value === 'string') {
+        const [rawNumerator, rawDenominator] = value.includes('/') ? value.split('/') : [value, '1'];
+        const numerator = Number(rawNumerator);
+        const denominator = Number(rawDenominator);
+        if (Number.isFinite(numerator) && Number.isFinite(denominator) && denominator !== 0) {
+            return numerator / denominator;
+        }
+    }
+    if (typeof value === 'object' && value !== null) {
+        const record = value;
+        const numerator = Number(record.numerator ?? record.num ?? record[0]);
+        const denominator = Number(record.denominator ?? record.den ?? record[1]);
+        if (Number.isFinite(numerator) && Number.isFinite(denominator) && denominator !== 0) {
+            return numerator / denominator;
+        }
+    }
+    if (typeof value === 'number' && Number.isFinite(value)) {
+        return value;
+    }
+    throw new Error(`Invalid Ogmios ratio for ${label}: ${JSON.stringify(value)}`);
+}
+function parseRetryAfterMs(headers) {
+    const retryAfter = headers?.get?.('retry-after')?.trim();
+    if (!retryAfter) {
+        return undefined;
+    }
+    if (/^\d+$/.test(retryAfter)) {
+        return Number(retryAfter) * 1_000;
+    }
+    const retryAt = Date.parse(retryAfter);
+    if (!Number.isFinite(retryAt)) {
+        return undefined;
+    }
+    return Math.max(0, retryAt - Date.now());
+}
+function lovelaceValue(value, fallback = 0n) {
+    const raw = value?.ada?.lovelace ?? value?.lovelace ?? value;
+    if (raw === undefined || raw === null || raw === '') {
+        return fallback;
+    }
+    return BigInt(raw);
+}
+function mapOgmiosProtocolParameters(result) {
+    if (!result) {
+        throw new Error('Ogmios protocol parameters response is missing result');
+    }
+    const coinsPerUtxoByte = result.utxoCostPerByte ?? result.minUtxoDepositCoefficient;
+    if (coinsPerUtxoByte === undefined || coinsPerUtxoByte === null) {
+        throw new Error('Ogmios protocol parameters response is missing utxoCostPerByte/minUtxoDepositCoefficient');
+    }
+    const costModels = mapOgmiosCostModels(result.plutusCostModels);
+    return {
+        minFeeA: result.minFeeCoefficient,
+        minFeeB: Number(lovelaceValue(result.minFeeConstant)),
+        maxTxSize: result.maxTransactionSize?.bytes,
+        maxValSize: result.maxValueSize?.bytes,
+        keyDeposit: lovelaceValue(result.stakeCredentialDeposit),
+        poolDeposit: lovelaceValue(result.stakePoolDeposit),
+        drepDeposit: lovelaceValue(result.delegateRepresentativeDeposit),
+        govActionDeposit: lovelaceValue(result.governanceActionDeposit),
+        priceMem: parseOgmiosRatio(result.scriptExecutionPrices?.memory, 'scriptExecutionPrices.memory'),
+        priceStep: parseOgmiosRatio(result.scriptExecutionPrices?.cpu, 'scriptExecutionPrices.cpu'),
+        maxTxExMem: BigInt(result.maxExecutionUnitsPerTransaction?.memory ?? 0),
+        maxTxExSteps: BigInt(result.maxExecutionUnitsPerTransaction?.cpu ?? 0),
+        coinsPerUtxoByte: BigInt(coinsPerUtxoByte),
+        collateralPercentage: result.collateralPercentage,
+        maxCollateralInputs: result.maxCollateralInputs,
+        minFeeRefScriptCostPerByte: result.minFeeReferenceScripts?.base ?? 0,
+        costModels,
+    };
+}
+async function queryProtocolParametersCompat(ogmiosEndpoint, headers, fetchImpl = fetch, timeoutMs = exports.OGMIOS_PROTOCOL_PARAMETERS_REQUEST_TIMEOUT_MS) {
+    const controller = new AbortController();
+    let timeout;
+    const timeoutError = new Error(`Ogmios protocol parameters query timed out after ${timeoutMs}ms`);
+    timeoutError.name = 'TimeoutError';
+    try {
+        return await Promise.race([
+            (async () => {
+                const response = await fetchImpl(ogmiosEndpoint, {
+                    method: 'POST',
+                    headers: {
+                        'content-type': 'application/json',
+                        ...(headers ?? {}),
+                    },
+                    body: JSON.stringify({
+                        jsonrpc: '2.0',
+                        method: 'queryLedgerState/protocolParameters',
+                        params: {},
+                        id: 'tx-builder-runtime-protocol-parameters',
+                    }),
+                    signal: controller.signal,
+                });
+                const text = await response.text();
+                if (!response.ok) {
+                    const error = new Error(`Ogmios protocol parameters query failed with HTTP ${response.status}: ${text}`);
+                    Object.assign(error, {
+                        status: response.status,
+                        retryAfterMs: parseRetryAfterMs(response.headers),
+                    });
+                    throw error;
+                }
+                let payload;
+                try {
+                    payload = JSON.parse(text);
+                }
+                catch (error) {
+                    throw new Error('Ogmios protocol parameters query returned invalid JSON', { cause: error });
+                }
+                if (payload.error) {
+                    throw new Error(`Ogmios protocol parameters query failed: ${JSON.stringify(payload.error)}`);
+                }
+                return mapOgmiosProtocolParameters(payload.result);
+            })(),
+            new Promise((_resolve, reject) => {
+                timeout = setTimeout(() => {
+                    controller.abort(timeoutError);
+                    reject(timeoutError);
+                }, timeoutMs);
+            }),
+        ]);
+    }
+    finally {
+        if (timeout !== undefined) {
+            clearTimeout(timeout);
+        }
+    }
 }
 function collectErrorSignals(error) {
     const signals = [];
@@ -539,6 +830,9 @@ function collectErrorSignals(error) {
             pushSignal(record.details);
             pushSignal(record.type);
             pushSignal(record.statusText);
+            if (typeof record.status === 'number') {
+                pushSignal(`HTTP ${record.status}`);
+            }
             visit(record.cause, depth + 1);
             visit(record.error, depth + 1);
             visit(record.originalError, depth + 1);
@@ -547,16 +841,43 @@ function collectErrorSignals(error) {
     visit(error, 0);
     return signals;
 }
+function hasTransientHttpStatus(normalizedSignals) {
+    return normalizedSignals.some((signal) => {
+        const statusMatches = [
+            ...signal.matchAll(/\bhttp\s+(\d{3})\b/g),
+            ...signal.matchAll(/\bstatus(?:code)?\s*[:=]?\s*(\d{3})\b/g),
+            ...signal.matchAll(/\((\d{3})\s+(?:get|post|put|delete|patch)\b/g),
+        ];
+        return statusMatches.some((match) => {
+            const status = Number(match[1]);
+            return status === 429 || (status >= 500 && status <= 599);
+        });
+    });
+}
 function isTransientStartupError(error) {
     const normalizedSignals = collectErrorSignals(error).map((signal) => signal.toLowerCase());
-    return normalizedSignals.some((signal) => TRANSIENT_STARTUP_ERROR_MARKERS.some((marker) => signal.includes(marker)));
+    return (hasTransientHttpStatus(normalizedSignals) ||
+        normalizedSignals.some((signal) => TRANSIENT_STARTUP_ERROR_MARKERS.some((marker) => signal.includes(marker))));
 }
 function computeJitteredBackoffDelayMs(failedAttempt) {
     const backoffDelay = PROTOCOL_PARAMETERS_BASE_DELAY_MS * 2 ** Math.max(0, failedAttempt - 1);
     const jitterMultiplier = 0.8 + Math.random() * 0.4;
     return Math.round(backoffDelay * jitterMultiplier);
 }
-async function retryWithBackoff(operation) {
+function computeProtocolParametersRetryDelayMs(failedAttempt, error) {
+    const backoffDelayMs = computeJitteredBackoffDelayMs(failedAttempt);
+    if (typeof error !== 'object' || error === null) {
+        return backoffDelayMs;
+    }
+    const retryAfterMs = error.retryAfterMs;
+    if (typeof retryAfterMs !== 'number' ||
+        !Number.isFinite(retryAfterMs) ||
+        retryAfterMs < 0) {
+        return backoffDelayMs;
+    }
+    return Math.max(backoffDelayMs, Math.min(retryAfterMs, PROTOCOL_PARAMETERS_RETRY_AFTER_MAX_MS));
+}
+async function retryWithBackoff(operation, wait = (durationMs) => new Promise((resolve) => setTimeout(resolve, durationMs))) {
     for (let attempt = 1; attempt <= PROTOCOL_PARAMETERS_MAX_ATTEMPTS; attempt += 1) {
         try {
             return await operation();
@@ -565,16 +886,16 @@ async function retryWithBackoff(operation) {
             if (!isTransientStartupError(error) || attempt >= PROTOCOL_PARAMETERS_MAX_ATTEMPTS) {
                 throw error;
             }
-            const retryDelayMs = computeJitteredBackoffDelayMs(attempt);
-            await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+            const retryDelayMs = computeProtocolParametersRetryDelayMs(attempt, error);
+            await wait(retryDelayMs);
         }
     }
     throw new Error('Kupmios protocol parameters fetch failed');
 }
-async function createLucidRuntime(kupoEndpoint, ogmiosEndpoint, cardanoNetwork, logger, headers) {
+async function createLucidRuntime(kupoEndpoint, ogmiosEndpoint, cardanoNetwork, logger, headers, fetchImpl = fetch) {
     const Lucid = await timed(logger, '[context]', 'import lucid', () => eval(`import('@lucid-evolution/lucid')`));
-    const provider = new Lucid.Kupmios(kupoEndpoint, ogmiosEndpoint, headers);
-    const protocolParameters = sanitizeProtocolParameters(await timed(logger, '[context]', 'fetch protocol parameters', () => retryWithBackoff(() => provider.getProtocolParameters())));
+    const provider = new Lucid.Kupmios(kupoEndpoint, ogmiosEndpoint, withKupoStringQuantityHeader(headers));
+    const protocolParameters = sanitizeProtocolParameters(await timed(logger, '[context]', 'fetch protocol parameters', () => retryWithBackoff(() => queryProtocolParametersCompat(ogmiosEndpoint, headers?.ogmiosHeader, fetchImpl))));
     const lucid = await timed(logger, '[context]', 'create lucid runtime', () => Lucid.Lucid(provider, cardanoNetwork, {
         presetProtocolParameters: protocolParameters,
     }));
@@ -647,36 +968,25 @@ function dedupeUtxos(utxos) {
 function utxoRef(utxo) {
     return `${utxo.txHash}#${utxo.outputIndex}`;
 }
-function transferEscrowShardTokenName(channelId, packetDenom) {
-    return Buffer.from((0, blake2b_1.blake2b)(Buffer.concat([
-        Buffer.from('transfer-escrow', 'utf8'),
-        Buffer.from(channelId, 'hex'),
-        Buffer.from(packetDenom, 'hex'),
-    ]), { dkLen: 28 })).toString('hex');
-}
 async function findTransferEscrowShard(context, channelId, packetDenom, denomToken, requiredAmount) {
-    const encodedDatum = await context.lucidService.encode({ channel_id: channelId, denom: packetDenom }, 'transferEscrow');
-    const shardTokenUnit = context.deployment.validators.mintTransferEscrowShard.scriptHash +
-        transferEscrowShardTokenName(channelId, packetDenom);
-    let utxo;
-    try {
-        utxo = await context.lucidService.findUtxoByUnit(shardTokenUnit);
-    }
-    catch {
-        utxo = undefined;
-    }
-    const canonicalUtxo = utxo?.datum === encodedDatum &&
-        (utxo.assets[shardTokenUnit] ?? 0n) === 1n &&
-        Object.keys(utxo.assets ?? {}).every((unit) => unit === 'lovelace' || unit === denomToken || unit === shardTokenUnit) &&
-        (requiredAmount === undefined || (utxo.assets[denomToken] ?? 0n) >= requiredAmount)
-        ? utxo
-        : undefined;
-    return { utxo: canonicalUtxo, encodedDatum, shardTokenUnit };
+    const deployment = context.deployment;
+    return (0, transferEscrowShard_1.findTransferEscrowShard)({
+        transferModuleAddress: deployment.modules.transfer.address,
+        transferModuleIdentifier: deployment.modules.transfer.identifier,
+        shardPolicyId: deployment.validators.mintTransferEscrowShard.scriptHash,
+        findUtxosAt: (address) => context.lucidService.findUtxoAt(address),
+        encodeTransferEscrowDatum: (datum) => context.lucidService.encode(datum, 'transferEscrow'),
+        decodeTransferEscrowDatum: (encodedDatum) => context.lucidService.decodeDatum(encodedDatum, 'transferEscrow'),
+        encodeTransferModuleDatum: (datum) => context.lucidService.encode(datum, 'transferModule'),
+        decodeTransferModuleDatum: (encodedDatum) => context.lucidService.decodeDatum(encodedDatum, 'transferModule'),
+    }, channelId, packetDenom, denomToken, requiredAmount);
 }
-async function ensureTreeAlignedForRoot(context, onChainRoot) {
-    if (!(0, ibcStateRoot_1.isTreeAligned)(onChainRoot)) {
-        context.logger.warn(`IBC tree root mismatch for local tx builder runtime, aligning to ${onChainRoot.slice(0, 16)}...`);
-        await (0, ibcStateRoot_1.alignTreeWithChain)();
+async function ensureTreeAlignedForRoot(context, onChainRoot, hostStateUtxo) {
+    const snapshot = await context.treeStore.getAlignedSnapshot();
+    if (snapshot.root !== onChainRoot ||
+        snapshot.hostState.txHash !== hostStateUtxo.txHash ||
+        snapshot.hostState.outputIndex !== hostStateUtxo.outputIndex) {
+        throw new ibcStateRoot_1.StaleIbcTreeStateError('HostState changed while preparing the transaction, retry with current inputs');
     }
 }
 async function buildHostStateUpdateForHandlePacket(context, inputChannelDatum, outputChannelDatum, channelIdForRoot) {
@@ -685,9 +995,9 @@ async function buildHostStateUpdateForHandlePacket(context, inputChannelDatum, o
         throw new Error('HostState UTXO has no datum');
     }
     const hostStateDatum = await context.lucidService.decodeDatum(hostStateUtxo.datum, 'host_state');
-    await ensureTreeAlignedForRoot(context, hostStateDatum.state.ibc_state_root);
+    await ensureTreeAlignedForRoot(context, hostStateDatum.state.ibc_state_root, hostStateUtxo);
     const portId = convertHex2String(inputChannelDatum.port);
-    const { newRoot, channelSiblings, nextSequenceSendSiblings, nextSequenceRecvSiblings, nextSequenceAckSiblings, packetCommitmentSiblings, packetReceiptSiblings, packetAcknowledgementSiblings, commit, } = await (0, ibcStateRoot_1.computeRootWithHandlePacketUpdate)(hostStateDatum.state.ibc_state_root, portId, channelIdForRoot, inputChannelDatum, outputChannelDatum, context.lucidService.LucidImporter);
+    const { newRoot, channelSiblings, nextSequenceSendSiblings, nextSequenceRecvSiblings, nextSequenceAckSiblings, packetCommitmentSiblings, packetReceiptSiblings, packetAcknowledgementSiblings, commit, } = await context.treeStore.computeRootWithHandlePacketUpdate(hostStateDatum.state.ibc_state_root, portId, channelIdForRoot, inputChannelDatum, outputChannelDatum, context.lucidService.LucidImporter);
     const updatedHostStateDatum = {
         ...hostStateDatum,
         state: {
@@ -743,7 +1053,7 @@ function createTxBuilderRuntime(config) {
     const traceRegistryClient = (0, trace_registry_1.createTraceRegistryClient)({
         bridgeManifestUrl: config.bridgeManifestUrl,
         kupmiosUrl: config.kupmiosUrl,
-        kupmiosHeaders: config.kupmiosHeaders,
+        kupmiosHeaders: withKupoStringQuantityHeader(config.kupmiosHeaders),
         fetchImpl: config.fetchImpl,
     });
     async function getBridgeManifest() {
@@ -768,18 +1078,20 @@ function createTxBuilderRuntime(config) {
         const manifest = await timed(logger, '[context]', 'load bridge manifest', getBridgeManifest);
         const { deployment, bridgeManifest } = normalizeBridgeManifest(manifest);
         const { kupoEndpoint, ogmiosEndpoint: rawOgmiosEndpoint } = splitKupmiosUrl(config.kupmiosUrl);
-        const { ogmiosEndpoint, headers: kupmiosHeaders } = normalizeDemeterOgmiosEndpoint(rawOgmiosEndpoint, config.kupmiosHeaders);
+        const { ogmiosEndpoint, headers: normalizedKupmiosHeaders } = normalizeDemeterOgmiosEndpoint(rawOgmiosEndpoint, config.kupmiosHeaders);
+        const kupmiosHeaders = withKupoStringQuantityHeader(normalizedKupmiosHeaders);
         const cardanoNetwork = normalizeCardanoNetwork(bridgeManifest.cardano.network);
-        const { lucidImporter, lucid } = await createLucidRuntime(kupoEndpoint, ogmiosEndpoint, cardanoNetwork, logger, kupmiosHeaders);
+        const { lucidImporter, lucid } = await createLucidRuntime(kupoEndpoint, ogmiosEndpoint, cardanoNetwork, logger, kupmiosHeaders, config.fetchImpl ?? fetch);
         const lucidService = new lucidIbcAdapter_1.LucidIbcAdapter(lucidImporter, lucid, deployment);
         await timed(logger, '[context]', 'initialize lucid adapter', () => lucidService.onModuleInit());
         const kupoService = new RuntimeKupoService(lucidService, deployment);
-        (0, ibcStateRoot_1.initTreeServices)(kupoService, lucidService);
-        await timed(logger, '[context]', 'rebuild IBC state tree', () => (0, ibcStateRoot_1.rebuildTreeFromChain)(kupoService, lucidService));
+        const treeStore = new ibcStateRoot_1.IbcTreeStateStore({ network: cardanoNetwork, hostStateNFT: deployment.hostStateNFT }, kupoService, lucidService);
+        await timed(logger, '[context]', 'rebuild IBC state tree', () => treeStore.rebuildTreeFromChain());
         logger.log(`[context] initialized shared Cardano tx-builder runtime context in ${elapsedMs(contextStartedAt)}`);
         return {
             deployment,
             lucidService,
+            treeStore,
             logger,
             cardanoNetwork,
             ogmiosEndpoint,
@@ -839,6 +1151,9 @@ function createTxBuilderRuntime(config) {
         logger.log(`${scope} initial wallet UTxOs selected=${initialWalletUtxos.length}`);
         context.lucidService.selectWalletFromAddress(sendPacketOperator.signer, initialWalletUtxos);
         const { unsignedTx, walletOverride } = await timed(logger, scope, 'build send_packet tx skeleton', () => (0, tx_builder_1.buildUnsignedSendPacketTx)(sendPacketOperator, {
+            ...(context.deployment.ics20PacketCodec === 'legacy-cardano-json'
+                ? { stringifyPacketData: tx_builder_1.stringifyLegacyIcs20PacketData }
+                : {}),
             loadContext: async (operator) => {
                 const loadContextStartedAt = startTimer();
                 try {

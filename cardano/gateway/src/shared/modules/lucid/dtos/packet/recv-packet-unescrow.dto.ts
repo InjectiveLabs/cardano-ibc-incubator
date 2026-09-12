@@ -3,8 +3,8 @@ import {
   WithChannelSpend,
   WithConstructedAddress,
   WithHostStateUpdate,
-  WithMintTransferEscrowShardRedeemer,
   WithPacketPolicyAndChannelToken,
+  WithRequiredTransferModuleReferenceUtxo,
   WithTransferAmount,
   WithTransferEscrowShard,
   WithTransferModuleSpend,
@@ -14,9 +14,9 @@ import {
 export type UnsignedRecvPacketUnescrowDto = WithHostStateUpdate &
   WithChannelContext &
   WithChannelSpend &
+  WithRequiredTransferModuleReferenceUtxo &
   WithTransferModuleSpend &
   WithTransferEscrowShard &
-  WithMintTransferEscrowShardRedeemer &
   WithTransferAmount &
   WithConstructedAddress &
   WithPacketPolicyAndChannelToken<'recvPacketPolicyId'> &

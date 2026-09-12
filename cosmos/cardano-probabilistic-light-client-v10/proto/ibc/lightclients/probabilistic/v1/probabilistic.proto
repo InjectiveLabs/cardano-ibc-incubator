@@ -20,6 +20,10 @@ message StakeDistributionEntry {
   uint64 stake = 2;
   bytes vrf_key_hash = 3;
   uint64 first_registration_slot = 4;
+  // Exact relative active stake used for Praos leader eligibility. The
+  // existing stake field remains the weight used by settlement scoring.
+  uint64 relative_stake_numerator = 5;
+  uint64 relative_stake_denominator = 6;
 }
 
 message EpochContext {
@@ -33,11 +37,18 @@ message EpochContext {
   uint64 epoch_end_slot_exclusive = 6;
 }
 
+message OperationalCertificateCounter {
+  option (gogoproto.goproto_getters) = false;
+
+  bytes pool_id = 1;
+  uint64 sequence_number = 2;
+}
+
 message ClientState {
   option (gogoproto.goproto_getters) = false;
 
-  reserved 6;
-  reserved "heuristic_params";
+  reserved 6, 18;
+  reserved "heuristic_params", "pool_registration_cutoff_slot_exclusive";
 
   string chain_id = 1;
   Height latest_height = 2;
@@ -55,6 +66,28 @@ message ClientState {
   uint64 system_start_unix_ns = 15;
   uint64 slot_length_ns = 16;
   repeated EpochContext epoch_contexts = 17;
+  // The latest authenticated Cardano block, which may be newer than
+  // latest_height when rootless checkpoint updates are used for catch-up.
+  Height latest_checkpoint_height = 19;
+  string latest_checkpoint_block_hash = 20;
+  uint64 latest_checkpoint_epoch = 21;
+  uint64 max_kes_evolutions = 22;
+  // Operational-certificate counters at latest_checkpoint_height.
+  repeated OperationalCertificateCounter latest_checkpoint_operational_certificate_counters = 23;
+  // Oldest height whose counter state can be reconstructed from the current
+  // snapshot and the light client's private rollback history.
+  Height operational_certificate_counter_history_start_height = 24;
+  // Shelley-genesis activeSlotsCoefficient, kept as an exact rational.
+  uint64 active_slot_coefficient_numerator = 25;
+  uint64 active_slot_coefficient_denominator = 26;
+  // Maximum amount by which an authenticated Cardano block may be ahead of
+  // the Cosmos host chain's current block time.
+  google.protobuf.Duration max_clock_drift = 27 [(gogoproto.nullable) = false, (gogoproto.stdduration) = true];
+  // Slot and derived Unix-nanosecond timestamp of latest_checkpoint_height.
+  // Both are retained because rootless checkpoints do not create an IBC
+  // consensus state.
+  uint64 latest_checkpoint_slot = 28;
+  uint64 latest_checkpoint_timestamp = 29;
 }
 
 message ConsensusState {
@@ -88,7 +121,12 @@ message ProbabilisticBlock {
   uint64 timestamp = 6;
   reserved 7;
   reserved 8;
+  // Full block CBOR. A root-bearing anchor requires this representation so
+  // its HostState transaction can be authenticated against the signed body.
   bytes block_cbor = 9;
+  // Raw Cardano header CBOR. This compact representation is sufficient for
+  // bridge blocks, descendant blocks, and rootless checkpoint anchors.
+  bytes header_cbor = 10;
 }
 
 message ProbabilisticHeader {
@@ -103,4 +141,7 @@ message ProbabilisticHeader {
   reserved 7 to 9;
   repeated ProbabilisticBlock bridge_blocks = 10;
   EpochContext new_epoch_context = 11;
+  // Checkpoints authenticate Cardano chain progression without creating an
+  // IBC consensus state or renewing the trusting period.
+  bool is_checkpoint = 12;
 }

@@ -9,28 +9,7 @@ const scopes = [
   { name: 'tx-builder-runtime', directory: 'packages/cardano-ibc-tx-builder-runtime' },
 ];
 
-const allowedHighCriticalAdvisories = new Set([
-  '1109842',
-  '1112659',
-  '1113300',
-  '1113375',
-  '1113459',
-  '1113461',
-  '1113465',
-  '1113538',
-  '1113540',
-  '1113544',
-  '1113546',
-  '1113548',
-  '1113552',
-  '1114200',
-  '1114302',
-  '1114680',
-  '1115356',
-  '1115573',
-  '1115806',
-  '1117159',
-]);
+const allowedHighCriticalAdvisories = new Set([]);
 
 function highCriticalAdvisories(auditJson) {
   const advisories = new Map();

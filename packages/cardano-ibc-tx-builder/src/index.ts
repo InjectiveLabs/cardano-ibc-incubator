@@ -1,8 +1,15 @@
 import { TxBuilder, UTxO } from '@lucid-evolution/lucid';
 import { blake2b } from '@noble/hashes/blake2b';
+import {
+  Ics20ClassicJsonCodecError,
+  stringifyIcs20PacketData,
+} from './ics20-json-codec';
+
+export * from './ics20-json-codec';
 
 const LOVELACE = 'lovelace';
 const CIP67_FT_LABEL_HEX = '0014df10';
+export const MAX_PACKET_ENTRIES_PER_CHANNEL = 64;
 const LOOKUP_RETRY_OPTIONS = {
   maxAttempts: 6,
   retryDelayMs: 1000,
@@ -33,6 +40,28 @@ export type SendPacketOperator = {
   memo: string;
 };
 
+export type Ics20PacketDataStringifier = (packetData: {
+  denom: string;
+  amount: string;
+  sender: string;
+  receiver: string;
+  memo?: string;
+}) => string;
+
+// Preserve the exact sorted JSON representation used by deployments created
+// before the strict ICS-20 codec was introduced.
+export const stringifyLegacyIcs20PacketData: Ics20PacketDataStringifier = (
+  packetData,
+) => {
+  const ordered: Record<string, string> = {};
+  if (packetData.amount) ordered.amount = packetData.amount;
+  if (packetData.denom) ordered.denom = packetData.denom;
+  if (packetData.memo) ordered.memo = packetData.memo;
+  if (packetData.receiver) ordered.receiver = packetData.receiver;
+  if (packetData.sender) ordered.sender = packetData.sender;
+  return JSON.stringify(ordered);
+};
+
 export type Packet = {
   sequence: bigint;
   source_port: string;
@@ -49,6 +78,10 @@ export type ChannelDatumLike = {
   state: {
     next_sequence_send: bigint;
     packet_commitment: Map<bigint, string>;
+    packet_receipt: Map<bigint, string>;
+    packet_acknowledgement: Map<bigint, string>;
+    minimum_receive_proof_height: Height;
+    maximum_receive_proof_height: Height;
     channel: {
       connection_hops: string[];
       counterparty: {
@@ -83,17 +116,17 @@ export type LoadedSendPacketContext = {
   };
 };
 
-export type HostStateUpdate = {
+export type HostStateUpdate<TreeCommit = () => void> = {
   hostStateUtxo: UTxO;
   encodedHostStateRedeemer: string;
   encodedUpdatedHostStateDatum: string;
   newRoot: string;
-  commit: () => void;
+  commit: TreeCommit;
 };
 
-export type PendingTreeUpdate = {
+export type PendingTreeUpdate<TreeCommit = () => void> = {
   expectedNewRoot: string;
-  commit: () => void;
+  commit: TreeCommit;
 };
 
 export type VoucherDenomTrace = {
@@ -101,9 +134,9 @@ export type VoucherDenomTrace = {
   baseDenom: string;
 };
 
-export type SendPacketBuildResult = {
+export type SendPacketBuildResult<TreeCommit = () => void> = {
   unsignedTx: TxBuilder;
-  pendingTreeUpdate: PendingTreeUpdate;
+  pendingTreeUpdate: PendingTreeUpdate<TreeCommit>;
   walletOverride?: {
     address: string;
     utxos: UTxO[];
@@ -121,6 +154,8 @@ export type UnsignedSendPacketBurnTxInput = {
   encodedUpdatedChannelDatum: string;
   channelTokenUnit: string;
   encodedMintVoucherRedeemer: string;
+  encodedSpendTransferModuleRedeemer: string;
+  transferModuleReferenceUtxo: UTxO;
   transferAmount: bigint;
   constructedAddress: string;
   sendPacketPolicyId: string;
@@ -140,12 +175,13 @@ export type UnsignedSendPacketEscrowTxInput = {
   channelUTxO: UTxO;
   connectionUTxO: UTxO;
   clientUTxO: UTxO;
-  transferModuleReferenceUtxo?: UTxO;
+  transferModuleReferenceUtxo: UTxO;
   encodedSpendChannelRedeemer: string;
   encodedUpdatedChannelDatum: string;
   channelTokenUnit: string;
   encodedSpendTransferModuleRedeemer: string;
   encodedMintTransferEscrowShardRedeemer?: string;
+  encodedUpdatedTransferModuleDatum?: string;
   transferAmount: bigint;
   constructedAddress: string;
   sendPacketPolicyId: string;
@@ -161,7 +197,24 @@ export type UnsignedSendPacketEscrowTxInput = {
   transferEscrowShardTokenUnit?: string;
 };
 
-export type SendPacketBuildDependencies = {
+export type TransferEscrowShardLookup =
+  | {
+      kind: 'existing';
+      transferModuleUtxo: UTxO;
+      utxo: UTxO;
+      encodedDatum: string;
+      shardTokenUnit: string;
+    }
+  | {
+      kind: 'missing';
+      transferModuleUtxo: UTxO;
+      encodedDatum: string;
+      shardTokenUnit: string;
+      registrySiblings: string[];
+      encodedUpdatedTransferModuleDatum: string;
+    };
+
+export type SendPacketBuildDependencies<TreeCommit = () => void> = {
   loadContext: (
     sendPacketOperator: SendPacketOperator,
   ) => Promise<LoadedSendPacketContext>;
@@ -169,11 +222,12 @@ export type SendPacketBuildDependencies = {
     inputChannelDatum: ChannelDatumLike,
     outputChannelDatum: ChannelDatumLike,
     channelIdForRoot: string,
-  ) => Promise<HostStateUpdate>;
+  ) => Promise<HostStateUpdate<TreeCommit>>;
   resolveIbcDenomHash: (
     denomHash: string,
   ) => Promise<VoucherDenomTrace | null>;
   commitPacket: (packet: Packet) => string;
+  stringifyPacketData?: Ics20PacketDataStringifier;
   encode: (value: unknown, kind: string) => Promise<string>;
   findUtxoAtWithUnit: (address: string, unit: string) => Promise<UTxO>;
   tryFindUtxosAt: (
@@ -188,7 +242,7 @@ export type SendPacketBuildDependencies = {
     packetDenom: string,
     denomToken: string,
     requiredAmount?: bigint,
-  ) => Promise<{ utxo?: UTxO; encodedDatum: string; shardTokenUnit: string }>;
+  ) => Promise<TransferEscrowShardLookup>;
   createUnsignedSendPacketBurnTx: (
     dto: UnsignedSendPacketBurnTxInput,
   ) => TxBuilder;
@@ -196,14 +250,30 @@ export type SendPacketBuildDependencies = {
     dto: UnsignedSendPacketEscrowTxInput,
   ) => TxBuilder;
   invalidArgument: (message: string) => Error;
+  failedPrecondition?: (message: string) => Error;
   internalError: (message: string) => Error;
 };
 
-export async function buildUnsignedSendPacketTx(
+export async function buildUnsignedSendPacketTx<TreeCommit = () => void>(
   sendPacketOperator: SendPacketOperator,
-  deps: SendPacketBuildDependencies,
-): Promise<SendPacketBuildResult> {
+  deps: SendPacketBuildDependencies<TreeCommit>,
+): Promise<SendPacketBuildResult<TreeCommit>> {
   const context = await deps.loadContext(sendPacketOperator);
+
+  const retainedPacketEntryCount =
+    context.channelDatum.state.packet_commitment.size +
+    context.channelDatum.state.packet_receipt.size +
+    context.channelDatum.state.packet_acknowledgement.size;
+  if (
+    retainedPacketEntryCount >= MAX_PACKET_ENTRIES_PER_CHANNEL
+  ) {
+    const packetCapacityError =
+      deps.failedPrecondition ?? deps.invalidArgument;
+    throw packetCapacityError(
+      `Channel ${sendPacketOperator.sourceChannel} retained packet state capacity ` +
+        `of ${MAX_PACKET_ENTRIES_PER_CHANNEL} is exhausted`,
+    );
+  }
 
   const inputDenom = normalizeDenomTokenTransfer(
     sendPacketOperator.token.denom,
@@ -222,6 +292,22 @@ export async function buildUnsignedSendPacketTx(
     sendPacketOperator.sourceChannel,
   );
 
+  let packetDataJson: string;
+  try {
+    packetDataJson = (deps.stringifyPacketData ?? stringifyIcs20PacketData)({
+      denom: packetDenom,
+      amount: sendPacketOperator.token.amount.toString(),
+      sender: sendPacketOperator.sender,
+      receiver: sendPacketOperator.receiver,
+      memo: sendPacketOperator.memo,
+    });
+  } catch (error) {
+    if (error instanceof Ics20ClassicJsonCodecError) {
+      throw deps.invalidArgument(`Invalid ICS-20 packet data: ${error.message}`);
+    }
+    throw error;
+  }
+
   const packet: Packet = {
     sequence: context.channelDatum.state.next_sequence_send,
     source_port: convertStringToHex(sendPacketOperator.sourcePort),
@@ -229,15 +315,7 @@ export async function buildUnsignedSendPacketTx(
     destination_port: context.channelDatum.state.channel.counterparty.port_id,
     destination_channel:
       context.channelDatum.state.channel.counterparty.channel_id,
-    data: convertStringToHex(
-      stringifyIcs20PacketData({
-        denom: packetDenom,
-        amount: sendPacketOperator.token.amount.toString(),
-        sender: sendPacketOperator.sender,
-        receiver: sendPacketOperator.receiver,
-        memo: sendPacketOperator.memo,
-      }),
-    ),
+    data: convertStringToHex(packetDataJson),
     timeout_height: sendPacketOperator.timeoutHeight,
     timeout_timestamp: sendPacketOperator.timeoutTimestamp,
   };
@@ -248,6 +326,7 @@ export async function buildUnsignedSendPacketTx(
     receiver: convertStringToHex(sendPacketOperator.receiver),
     memo: convertStringToHex(sendPacketOperator.memo),
   };
+  const packetCommitment = deps.commitPacket(packet);
 
   const encodedSpendChannelRedeemer = await deps.encode(
     {
@@ -260,20 +339,20 @@ export async function buildUnsignedSendPacketTx(
 
   const encodedSpendTransferModuleRedeemer = await deps.encode(
     {
-      Operator: [
+      Callback: [
         {
-          TransferModuleOperator: [
-            {
-              Transfer: {
-                channel_id: convertStringToHex(sendPacketOperator.sourceChannel),
-                data: fungibleTokenPacketData,
-              },
+          OnSendPacket: {
+            channel_id: convertStringToHex(sendPacketOperator.sourceChannel),
+            packet_data: packet.data,
+            packet_commitment: packetCommitment,
+            data: {
+              ModuleDataV1: [fungibleTokenPacketData],
             },
-          ],
+          },
         },
       ],
     },
-    'iBCModuleRedeemer',
+    'transferIBCModuleRedeemer',
   );
 
   const updatedChannelDatum: ChannelDatumLike = {
@@ -284,7 +363,7 @@ export async function buildUnsignedSendPacketTx(
       packet_commitment: insertSortMapWithNumberKey(
         context.channelDatum.state.packet_commitment,
         packet.sequence,
-        deps.commitPacket(packet),
+        packetCommitment,
       ),
     },
   };
@@ -317,12 +396,13 @@ export async function buildUnsignedSendPacketTx(
       context.deployment.mintVoucherScriptHash +
       buildVoucherTokenName(resolvedDenom, deps);
     const senderAddress = sendPacketOperator.sender;
+    const signerWalletAddress = sendPacketOperator.signer;
     const senderVoucherTokenUtxo = await deps.findUtxoAtWithUnit(
-      senderAddress,
+      signerWalletAddress,
       voucherTokenUnit,
     );
     const senderWalletUtxos = await deps.tryFindUtxosAt(
-      senderAddress,
+      signerWalletAddress,
       LOOKUP_RETRY_OPTIONS,
     );
     const walletUtxos = dedupeUtxos([
@@ -340,6 +420,8 @@ export async function buildUnsignedSendPacketTx(
       encodedHostStateRedeemer,
       encodedUpdatedHostStateDatum,
       encodedMintVoucherRedeemer,
+      encodedSpendTransferModuleRedeemer,
+      transferModuleReferenceUtxo: context.transferModuleReferenceUtxo,
       encodedSpendChannelRedeemer,
       encodedUpdatedChannelDatum: await deps.encode(updatedChannelDatum, 'channel'),
       transferAmount: sendPacketOperator.token.amount,
@@ -360,20 +442,21 @@ export async function buildUnsignedSendPacketTx(
         commit,
       },
       walletOverride: {
-        address: senderAddress,
+        address: signerWalletAddress,
         utxos: walletUtxos,
       },
     };
   }
 
   const senderAddress = sendPacketOperator.sender;
+  const signerWalletAddress = sendPacketOperator.signer;
   const senderWalletUtxos = await deps.tryFindUtxosAt(
-    senderAddress,
+    signerWalletAddress,
     LOOKUP_RETRY_OPTIONS,
   );
   if (senderWalletUtxos.length === 0) {
     throw deps.internalError(
-      `No spendable UTxOs found for sender ${senderAddress}`,
+      `No spendable UTxOs found for signer ${signerWalletAddress}`,
     );
   }
 
@@ -395,14 +478,12 @@ export async function buildUnsignedSendPacketTx(
     channelUTxO: context.channelUtxo,
     connectionUTxO: context.connectionUtxo,
     clientUTxO: context.clientUtxo,
-    transferModuleReferenceUtxo: transferEscrowShard.utxo
-      ? undefined
-      : context.transferModuleReferenceUtxo,
+    transferModuleReferenceUtxo: transferEscrowShard.transferModuleUtxo,
     encodedHostStateRedeemer,
     encodedUpdatedHostStateDatum,
     encodedSpendChannelRedeemer,
     encodedSpendTransferModuleRedeemer,
-    encodedMintTransferEscrowShardRedeemer: transferEscrowShard.utxo
+    encodedMintTransferEscrowShardRedeemer: transferEscrowShard.kind === 'existing'
       ? undefined
       : await deps.encode(
           {
@@ -410,6 +491,7 @@ export async function buildUnsignedSendPacketTx(
               channel_id: convertStringToHex(sendPacketOperator.sourceChannel),
               denom: convertStringToHex(packetDenom),
               data: fungibleTokenPacketData,
+              registry_siblings: transferEscrowShard.registrySiblings,
             },
           },
           'transferEscrowShardRedeemer',
@@ -424,7 +506,12 @@ export async function buildUnsignedSendPacketTx(
     channelTokenUnit: context.channelTokenUnit,
     transferModuleAddress: context.deployment.transferModuleAddress,
     denomToken,
-    transferEscrowUtxo: transferEscrowShard.utxo,
+    transferEscrowUtxo:
+      transferEscrowShard.kind === 'existing' ? transferEscrowShard.utxo : undefined,
+    encodedUpdatedTransferModuleDatum:
+      transferEscrowShard.kind === 'missing'
+        ? transferEscrowShard.encodedUpdatedTransferModuleDatum
+        : undefined,
     encodedTransferEscrowDatum: transferEscrowShard.encodedDatum,
     transferEscrowShardTokenUnit: transferEscrowShard.shardTokenUnit,
     sendPacketPolicyId: context.deployment.sendPacketPolicyId,
@@ -438,7 +525,7 @@ export async function buildUnsignedSendPacketTx(
       commit,
     },
     walletOverride: {
-      address: senderAddress,
+      address: signerWalletAddress,
       utxos: walletUtxos,
     },
   };
@@ -496,24 +583,6 @@ function insertSortMapWithNumberKey<K, V>(
       ([keyA], [keyB]) => Number(keyA) - Number(keyB),
     ),
   );
-}
-
-function stringifyIcs20PacketData(packet: {
-  denom?: string;
-  amount?: string;
-  sender?: string;
-  receiver?: string;
-  memo?: string;
-}): string {
-  const ordered: Record<string, string> = {};
-
-  if (packet.denom) ordered.denom = packet.denom;
-  if (packet.amount) ordered.amount = packet.amount;
-  if (packet.sender) ordered.sender = packet.sender;
-  if (packet.receiver) ordered.receiver = packet.receiver;
-  if (packet.memo) ordered.memo = packet.memo;
-
-  return JSON.stringify(ordered);
 }
 
 function convertStringToHex(value: string): string {

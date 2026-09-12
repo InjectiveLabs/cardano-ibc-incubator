@@ -1,10 +1,15 @@
+use aiken/collection/list
+use aiken/fuzz
+use aiken/primitive/bytearray
 use ibc/core/ics_023_vector_commitments/ics23/ics23
 use ibc/core/ics_023_vector_commitments/ics23/proof
 use ibc/core/ics_023_vector_commitments/ics23/proofs.{
-  CommitmentProof, CommitmentProof_Exist, ExistenceProof, InnerOp, LeafOp,
-  NonExistenceProof,
+  CommitmentProof, CommitmentProof_Exist, CommitmentProof_Nonexist,
+  ExistenceProof, InnerOp, LeafOp, NonExistenceProof, ProofSpec,
 }
-use ibc/core/ics_023_vector_commitments/merkle.{MerklePath}
+use ibc/core/ics_023_vector_commitments/merkle.{
+  MerklePath, MerkleProof, MerkleRoot,
+}
 use ibc/core/ics_023_vector_commitments/merkle_prefix
 
 test test_apply_prefix() {
@@ -37,6 +42,203 @@ test test_get_key_fail_with_index_too_big() fail {
   let m_path =
     MerklePath { key_path: ["storePrefixKey", "pathone/pathtwo/paththree/key"] }
   merkle.get_key(m_path, 3) == "storePrefixKey"
+}
+
+fn null_nonexist_commitment_proof() -> CommitmentProof {
+  CommitmentProof {
+    proof: CommitmentProof_Nonexist {
+      non_exist: proofs.null_non_existance_proof(),
+    },
+  }
+}
+
+fn chained_fixture(depth: Int, key: ByteArray, value: ByteArray) -> MerkleProof {
+  let lower =
+    ExistenceProof {
+      key,
+      value,
+      leaf: LeafOp { ..proofs.iavl_spec().leaf_spec, prefix: #"000202" },
+      path: list.repeat(
+        InnerOp {
+          hash: 1,
+          prefix: #"8202060220",
+          suffix: #"20afca3de8c7aefe1041f185a34e977a976b37d6ce4cce80e5e4545b93413eca02",
+        },
+        depth,
+      ),
+    }
+  let upper =
+    ExistenceProof {
+      key: #"696263",
+      value: proof.calculate_exist(lower),
+      leaf: proofs.tendermint_spec().leaf_spec,
+      path: [],
+    }
+  MerkleProof {
+    proofs: [
+      CommitmentProof { proof: CommitmentProof_Exist { exist: lower } },
+      CommitmentProof { proof: CommitmentProof_Exist { exist: upper } },
+    ],
+  }
+}
+
+fn legacy_chained_membership(
+  p: MerkleProof,
+  root: MerkleRoot,
+  key: ByteArray,
+  value: ByteArray,
+) -> Bool {
+  expect [lower, upper] = p.proofs
+  let lower_root = proof.calculate(lower)
+  expect
+    ics23.verify_membership(proofs.iavl_spec(), lower_root, lower, key, value)
+  let upper_root = proof.calculate(upper)
+  expect
+    ics23.verify_membership(
+      proofs.tendermint_spec(),
+      upper_root,
+      upper,
+      #"696263",
+      lower_root,
+    )
+  root.hash == upper_root
+}
+
+fn chained_inputs() -> Fuzzer<(Int, ByteArray, ByteArray)> {
+  fuzz.map3(
+    fuzz.int_between(0, 32),
+    fuzz.bytearray_between(1, 16),
+    fuzz.bytearray_between(1, 16),
+    fn(depth, key, value) { (depth, key, value) },
+  )
+}
+
+test prop_proof_chained_membership_matches_legacy(input via chained_inputs()) {
+  fuzz.label(@"fuzz.unit.proof.chained_membership")
+  let (depth, key, value) = input
+  let p = chained_fixture(depth, key, value)
+  expect [_, upper] = p.proofs
+  let root = MerkleRoot { hash: proof.calculate(upper) }
+  let wrong_root = MerkleRoot { hash: bytearray.concat(root.hash, #"00") }
+  let path = MerklePath { key_path: [#"696263", key] }
+  and {
+    merkle.verify_membership(p, merkle.get_sdk_specs(), root, path, value) == legacy_chained_membership(
+      p,
+      root,
+      key,
+      value,
+    ),
+    !merkle.verify_membership(
+      p,
+      merkle.get_sdk_specs(),
+      wrong_root,
+      path,
+      value,
+    ),
+    !legacy_chained_membership(p, wrong_root, key, value),
+  }
+}
+
+test chained_membership_rejects_wrong_key() fail {
+  let p = chained_fixture(1, #"01", #"02")
+  expect [_, upper] = p.proofs
+  merkle.verify_membership(
+    p,
+    merkle.get_sdk_specs(),
+    MerkleRoot { hash: proof.calculate(upper) },
+    MerklePath { key_path: [#"696263", #"03"] },
+    #"02",
+  )
+}
+
+test chained_membership_rejects_wrong_value() fail {
+  let p = chained_fixture(1, #"01", #"02")
+  expect [_, upper] = p.proofs
+  merkle.verify_membership(
+    p,
+    merkle.get_sdk_specs(),
+    MerkleRoot { hash: proof.calculate(upper) },
+    MerklePath { key_path: [#"696263", #"01"] },
+    #"03",
+  )
+}
+
+test chained_membership_rejects_wrong_intermediate_root() fail {
+  let p = chained_fixture(1, #"01", #"02")
+  expect [lower, upper] = p.proofs
+  expect CommitmentProof_Exist { exist } = upper.proof
+  let altered =
+    CommitmentProof {
+      proof: CommitmentProof_Exist {
+        exist: ExistenceProof { ..exist, value: #"03" },
+      },
+    }
+  merkle.verify_membership(
+    MerkleProof { proofs: [lower, altered] },
+    merkle.get_sdk_specs(),
+    MerkleRoot { hash: proof.calculate(altered) },
+    MerklePath { key_path: [#"696263", #"01"] },
+    #"02",
+  )
+}
+
+test chained_membership_rejects_wrong_spec() fail {
+  let p = chained_fixture(1, #"01", #"02")
+  expect [_, upper] = p.proofs
+  merkle.verify_membership(
+    p,
+    [proofs.null_proof_spec(), proofs.tendermint_spec()],
+    MerkleRoot { hash: proof.calculate(upper) },
+    MerklePath { key_path: [#"696263", #"01"] },
+    #"02",
+  )
+}
+
+test test_verify_membership_rejects_two_nonexist_proofs() fail {
+  let value = #"01"
+
+  merkle.verify_membership(
+    MerkleProof {
+      proofs: [
+        null_nonexist_commitment_proof(),
+        null_nonexist_commitment_proof(),
+      ],
+    },
+    merkle.get_sdk_specs(),
+    MerkleRoot { hash: value },
+    MerklePath { key_path: ["store", "key"] },
+    value,
+  )
+}
+
+test test_verify_membership_rejects_nonexist_before_exist() fail {
+  let key = #"6b6579"
+  let value = #"76616c7565"
+  let exist_proof =
+    CommitmentProof {
+      proof: CommitmentProof_Exist {
+        exist: ExistenceProof {
+          key,
+          value,
+          leaf: LeafOp {
+            hash: 1,
+            prehash_key: 0,
+            prehash_value: 1,
+            length: 1,
+            prefix: #"000202",
+          },
+          path: [],
+        },
+      },
+    }
+
+  merkle.verify_membership(
+    MerkleProof { proofs: [null_nonexist_commitment_proof(), exist_proof] },
+    merkle.get_sdk_specs(),
+    MerkleRoot { hash: proof.calculate(exist_proof) },
+    MerklePath { key_path: ["store", key] },
+    value,
+  )
 }
 
 test test_verify_membership_success_exist_left_with_iavl_spec() {
@@ -528,7 +730,7 @@ test test_verify_membership_success_with_exist_middle_with_terdermint_spec() {
   )
 }
 
-test test_is_left_neighbor() {
+fn multi_level_neighbor_non_existence_proof() -> NonExistenceProof {
   let non_exist_proof =
     NonExistenceProof {
       key: #"72656365697074732f706f7274732f7472616e736665722f6368616e6e656c732f6368616e6e656c2d3337332f73657175656e6365732f31",
@@ -744,9 +946,70 @@ test test_is_left_neighbor() {
         ],
       },
     }
+  non_exist_proof
+}
+
+test test_is_left_neighbor() {
+  let non_exist_proof = multi_level_neighbor_non_existence_proof()
+
   proof.is_left_neighbor(
     proofs.iavl_spec().inner_spec,
     non_exist_proof.left.path,
     non_exist_proof.right.path,
+  )
+}
+
+test verify_non_existence_proof_with_both_neighbors() {
+  let non_exist_proof = multi_level_neighbor_non_existence_proof()
+  let root = proof.calculate_exist(non_exist_proof.left)
+
+  proof.verify_non_existence_proof(
+    non_exist_proof,
+    proofs.iavl_spec(),
+    root,
+    non_exist_proof.key,
+  )
+}
+
+test verify_non_existence_proof_with_both_neighbors_rejects_boundary_key() {
+  let non_exist_proof = multi_level_neighbor_non_existence_proof()
+  let root = proof.calculate_exist(non_exist_proof.left)
+
+  !proof.verify_non_existence_proof(
+    non_exist_proof,
+    proofs.iavl_spec(),
+    root,
+    non_exist_proof.left.key,
+  )
+}
+
+test multi_level_paths_reject_reversed_neighbor_order() {
+  let non_exist_proof = multi_level_neighbor_non_existence_proof()
+
+  !proof.is_left_neighbor(
+    proofs.iavl_spec().inner_spec,
+    non_exist_proof.right.path,
+    non_exist_proof.left.path,
+  )
+}
+
+test non_existence_proof_rejects_missing_neighbors_without_hashing_key() {
+  let base_spec = proofs.iavl_spec()
+  let invalid_hash_spec =
+    ProofSpec {
+      ..base_spec,
+      leaf_spec: LeafOp { ..base_spec.leaf_spec, prehash_key: 10 },
+      prehash_key_before_comparison: True,
+    }
+
+  !proof.verify_non_existence_proof(
+    NonExistenceProof {
+      key: #"6d697373696e67",
+      left: proofs.null_existance_proof(),
+      right: proofs.null_existance_proof(),
+    },
+    invalid_hash_spec,
+    #[],
+    #"6d697373696e67",
   )
 }

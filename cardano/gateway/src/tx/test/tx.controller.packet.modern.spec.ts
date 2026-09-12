@@ -5,6 +5,7 @@ import { ConnectionService } from '../connection.service';
 import { ChannelService } from '../channel.service';
 import { PacketService } from '../packet.service';
 import { SubmissionService } from '../submission.service';
+import { HostStateHeartbeatService } from '../host-state-heartbeat.service';
 
 describe('TxController - Packet (modern)', () => {
   let controller: TxController;
@@ -13,6 +14,8 @@ describe('TxController - Packet (modern)', () => {
     sendPacket: jest.Mock;
     acknowledgementPacket: jest.Mock;
     timeoutPacket: jest.Mock;
+    timeoutOnClosePacket: jest.Mock;
+    prunePacketHistory: jest.Mock;
   };
   let channelServiceMock: {
     channelCloseInit: jest.Mock;
@@ -26,6 +29,8 @@ describe('TxController - Packet (modern)', () => {
       sendPacket: jest.fn(),
       acknowledgementPacket: jest.fn(),
       timeoutPacket: jest.fn(),
+      timeoutOnClosePacket: jest.fn(),
+      prunePacketHistory: jest.fn(),
     };
 
     channelServiceMock = {
@@ -40,6 +45,7 @@ describe('TxController - Packet (modern)', () => {
         { provide: ChannelService, useValue: channelServiceMock },
         { provide: PacketService, useValue: packetServiceMock },
         { provide: SubmissionService, useValue: {} },
+        { provide: HostStateHeartbeatService, useValue: {} },
       ],
     }).compile();
 
@@ -96,6 +102,41 @@ describe('TxController - Packet (modern)', () => {
 
     expect(packetServiceMock.timeoutPacket).toHaveBeenCalledWith(request);
     expect(response).toBe(expected);
+  });
+
+  it('delegates TimeoutOnClose to PacketService', async () => {
+    const request = { packet: { sequence: 3n }, proof_close: Uint8Array.from([1]) } as any;
+    const expected = { unsigned_tx: Buffer.from([5]) } as any;
+    packetServiceMock.timeoutOnClosePacket.mockResolvedValue(expected);
+
+    const response = await controller.TimeoutOnClose(request);
+
+    expect(packetServiceMock.timeoutOnClosePacket).toHaveBeenCalledWith(request);
+    expect(response).toBe(expected);
+  });
+
+  it('normalizes and delegates CardanoMsg PrunePacketHistory to PacketService', async () => {
+    const request = {
+      signer: 'addr_test1signer',
+      port_id: 'transfer',
+      channel_id: 'channel-7',
+      sequence: 9n,
+      // MerkleProof containing a recognized BatchProof variant.
+      proof_commitment_absence: Uint8Array.from([0x0a, 0x02, 0x1a, 0x00]),
+      proof_height: { revision_number: 0n, revision_height: 55n },
+    };
+    const expected = { unsigned_tx: { type_url: '', value: Uint8Array.from([1]) } };
+    packetServiceMock.prunePacketHistory.mockResolvedValue(expected);
+
+    await expect(controller.PrunePacketHistory(request)).resolves.toBe(expected);
+    expect(packetServiceMock.prunePacketHistory).toHaveBeenCalledWith(
+      expect.objectContaining({
+        portId: 'transfer',
+        channelId: 'channel-7',
+        sequence: 9n,
+        proofHeight: { revisionNumber: 0n, revisionHeight: 55n },
+      }),
+    );
   });
 
   it('delegates ChannelCloseInit to ChannelService', async () => {

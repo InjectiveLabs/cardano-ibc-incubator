@@ -1,5 +1,6 @@
 import {
   DEFAULT_HANDLER_JSON_PATH,
+  ICS20_PACKET_CODEC,
   bridgeManifestsEqual,
   loadBridgeConfigFromEnv,
   normalizeBridgeManifestConfig,
@@ -22,12 +23,14 @@ function buildValidator(name: string) {
 function buildHandlerJsonDeployment() {
   return {
     deployedAt: '2026-04-01T12:34:56.000Z',
+    ics20PacketCodec: ICS20_PACKET_CODEC.STRICT,
     hostStateNFT: {
       policyId: 'host-policy',
       name: 'host-token',
     },
     validators: {
       hostStateStt: buildValidator('hostStateStt'),
+      recoverClient: buildValidator('recoverClient'),
       spendClient: buildValidator('spendClient'),
       spendConnection: buildValidator('spendConnection'),
       spendChannel: {
@@ -39,6 +42,7 @@ function buildHandlerJsonDeployment() {
           chan_open_ack: { scriptHash: 'open-ack-hash', refUtxo: { txHash: 'open-ack-tx', outputIndex: 5 } },
           chan_open_confirm: { scriptHash: 'open-confirm-hash', refUtxo: { txHash: 'open-confirm-tx', outputIndex: 6 } },
           recv_packet: { scriptHash: 'recv-hash', refUtxo: { txHash: 'recv-tx', outputIndex: 7 } },
+          prune_packet_history: { scriptHash: 'prune-hash', refUtxo: { txHash: 'prune-tx', outputIndex: 10 } },
           send_packet: { scriptHash: 'send-hash', refUtxo: { txHash: 'send-tx', outputIndex: 8 } },
           timeout_packet: { scriptHash: 'timeout-hash', refUtxo: { txHash: 'timeout-tx', outputIndex: 9 } },
         },
@@ -87,9 +91,10 @@ describe('bridge manifest normalization', () => {
     });
 
     expect(loaded.bridgeManifest).toMatchObject({
-      schema_version: 3,
+      schema_version: 4,
       deployment_id: 'cardano-devnet:host-policy.host-token',
       deployed_at: '2026-04-01T12:34:56.000Z',
+      ics20_packet_codec: ICS20_PACKET_CODEC.STRICT,
       cardano: {
         chain_id: 'cardano-devnet',
         network_magic: 42,
@@ -106,6 +111,22 @@ describe('bridge manifest normalization', () => {
     expect(loaded.bridgeManifest.validators.voucher_metadata).toEqual({
       address: 'voucher-metadata-address',
     });
+    expect(loaded.deployment.validators.recoverClient).toEqual({
+      scriptHash: 'recoverClient-hash',
+      address: 'recoverClient-address',
+      refUtxo: {
+        txHash: 'recoverClient-tx',
+        outputIndex: 1,
+      },
+    });
+    expect(loaded.bridgeManifest.validators.recover_client).toEqual({
+      script_hash: 'recoverClient-hash',
+      address: 'recoverClient-address',
+      ref_utxo: {
+        tx_hash: 'recoverClient-tx',
+        output_index: 1,
+      },
+    });
 
     expect(loaded.deployment.validators.spendChannel.refValidator.chan_open_ack.scriptHash).toBe('open-ack-hash');
     expect(loaded.bridgeManifest.validators.spend_channel.ref_validator.chan_open_ack).toEqual({
@@ -114,6 +135,10 @@ describe('bridge manifest normalization', () => {
         tx_hash: 'open-ack-tx',
         output_index: 5,
       },
+    });
+    expect(loaded.bridgeManifest.validators.spend_channel.ref_validator.prune_packet_history).toEqual({
+      script_hash: 'prune-hash',
+      ref_utxo: { tx_hash: 'prune-tx', output_index: 10 },
     });
     expect(loaded.bridgeManifest.trace_registry).toEqual({
       address: 'trace-registry-address',
@@ -136,6 +161,82 @@ describe('bridge manifest normalization', () => {
 
     expect(manifestLoaded.deployment).toEqual(legacy.deployment);
     expect(bridgeManifestsEqual(manifestLoaded.bridgeManifest, legacy.bridgeManifest)).toBe(true);
+  });
+
+  it('keeps handler files without a recovery validator loadable', () => {
+    const current = buildHandlerJsonDeployment();
+    const { recoverClient: _recoverClient, ...legacyValidators } = current.validators;
+
+    const loaded = normalizeHandlerJsonDeploymentConfig(
+      { ...current, validators: legacyValidators },
+      {
+        chain_id: 'cardano-devnet',
+        network_magic: 42,
+        network: 'Custom',
+      },
+    );
+
+    expect(loaded.deployment.validators.recoverClient).toBeUndefined();
+    expect(loaded.bridgeManifest.validators.recover_client).toBeUndefined();
+  });
+
+  it('keeps manifests without a recovery validator loadable', () => {
+    const current = normalizeHandlerJsonDeploymentConfig(buildHandlerJsonDeployment(), {
+      chain_id: 'cardano-devnet',
+      network_magic: 42,
+      network: 'Custom',
+    }).bridgeManifest;
+    const { recover_client: _recoverClient, ...legacyValidators } = current.validators;
+
+    const loaded = normalizeBridgeManifestConfig({
+      ...current,
+      validators: legacyValidators,
+    });
+
+    expect(loaded.deployment.validators.recoverClient).toBeUndefined();
+    expect(loaded.bridgeManifest.validators.recover_client).toBeUndefined();
+  });
+
+  it('defaults handler files without a codec capability to the legacy validators', () => {
+    const { ics20PacketCodec: _codec, ...legacyHandler } = buildHandlerJsonDeployment();
+
+    const loaded = normalizeHandlerJsonDeploymentConfig(legacyHandler, {
+      chain_id: 'cardano-devnet',
+      network_magic: 42,
+      network: 'Custom',
+    });
+
+    expect(loaded.deployment.ics20PacketCodec).toBe(ICS20_PACKET_CODEC.LEGACY);
+    expect(loaded.bridgeManifest.ics20_packet_codec).toBe(ICS20_PACKET_CODEC.LEGACY);
+  });
+
+  it('defaults schema-v4 manifests without a codec capability to the legacy validators', () => {
+    const current = normalizeHandlerJsonDeploymentConfig(buildHandlerJsonDeployment(), {
+      chain_id: 'cardano-devnet',
+      network_magic: 42,
+      network: 'Custom',
+    });
+    const { ics20_packet_codec: _codec, ...legacyManifest } = current.bridgeManifest;
+
+    const loaded = normalizeBridgeManifestConfig(legacyManifest);
+
+    expect(loaded.deployment.ics20PacketCodec).toBe(ICS20_PACKET_CODEC.LEGACY);
+    expect(loaded.bridgeManifest.ics20_packet_codec).toBe(ICS20_PACKET_CODEC.LEGACY);
+  });
+
+  it('rejects unknown codec capabilities', () => {
+    const current = normalizeHandlerJsonDeploymentConfig(buildHandlerJsonDeployment(), {
+      chain_id: 'cardano-devnet',
+      network_magic: 42,
+      network: 'Custom',
+    });
+
+    expect(() =>
+      normalizeBridgeManifestConfig({
+        ...current.bridgeManifest,
+        ics20_packet_codec: 'future-codec',
+      }),
+    ).toThrow('Invalid bridge config: "ics20_packet_codec"');
   });
 
   it('rejects handler.json files without a deployment timestamp', () => {
@@ -164,7 +265,7 @@ describe('bridge manifest normalization', () => {
     );
   });
 
-  it('rejects bridge manifests with the old schema version', () => {
+  it('rejects bridge manifests with an old schema version', () => {
     const legacy = normalizeHandlerJsonDeploymentConfig(buildHandlerJsonDeployment(), {
       chain_id: 'cardano-devnet',
       network_magic: 42,
@@ -174,9 +275,9 @@ describe('bridge manifest normalization', () => {
     expect(() =>
       normalizeBridgeManifestConfig({
         ...legacy.bridgeManifest,
-        schema_version: 1,
+        schema_version: 3,
       }),
-    ).toThrow('Invalid bridge config: "schema_version" must be 2 or 3');
+    ).toThrow('Invalid bridge config: "schema_version" must be 4');
   });
 
   it('accepts legacy voucher_metadata validator payloads and normalizes them to address-only', () => {
@@ -188,7 +289,7 @@ describe('bridge manifest normalization', () => {
 
     const legacyManifest = {
       ...current.bridgeManifest,
-      schema_version: 2,
+      schema_version: 4,
       validators: {
         ...current.bridgeManifest.validators,
         voucher_metadata: {

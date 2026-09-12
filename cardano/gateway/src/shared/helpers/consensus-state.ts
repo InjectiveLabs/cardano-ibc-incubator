@@ -1,6 +1,6 @@
 /* eslint-disable @typescript-eslint/no-unused-vars */
-import { ConsensusState as ConsensusStateTendermint } from '@plus/proto-types/build/ibc/lightclients/tendermint/v1/tendermint';
-import { Timestamp } from '@plus/proto-types/build/google/protobuf/timestamp';
+import { ConsensusState as ConsensusStateTendermint } from '@cardano-ibc/proto-types/build/ibc/lightclients/tendermint/v1/tendermint';
+import { Timestamp } from '@cardano-ibc/proto-types/build/google/protobuf/timestamp';
 import { ConsensusState } from '../types/consensus-state';
 import { Height } from '../types/height';
 import { fromHex, toHex } from './hex';
@@ -10,18 +10,16 @@ export function normalizeConsensusStateFromDatum(
   consensusStateDatum: Map<Height, ConsensusState>,
   requestHeight: bigint,
 ): ConsensusStateTendermint {
-  let consensusState: ConsensusState;
-
-  for (const [height, consensusState_] of consensusStateDatum.entries()) {
-    if (height.revisionHeight == requestHeight) {
-      consensusState = consensusState_;
-    }
+  const consensusState = Array.from(consensusStateDatum.entries()).find(
+    ([height]) => height.revisionHeight === requestHeight,
+  )?.[1];
+  if (!consensusState) {
+    throw new GrpcNotFoundException(`Unable to find Consensus State at height ${requestHeight}`);
   }
-  if (!consensusState) throw new GrpcNotFoundException(`Unable to find Consensus State at height ${requestHeight}`); // Return undefined if no matching entry is found
   const consensus: ConsensusStateTendermint = {
     timestamp: Timestamp.fromPartial({
-      seconds: BigInt(Math.round(Number(consensusState.timestamp) / 1e9)),
-      nanos: Number(consensusState.timestamp) % 1e9,
+      seconds: consensusState.timestamp / 1_000_000_000n,
+      nanos: Number(consensusState.timestamp % 1_000_000_000n),
     }),
     /** commitment root (i.e app hash) */
     root: {
@@ -57,7 +55,7 @@ export function initializeConsensusState(consensusStateMsg: ConsensusStateTender
   return consensusState;
 }
 // Validate the structure and values of the consensus state
-export function validateConsensusState(consensusState: ConsensusState): GrpcInvalidArgumentException {
+export function validateConsensusState(consensusState: ConsensusState): GrpcInvalidArgumentException | null {
   if (consensusState.root?.hash?.length === 0) {
     return new GrpcInvalidArgumentException('root cannot be empty');
   }

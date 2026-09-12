@@ -47,13 +47,13 @@ func TestLightClientModuleVerifyClientMessageEmitsRejectedEvent(t *testing.T) {
 
 	header := newVerifiedTestHeader(t)
 	err := module.VerifyClientMessage(ctx, clientID, header)
-	require.ErrorContains(t, err, "must equal latest height")
+	require.ErrorContains(t, err, "must equal latest authenticated checkpoint")
 
 	event := findEventByType(t, ctx.EventManager().Events(), EventTypeProbabilisticHeaderRejected)
 	require.Equal(t, clientID, eventAttributeValue(t, event, AttributeKeyClientID))
 	require.Equal(t, header.TrustedHeight.String(), eventAttributeValue(t, event, AttributeKeyTrustedHeight))
 	require.Equal(t, header.GetHeight().String(), eventAttributeValue(t, event, AttributeKeyAcceptedHeight))
-	require.Contains(t, eventAttributeValue(t, event, AttributeKeyReason), "must equal latest height")
+	require.Contains(t, eventAttributeValue(t, event, AttributeKeyReason), "must equal latest authenticated checkpoint")
 }
 
 func TestLightClientModuleUpdateStateOnMisbehaviourEmitsFrozenEvent(t *testing.T) {
@@ -62,13 +62,68 @@ func TestLightClientModuleUpdateStateOnMisbehaviourEmitsFrozenEvent(t *testing.T
 
 	clientState := newProbabilisticTestClientState()
 	setClientState(clientStore, cdc, clientState)
+	header := newVerifiedTestHeader(t)
+	header.NewEpochContext = cloneEpochContext(mustCurrentTestEpochContext(t, clientState))
+	header.NewEpochContext.StakeDistribution[0].FirstRegistrationSlot++
+	require.True(t, module.CheckForMisbehaviour(ctx, clientID, header))
 
-	module.UpdateStateOnMisbehaviour(ctx, clientID, nil)
+	module.UpdateStateOnMisbehaviour(ctx, clientID, header)
+
+	frozen, found := getClientState(clientStore, cdc)
+	require.True(t, found)
+	require.True(t, frozen.FrozenHeight.EQ(FrozenHeight))
 
 	event := findEventByType(t, ctx.EventManager().Events(), EventTypeProbabilisticClientFrozen)
 	require.Equal(t, clientID, eventAttributeValue(t, event, AttributeKeyClientID))
 	require.Equal(t, FrozenHeight.String(), eventAttributeValue(t, event, AttributeKeyFrozenHeight))
 	require.Equal(t, "misbehaviour", eventAttributeValue(t, event, AttributeKeyReason))
+}
+
+func TestLightClientModuleRecoverClientUsesPrefixedClientStores(t *testing.T) {
+	ctx, subjectStore, module, subjectClientID := newProbabilisticTestModule(t, "probabilistic-recovery-module")
+	cdc := newProbabilisticTestCodec()
+	substituteClientID := ModuleName + "-1"
+	substituteStore := module.storeProvider.ClientStore(ctx, substituteClientID)
+
+	subject := newProbabilisticTestClientState()
+	subject.FrozenHeight = NewHeight(0, 5)
+	setTestCheckpoint(t, subject, subject.LatestHeight, "subject-hash-10", subject.CurrentEpoch, 10)
+	setClientState(subjectStore, cdc, subject)
+
+	substitute := newProbabilisticTestClientState()
+	substitute.LatestHeight = NewHeight(0, 20)
+	setTestCheckpoint(t, substitute, substitute.LatestHeight, "substitute-hash-20", substitute.CurrentEpoch, 20)
+	setClientState(substituteStore, cdc, substitute)
+	consensusState := newProbabilisticTestConsensusState("substitute-hash-20")
+	consensusState.Timestamp = substitute.LatestCheckpointTimestamp
+	setConsensusState(
+		substituteStore,
+		cdc,
+		consensusState,
+		substitute.LatestHeight,
+	)
+	setConsensusMetadataWithValues(
+		substituteStore,
+		substitute.LatestHeight,
+		clienttypes.NewHeight(0, 50),
+		123456789,
+	)
+
+	require.NoError(t, module.RecoverClient(ctx, subjectClientID, substituteClientID))
+
+	recovered, found := getClientState(subjectStore, cdc)
+	require.True(t, found)
+	require.True(t, recovered.LatestHeight.EQ(substitute.LatestHeight))
+	require.True(t, recovered.FrozenHeight.IsZero())
+	_, found = GetConsensusState(subjectStore, cdc, substitute.LatestHeight)
+	require.True(t, found)
+	processedHeight, found := GetProcessedHeight(subjectStore, substitute.LatestHeight)
+	require.True(t, found)
+	require.Equal(t, clienttypes.NewHeight(0, 50).String(), processedHeight.String())
+	processedTime, found := GetProcessedTime(subjectStore, substitute.LatestHeight)
+	require.True(t, found)
+	require.EqualValues(t, 123456789, processedTime)
+	require.NotEmpty(t, subjectStore.Get(IterationKey(substitute.LatestHeight)))
 }
 
 func newProbabilisticTestModule(t *testing.T, keyName string) (sdk.Context, storetypes.KVStore, LightClientModule, string) {

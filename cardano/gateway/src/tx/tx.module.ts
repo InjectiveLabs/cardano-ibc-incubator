@@ -14,9 +14,13 @@ import { IbcTreeCacheService } from '../shared/services/ibc-tree-cache.service';
 import { IbcTreePendingUpdatesService } from '../shared/services/ibc-tree-pending-updates.service';
 import { TxOperationRunnerService } from './tx-operation-runner.service';
 import { WalletContextService } from './wallet-context.service';
+import { HostStateHeartbeatService } from './host-state-heartbeat.service';
+import { GRPC_AUTH_TOKEN, GrpcAuthGuard, loadGrpcAuthToken } from '../security/grpc-auth.guard';
+import { HealthModule } from '../health/health.module';
+import { IbcTreeModule } from '../shared/modules/ibc-tree/ibc-tree.module';
 
 @Module({
-  imports: [LucidModule, QueryModule, KupoModule],
+  imports: [LucidModule, QueryModule, KupoModule, HealthModule, IbcTreeModule],
   controllers: [TxController],
   providers: [
     ClientService,
@@ -30,6 +34,12 @@ import { WalletContextService } from './wallet-context.service';
     WalletContextService,
     IbcTreeCacheService,
     IbcTreePendingUpdatesService,
+    HostStateHeartbeatService,
+    GrpcAuthGuard,
+    {
+      provide: GRPC_AUTH_TOKEN,
+      useFactory: loadGrpcAuthToken,
+    },
     Logger,
   ],
   exports: [IbcTreeCacheService, IbcTreePendingUpdatesService, PacketService],

@@ -1,3 +1,4 @@
+use cardano/assets.{Value}
 use cardano/transaction.{
   Input, Mint, Redeemer, ScriptPurpose, Spend, Transaction,
 }
@@ -33,7 +34,7 @@ use ibc/utils/validator_utils
 use spending_channel/chan_open_confirm
 use spending_channel/spending_channel_fixture.{MockData, setup}
 
-test succeed_chan_open_confirm() {
+fn check_chan_open_confirm(mint: Value) {
   let mock_data = setup()
 
   //========================arrange inputs=======================
@@ -52,6 +53,8 @@ test succeed_chan_open_confirm() {
   let input_channel_datum =
     ChannelDatum {
       state: ChannelDatumState {
+        maximum_receive_proof_height: height_mod.zero_height(),
+        minimum_receive_proof_height: height_mod.zero_height(),
         channel: input_channel,
         next_sequence_send: 1,
         next_sequence_recv: 1,
@@ -67,7 +70,8 @@ test succeed_chan_open_confirm() {
   let channel_input =
     test_utils.build_channel_input(input_channel_datum, mock_data.channel_token)
 
-  let inputs = [mock_data.module_input, channel_input]
+  let inputs =
+    [mock_data.host_state_input, mock_data.module_input, channel_input]
 
   //========================arrange reference_inputs=======================
   let proof_height = Height { revision_number: 1, revision_height: 16 }
@@ -282,20 +286,61 @@ test succeed_chan_open_confirm() {
     Transaction {
       ..transaction.placeholder,
       inputs,
+      mint,
       reference_inputs,
       outputs,
       redeemers,
       validity_range,
     }
 
-  chan_open_confirm.chan_open_confirm.spend(
+  chan_open_confirm.chan_open_confirm.mint(
     mock_data.client_minting_policy_id,
     mock_data.connection_minting_policy_id,
     mock_data.port_minting_policy_id,
     mock_data.verify_proof_policy_id,
-    None,
+    mock_data.host_state_nft_policy_id,
     mock_data.channel_token,
-    channel_input.output_reference,
+    mock_data.chan_open_confirm_policy_id,
     transaction,
+  )
+}
+
+test succeed_chan_open_confirm() {
+  let mock_data = setup()
+  check_chan_open_confirm(
+    assets.from_asset(mock_data.chan_open_confirm_policy_id, "", 1),
+  )
+}
+
+test chan_open_confirm_rejects_missing_marker() fail {
+  check_chan_open_confirm(assets.zero)
+}
+
+test chan_open_confirm_rejects_marker_burn() fail {
+  let mock_data = setup()
+  check_chan_open_confirm(
+    assets.from_asset(mock_data.chan_open_confirm_policy_id, "", -1),
+  )
+}
+
+test chan_open_confirm_rejects_multiple_markers() fail {
+  let mock_data = setup()
+  check_chan_open_confirm(
+    assets.from_asset(mock_data.chan_open_confirm_policy_id, "", 2),
+  )
+}
+
+test chan_open_confirm_rejects_wrong_marker_name() fail {
+  let mock_data = setup()
+  check_chan_open_confirm(
+    assets.from_asset(mock_data.chan_open_confirm_policy_id, "wrong", 1),
+  )
+}
+
+test chan_open_confirm_rejects_extra_marker_asset() fail {
+  let mock_data = setup()
+  check_chan_open_confirm(
+    assets.from_asset(mock_data.chan_open_confirm_policy_id, "", 1)
+      |> assets.add(mock_data.chan_open_confirm_policy_id, "extra", 1),
   )
 }

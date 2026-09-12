@@ -11,7 +11,12 @@ import {
   Query,
   UseFilters,
 } from '@nestjs/common';
-import { EstimateLocalOsmosisSwapDto, MsgtransferDto, PlanTransferRouteDto } from './api.dto';
+import {
+  EstimateLocalOsmosisSwapDto,
+  MsgtransferDto,
+  PlanTransferRouteDto,
+  PrunePacketHistoryDto,
+} from './api.dto';
 import {
   CheqdDidDocIcqRequestDto,
   CheqdDidDocVersionIcqRequestDto,
@@ -19,15 +24,11 @@ import {
   CheqdResourceIcqRequestDto,
 } from './cheqd-icq.dto';
 import { AsyncIcqAcknowledgementDto, AsyncIcqResultRequestDto } from './async-icq.dto';
-import {
-  VesseloracleConsolidatedDataReportIcqRequestDto,
-  VesseloracleLatestConsolidatedDataReportIcqRequestDto,
-} from './vesseloracle-icq.dto';
 import { ChannelService } from '~@/query/services/channel.service';
-import { QueryChannelsRequest } from '@plus/proto-types/build/ibc/core/channel/v1/query';
-import { IdentifiedChannel } from '@plus/proto-types/build/ibc/core/channel/v1/channel';
+import { QueryChannelsRequest } from '@cardano-ibc/proto-types/build/ibc/core/channel/v1/query';
+import { IdentifiedChannel } from '@cardano-ibc/proto-types/build/ibc/core/channel/v1/channel';
 import { PacketService } from '~@/tx/packet.service';
-import { MsgTransfer } from '@plus/proto-types/build/ibc/core/channel/v1/tx';
+import { MsgTransfer } from '@cardano-ibc/proto-types/build/ibc/core/channel/v1/tx';
 import { GrpcExceptionFilter } from '~@/exception/exception.filter';
 import { DenomTraceService, ResolvedDenomTrace } from '~@/query/services/denom-trace.service';
 import { LOVELACE } from '../constant';
@@ -36,8 +37,8 @@ import { TransferPlannerService } from './transfer-planner.service';
 import { BridgeManifestService } from '~@/query/services/bridge-manifest.service';
 import { QueryService } from '~@/query/services/query.service';
 import { CheqdIcqService } from './cheqd-icq.service';
-import { VesseloracleIcqService } from './vesseloracle-icq.service';
 import { parseVoucherAssetName } from '../shared/helpers/voucher-asset';
+import { validateAndFormatPrunePacketHistoryParams } from '../tx/helper/packet.validate';
 
 type ApiCardanoAssetDenomTrace = {
   asset_id: string;
@@ -81,7 +82,6 @@ export class ApiController {
     private readonly bridgeManifestService: BridgeManifestService,
     private readonly queryService: QueryService,
     private readonly cheqdIcqService: CheqdIcqService,
-    private readonly vesseloracleIcqService: VesseloracleIcqService,
   ) {}
 
   @Get('channels')
@@ -103,16 +103,45 @@ export class ApiController {
     };
     const request = QueryChannelsRequest.fromJSON(pageRequestDto);
     const response = await this.channelService.queryChannels(request);
-    const next_key = Buffer.from(response.pagination.next_key || '').toString('base64');
+    const next_key = Buffer.from(response.pagination?.next_key || '').toString('base64');
     return {
       channels: response.channels.map((chann) => IdentifiedChannel.toJSON(chann)),
       pagination: {
         next_key: next_key,
-        total: response.pagination.total.toString(),
+        total: (response.pagination?.total ?? 0n).toString(),
       },
       height: {
         revision_height: response.height.revision_height.toString(),
         revision_number: response.height.revision_number.toString(),
+      },
+    };
+  }
+
+  @Get('cardano/channel-ends')
+  async getCardanoChannelEnds(
+    @Query('key') key: string,
+    @Query('offset', ParseIntPipe) offset: number,
+    @Query('limit', ParseIntPipe) limit: number,
+    @Query('countTotal', ParseBoolPipe) countTotal: boolean,
+    @Query('reverse', ParseBoolPipe) reverse: boolean,
+  ) {
+    const request = QueryChannelsRequest.fromJSON({
+      pagination: {
+        key,
+        offset,
+        limit,
+        count_total: countTotal,
+        reverse,
+      },
+    });
+    const response = await this.channelService.listCurrentChannelEnds(request);
+    const next_key = Buffer.from(response.pagination?.next_key || '').toString('base64');
+
+    return {
+      channels: response.channels.map((channel) => IdentifiedChannel.toJSON(channel)),
+      pagination: {
+        next_key,
+        total: (response.pagination?.total ?? 0n).toString(),
       },
     };
   }
@@ -130,6 +159,25 @@ export class ApiController {
     const request = MsgTransfer.fromJSON(msgtransferDto);
     const response = await this.packetService.sendPacket(request);
 
+    return this.serializeUnsignedTxResponse(response);
+  }
+
+  @Post('packet-history/prune')
+  @HttpCode(200)
+  async buildPrunePacketHistory(@Body() dto: PrunePacketHistoryDto) {
+    const response = await this.packetService.prunePacketHistory(
+      validateAndFormatPrunePacketHistoryParams({
+        signer: dto.signer,
+        port_id: dto.port_id,
+        channel_id: dto.channel_id,
+        sequence: BigInt(dto.sequence),
+        proof_commitment_absence: Buffer.from(dto.proof_commitment_absence, 'base64'),
+        proof_height: {
+          revision_number: BigInt(dto.proof_height.revision_number),
+          revision_height: BigInt(dto.proof_height.revision_height),
+        },
+      }),
+    );
     return this.serializeUnsignedTxResponse(response);
   }
 
@@ -277,56 +325,6 @@ export class ApiController {
   @HttpCode(200)
   async getCheqdIcqResult(@Body() dto: AsyncIcqResultRequestDto) {
     return this.cheqdIcqService.findResult(dto);
-  }
-
-  @Post('icq/vesseloracle/consolidated-data-report')
-  @HttpCode(200)
-  async buildVesseloracleConsolidatedDataReportIcq(
-    @Body() requestDto: VesseloracleConsolidatedDataReportIcqRequestDto,
-  ) {
-    const response = await this.vesseloracleIcqService.buildConsolidatedDataReportQuery(requestDto);
-    return {
-      query_path: response.query_path,
-      source_port: response.source_port,
-      source_channel: response.source_channel,
-      packet_sequence: response.packet_sequence,
-      packet_data_hex: response.packet_data_hex,
-      ...this.serializeUnsignedTxResponse(response.tx),
-    };
-  }
-
-  @Post('icq/vesseloracle/consolidated-data-report/decode')
-  @HttpCode(200)
-  async decodeVesseloracleConsolidatedDataReportIcq(@Body() dto: AsyncIcqAcknowledgementDto) {
-    return this.vesseloracleIcqService.decodeConsolidatedDataReportAcknowledgement(dto.acknowledgement_hex);
-  }
-
-  @Post('icq/vesseloracle/latest-consolidated-data-report')
-  @HttpCode(200)
-  async buildVesseloracleLatestConsolidatedDataReportIcq(
-    @Body() requestDto: VesseloracleLatestConsolidatedDataReportIcqRequestDto,
-  ) {
-    const response = await this.vesseloracleIcqService.buildLatestConsolidatedDataReportQuery(requestDto);
-    return {
-      query_path: response.query_path,
-      source_port: response.source_port,
-      source_channel: response.source_channel,
-      packet_sequence: response.packet_sequence,
-      packet_data_hex: response.packet_data_hex,
-      ...this.serializeUnsignedTxResponse(response.tx),
-    };
-  }
-
-  @Post('icq/vesseloracle/latest-consolidated-data-report/decode')
-  @HttpCode(200)
-  async decodeVesseloracleLatestConsolidatedDataReportIcq(@Body() dto: AsyncIcqAcknowledgementDto) {
-    return this.vesseloracleIcqService.decodeLatestConsolidatedDataReportAcknowledgement(dto.acknowledgement_hex);
-  }
-
-  @Post('icq/vesseloracle/result')
-  @HttpCode(200)
-  async getVesseloracleIcqResult(@Body() dto: AsyncIcqResultRequestDto) {
-    return this.vesseloracleIcqService.findResult(dto);
   }
 
   private serializeUnsignedTxResponse(response: {

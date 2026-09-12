@@ -1,18 +1,60 @@
-import { GrpcInvalidArgumentException } from '~@/exception/grpc_exceptions';
+import { GrpcFailedPreconditionException, GrpcInvalidArgumentException } from '~@/exception/grpc_exceptions';
 import { CHANNEL_ID_PREFIX } from 'src/constant';
 import { decodeMerkleProof } from './helper';
-import { MerkleProof } from '@plus/proto-types/build/ibc/core/commitment/v1/commitment';
-import { convertHex2String, convertString2Hex, toHex } from '@shared/helpers/hex';
+import { MerkleProof } from '@cardano-ibc/proto-types/build/ibc/core/commitment/v1/commitment';
+import { convertString2Hex, toHex } from '@shared/helpers/hex';
 import { initializeMerkleProof } from '@shared/helpers/merkle-proof';
 import {
   MsgAcknowledgement,
   MsgRecvPacket,
   MsgTimeout,
+  MsgTimeoutOnClose,
   MsgTransfer,
-} from '@plus/proto-types/build/ibc/core/channel/v1/tx';
+} from '@cardano-ibc/proto-types/build/ibc/core/channel/v1/tx';
 import { FungibleTokenPacketDatum } from '@shared/types/apps/transfer/types/fungible-token-packet-data';
-import { AckPacketOperator, RecvPacketOperator, SendPacketOperator, TimeoutPacketOperator } from '../dto';
+import {
+  AckPacketOperator,
+  PrunePacketHistoryOperator,
+  RecvPacketOperator,
+  SendPacketOperator,
+  TimeoutOnClosePacketOperator,
+  TimeoutPacketOperator,
+} from '../dto';
+import { MsgPrunePacketHistory } from '@cardano-ibc/proto-types/build/ibc/cardano/v1/tx';
 import { isSupportedGatewayPortId } from '@shared/helpers/module-port';
+import { ChannelDatum } from '@shared/types/channel/channel-datum';
+import { Order } from '@shared/types/channel/order';
+import { MAX_PACKET_ENTRIES_PER_CHANNEL } from '@cardano-ibc/tx-builder';
+import { ICS20_PACKET_CODEC, type Ics20PacketCodec } from '../../config/bridge-manifest';
+import { decodeIcs20PacketDataForCodec } from '../../shared/helpers/ics20-packet-codec';
+
+function packetCapacityExhausted(channelDatum: ChannelDatum): GrpcFailedPreconditionException {
+  return new GrpcFailedPreconditionException(
+    `Channel ${channelDatum.port} retained packet state capacity of ` +
+      `${MAX_PACKET_ENTRIES_PER_CHANNEL} is exhausted`,
+  );
+}
+
+function packetEntryCount(channelDatum: ChannelDatum): number {
+  return (
+    channelDatum.state.packet_commitment.size +
+    channelDatum.state.packet_receipt.size +
+    channelDatum.state.packet_acknowledgement.size
+  );
+}
+
+export function validateRecvPacketHistoryCapacity(channelDatum: ChannelDatum): void {
+  const insertedEntries = channelDatum.state.channel.ordering === Order.Unordered ? 2 : 1;
+  if (packetEntryCount(channelDatum) + insertedEntries > MAX_PACKET_ENTRIES_PER_CHANNEL) {
+    throw packetCapacityExhausted(channelDatum);
+  }
+}
+
+export function validateSendPacketCommitmentCapacity(channelDatum: ChannelDatum): void {
+  if (packetEntryCount(channelDatum) >= MAX_PACKET_ENTRIES_PER_CHANNEL) {
+    throw packetCapacityExhausted(channelDatum);
+  }
+}
 
 export function validateAndFormatRecvPacketParams(data: MsgRecvPacket): {
   constructedAddress: string;
@@ -26,20 +68,28 @@ export function validateAndFormatRecvPacketParams(data: MsgRecvPacket): {
     throw new GrpcInvalidArgumentException(
       `Invalid argument: "destination_channel". Please use the prefix "${CHANNEL_ID_PREFIX}-"`,
     );
-  // Hermes (and standard IBC) uses well-known port ids like "transfer".
-  // Older versions of the Gateway used a legacy numeric port scheme (e.g. "port-100").
-  // Accept both for compatibility, but treat "transfer" / "mock" as canonical.
+  // Port identifiers are exact, case-sensitive commitment-path identities.
   if (!isSupportedGatewayPortId(data.packet.destination_port)) {
     throw new GrpcInvalidArgumentException(
       `Invalid argument: "destination_port" ${data.packet.destination_port} not supported`,
     );
   }
-  const decodedProofCommitment: MerkleProof = decodeMerkleProof(data.proof_commitment);
-  // Prepare the Recv packet operator object
-
   if (typeof data.packet?.timeout_timestamp === 'undefined') {
     throw new GrpcInvalidArgumentException('Invalid argument: "packet.timeout_timestamp" is required');
   }
+
+  const timeoutHeight = {
+    revisionHeight: BigInt(data.packet.timeout_height?.revision_height || 0),
+    revisionNumber: BigInt(data.packet.timeout_height?.revision_number || 0),
+  };
+  if (timeoutHeight.revisionHeight !== 0n || timeoutHeight.revisionNumber !== 0n) {
+    throw new GrpcInvalidArgumentException(
+      'Invalid argument: "packet.timeout_height" is not supported for Cardano receive packets; use "packet.timeout_timestamp"',
+    );
+  }
+
+  const decodedProofCommitment: MerkleProof = decodeMerkleProof(data.proof_commitment);
+  // Prepare the Recv packet operator object
 
   const recvPacketOperator: RecvPacketOperator = {
     channelId: data.packet.destination_channel,
@@ -50,13 +100,56 @@ export function validateAndFormatRecvPacketParams(data: MsgRecvPacket): {
       revisionHeight: BigInt(data.proof_height?.revision_height || 0),
       revisionNumber: BigInt(data.proof_height?.revision_number || 0),
     },
-    timeoutHeight: {
-      revisionHeight: BigInt(data.packet.timeout_height?.revision_height || 0),
-      revisionNumber: BigInt(data.packet.timeout_height?.revision_number || 0),
-    },
+    timeoutHeight,
     timeoutTimestamp: BigInt(data.packet?.timeout_timestamp),
   };
   return { constructedAddress, recvPacketOperator };
+}
+
+export function validateAndFormatPrunePacketHistoryParams(
+  data: MsgPrunePacketHistory,
+): PrunePacketHistoryOperator {
+  if (!data.signer) {
+    throw new GrpcInvalidArgumentException('Invalid argument: "signer" is required');
+  }
+  if (!data.port_id) {
+    throw new GrpcInvalidArgumentException('Invalid argument: "port_id" is required');
+  }
+  if (!data.channel_id?.startsWith(`${CHANNEL_ID_PREFIX}-`)) {
+    throw new GrpcInvalidArgumentException(
+      `Invalid argument: "channel_id". Please use the prefix "${CHANNEL_ID_PREFIX}-"`,
+    );
+  }
+
+  let sequence: bigint;
+  let proofHeight: { revisionNumber: bigint; revisionHeight: bigint };
+  try {
+    sequence = BigInt(data.sequence);
+    proofHeight = {
+      revisionNumber: BigInt(data.proof_height?.revision_number ?? 0),
+      revisionHeight: BigInt(data.proof_height?.revision_height ?? 0),
+    };
+  } catch {
+    throw new GrpcInvalidArgumentException('Invalid prune sequence or proof height');
+  }
+  if (sequence <= 0n) {
+    throw new GrpcInvalidArgumentException('Invalid argument: "sequence" must be positive');
+  }
+  if (proofHeight.revisionHeight <= 0n) {
+    throw new GrpcInvalidArgumentException('Invalid argument: "proof_height.revision_height" must be positive');
+  }
+  if (!data.proof_commitment_absence?.length) {
+    throw new GrpcInvalidArgumentException('Invalid argument: "proof_commitment_absence" is required');
+  }
+
+  return {
+    signer: data.signer,
+    portId: data.port_id,
+    channelId: data.channel_id,
+    sequence,
+    proofHeight,
+    proofCommitmentAbsence: initializeMerkleProof(decodeMerkleProof(data.proof_commitment_absence)),
+  };
 }
 
 export function validateAndFormatSendPacketParams(data: MsgTransfer): SendPacketOperator {
@@ -104,12 +197,15 @@ export function validateAndFormatSendPacketParams(data: MsgTransfer): SendPacket
       revisionNumber: BigInt(data.timeout_height?.revision_number || 0),
     },
     timeoutTimestamp: BigInt(data?.timeout_timestamp || 0),
-    memo: data.memo || undefined,
+    memo: data.memo || '',
   };
   return sendPacketOperator;
 }
 
-export function validateAndFormatTimeoutPacketParams(data: MsgTimeout): {
+export function validateAndFormatTimeoutPacketParams(
+  data: MsgTimeout,
+  ics20PacketCodec: Ics20PacketCodec = ICS20_PACKET_CODEC.STRICT,
+): {
   constructedAddress: string;
   timeoutPacketOperator: TimeoutPacketOperator;
 } {
@@ -121,7 +217,13 @@ export function validateAndFormatTimeoutPacketParams(data: MsgTimeout): {
     throw new GrpcInvalidArgumentException(
       `Invalid argument: "channel_id". Please use the prefix "${CHANNEL_ID_PREFIX}-"`,
     );
-  const fungibleTokenPacketData: FungibleTokenPacketDatum = JSON.parse(convertHex2String(toHex(data.packet.data)));
+  let fungibleTokenPacketData: FungibleTokenPacketDatum;
+  try {
+    fungibleTokenPacketData = decodeIcs20PacketDataForCodec(data.packet.data, ics20PacketCodec).data;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new GrpcInvalidArgumentException(`Invalid ICS-20 packet data: ${message}`);
+  }
   const decodedProofUnreceived: MerkleProof = decodeMerkleProof(data.proof_unreceived);
   // Prepare the timeoutPacketOperator object
   const timeoutPacketOperator: TimeoutPacketOperator = {
@@ -147,6 +249,25 @@ export function validateAndFormatTimeoutPacketParams(data: MsgTimeout): {
     },
   };
   return { constructedAddress, timeoutPacketOperator };
+}
+
+export function validateAndFormatTimeoutOnClosePacketParams(
+  data: MsgTimeoutOnClose,
+  ics20PacketCodec: Ics20PacketCodec = ICS20_PACKET_CODEC.STRICT,
+): {
+  constructedAddress: string;
+  timeoutOnClosePacketOperator: TimeoutOnClosePacketOperator;
+} {
+  const { constructedAddress, timeoutPacketOperator } = validateAndFormatTimeoutPacketParams(data, ics20PacketCodec);
+  const decodedProofClose: MerkleProof = decodeMerkleProof(data.proof_close);
+
+  return {
+    constructedAddress,
+    timeoutOnClosePacketOperator: {
+      ...timeoutPacketOperator,
+      proofClose: initializeMerkleProof(decodedProofClose),
+    },
+  };
 }
 
 export function validateAndFormatAcknowledgementPacketParams(data: MsgAcknowledgement): {
