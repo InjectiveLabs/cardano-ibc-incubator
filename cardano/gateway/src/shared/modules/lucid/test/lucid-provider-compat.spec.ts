@@ -9,6 +9,7 @@ import { Lucid } from '@lucid-evolution/lucid';
 
 function protocolParameters(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
+    version: { major: 11, minor: 0 },
     minFeeCoefficient: 44,
     minFeeConstant: { ada: { lovelace: 155381 } },
     maxTransactionSize: { bytes: 16384 },
@@ -33,6 +34,11 @@ function protocolParameters(overrides: Record<string, unknown> = {}): Record<str
 }
 
 describe('Ogmios protocol parameter compatibility', () => {
+  it.each([undefined, 10, 12])('rejects unsupported protocol version %s', (major) => {
+    expect(() => mapOgmiosProtocolParameters(protocolParameters({ version: { major } })))
+      .toThrow('Cardano protocol version 11 is required');
+  });
+
   afterEach(() => {
     jest.useRealTimers();
     jest.restoreAllMocks();
@@ -94,6 +100,30 @@ describe('Ogmios protocol parameter compatibility', () => {
     ).resolves.toBeDefined();
   });
 
+  it('accepts a protocol 11 response where Plutus V2 is unavailable', async () => {
+    const mapped = mapOgmiosProtocolParameters(
+      protocolParameters({
+        utxoCostPerByte: 4310,
+        plutusCostModels: {
+          'plutus:v1': [1, 2],
+          'plutus:v3': [3, 4],
+        },
+      }),
+    );
+
+    expect(mapped.costModels).toEqual({
+      PlutusV1: [1, 2],
+      PlutusV2: [],
+      PlutusV3: [3, 4],
+    });
+    await expect(
+      Lucid(undefined, 'Custom', {
+        presetProtocolParameters: mapped,
+        slotConfig: { zeroTime: 0, zeroSlot: 0, slotLength: 1000 },
+      }),
+    ).resolves.toBeDefined();
+  });
+
   it('rejects malformed responses instead of silently manufacturing parameters', () => {
     expect(() => mapOgmiosProtocolParameters(undefined)).toThrow('missing result');
     expect(() => mapOgmiosProtocolParameters(protocolParameters())).toThrow(
@@ -105,18 +135,7 @@ describe('Ogmios protocol parameter compatibility', () => {
           utxoCostPerByte: 4310,
         }),
       ),
-    ).toThrow('missing a non-empty plutus:v1 cost model');
-    expect(() =>
-      mapOgmiosProtocolParameters(
-        protocolParameters({
-          utxoCostPerByte: 4310,
-          plutusCostModels: {
-            'plutus:v1': [1, 2],
-            'plutus:v2': [],
-          },
-        }),
-      ),
-    ).toThrow('missing a non-empty plutus:v2 cost model');
+    ).toThrow('missing a non-empty Plutus cost model');
     expect(() =>
       mapOgmiosProtocolParameters(
         protocolParameters({

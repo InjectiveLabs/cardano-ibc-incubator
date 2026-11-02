@@ -1,6 +1,6 @@
 use crate::logger::{self, verbose};
+use crate::process::cardano::CardanoCli;
 use crate::process::runner;
-use crate::process::{cardano::CardanoCli, docker::DockerCli};
 use console::style;
 use indicatif::ProgressBar;
 use regex::Regex;
@@ -8,11 +8,8 @@ use reqwest::Client;
 use serde_json::Value;
 use std::error::Error;
 use std::fs::File;
-use std::fs::Permissions;
 use std::io::IsTerminal;
 use std::io::{self, BufReader, Write};
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
@@ -64,6 +61,45 @@ pub fn prompt_runtime_deployer_sk() -> Result<String, Box<dyn Error>> {
     )
 }
 
+fn parse_backup_operator(value: &str) -> Result<Option<String>, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.len() != 56 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("Backup operator must be a 56-character hexadecimal payment key hash".into());
+    }
+    Ok(Some(value.to_ascii_lowercase()))
+}
+
+pub fn prompt_backup_operator() -> Result<Option<String>, Box<dyn Error>> {
+    let configured = std::env::var("DEPLOYER_BACKUP_PAYMENT_KEY_HASH");
+    let backup = match configured {
+        Ok(value) if !value.trim().is_empty() => parse_backup_operator(&value)?,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err("DEPLOYER_BACKUP_PAYMENT_KEY_HASH contains invalid Unicode".into());
+        }
+        _ if io::stdin().is_terminal() && io::stderr().is_terminal() => {
+            eprintln!("Upgradeable deployments require governance approval and its activation delay before a backup nominee can become admin. Legacy deployments let the backup key claim admin directly. Use a different operator's payment key hash.");
+            loop {
+                eprint!("Backup operator payment key hash (Enter to skip on local or testnet): ");
+                io::stderr().flush()?;
+                let mut input = String::new();
+                io::stdin().read_line(&mut input)?;
+                match parse_backup_operator(&input) {
+                    Ok(backup) => break backup,
+                    Err(error) => eprintln!("{error}"),
+                }
+            }
+        }
+        _ => None,
+    };
+    if backup.is_none() {
+        eprintln!("WARNING: Deploying without a backup operator. No successor is preselected. Upgradeable deployments can still nominate one through governance. Legacy deployments will have no backup handover path. Set DEPLOYER_BACKUP_PAYMENT_KEY_HASH for unattended deployments.");
+    }
+    Ok(backup)
+}
+
 pub struct IndicatorMessage {
     pub message: String,
     pub step: String,
@@ -113,67 +149,6 @@ pub fn get_cardano_tip_state(
     }
 }
 
-pub enum CardanoQuery {
-    #[allow(dead_code)]
-    Epoch,
-    Slot,
-    SlotInEpoch,
-    SlotsToEpochEnd,
-}
-
-impl CardanoQuery {
-    fn as_str(&self) -> &'static str {
-        match self {
-            CardanoQuery::Epoch => "epoch",
-            CardanoQuery::Slot => "slot",
-            CardanoQuery::SlotInEpoch => "slotInEpoch",
-            CardanoQuery::SlotsToEpochEnd => "slotsToEpochEnd",
-        }
-    }
-}
-
-pub fn get_cardano_state(
-    project_root_dir: &Path,
-    query: CardanoQuery,
-) -> Result<u64, Box<dyn std::error::Error>> {
-    let cardano_tip_state = get_cardano_tip_state(project_root_dir)?;
-    let cardano_tip_json: Value = serde_json::from_str(&cardano_tip_state)?;
-    let epoch_json = cardano_tip_json.get(query.as_str());
-    if let Some(epoch) = epoch_json {
-        epoch.as_u64().ok_or_else(|| {
-            format!(
-                "Failed to parse {} from cardano-node: {}",
-                query.as_str(),
-                cardano_tip_state
-            )
-            .into()
-        })
-    } else {
-        Err(format!(
-            "Failed to extract {} from cardano-node: {}",
-            query.as_str(),
-            cardano_tip_state
-        )
-        .into())
-    }
-}
-
-pub fn get_cardano_era(project_root_dir: &Path) -> Result<String, Box<dyn std::error::Error>> {
-    let cardano_tip_state = get_cardano_tip_state(project_root_dir)?;
-    let cardano_tip_json: Value = serde_json::from_str(&cardano_tip_state)?;
-    let era_json = cardano_tip_json.get("era");
-
-    if let Some(era) = era_json.and_then(Value::as_str) {
-        Ok(era.to_string())
-    } else {
-        Err(format!(
-            "Failed to extract era from cardano-node: {}",
-            cardano_tip_state
-        )
-        .into())
-    }
-}
-
 pub fn replace_text_in_file(path: &Path, pattern: &str, replacement: &str) -> io::Result<()> {
     let content = fs::read_to_string(path)?;
     let re = Regex::new(pattern).map_err(io::Error::other)?;
@@ -182,45 +157,6 @@ pub fn replace_text_in_file(path: &Path, pattern: &str, replacement: &str) -> io
     file.write_all(new_content.as_bytes())?;
 
     Ok(())
-}
-
-pub fn change_dir_permissions_read_only(dir: &Path, exclude_files: &[&str]) -> std::io::Result<()> {
-    if dir.is_dir() {
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-
-            if path.is_dir() {
-                change_dir_permissions_read_only(&path, exclude_files)?;
-            } else if path.is_file() {
-                let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-                    continue;
-                };
-                if exclude_files.contains(&file_name) {
-                    continue;
-                }
-                verbose(&format!(
-                    "Set permissions to read-only for file: {}",
-                    path.display()
-                ));
-                set_read_only(&path)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn set_read_only(path: &Path) -> std::io::Result<()> {
-    let permissions = Permissions::from_mode(0o400);
-    fs::set_permissions(path, permissions)
-}
-
-#[cfg(windows)]
-fn set_read_only(path: &Path) -> std::io::Result<()> {
-    let mut permissions = fs::metadata(path)?.permissions();
-    permissions.set_readonly(true);
-    fs::set_permissions(path, permissions)
 }
 
 pub async fn download_file(
@@ -403,7 +339,8 @@ pub fn unzip_file(file_path: &Path, destination: &Path) -> Result<(), Box<dyn st
 
     for i in 0..file_count {
         let mut file = archive.by_index(i)?;
-        let outpath = destination.join(file.name());
+        let file_name = file.name()?.into_owned();
+        let outpath = destination.join(&file_name);
 
         if i == 1 {
             if let Some(parent) = outpath.parent() {
@@ -411,7 +348,7 @@ pub fn unzip_file(file_path: &Path, destination: &Path) -> Result<(), Box<dyn st
             }
         }
 
-        if file.name().ends_with('/') {
+        if file_name.ends_with('/') {
             fs::create_dir_all(&outpath)?;
         } else {
             if let Some(p) = outpath.parent() {
@@ -431,7 +368,7 @@ pub fn unzip_file(file_path: &Path, destination: &Path) -> Result<(), Box<dyn st
             }
         }
 
-        progress_bar.set_message(file.name().to_string());
+        progress_bar.set_message(file_name);
         progress_bar.inc(1);
     }
 
@@ -494,197 +431,6 @@ pub fn query_balance(project_root_path: &Path, address: &str) -> Result<u64, Str
 }
 
 /// Check if a Docker container is running and healthy
-pub fn check_container_status(container_name: &str) -> Result<String, Box<dyn Error>> {
-    let output = DockerCli::new(Path::new("."))
-        .raw_output(["inspect", "--format", "{{.State.Status}}", container_name].as_slice())
-        .map_err(io::Error::other)?;
-
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    } else {
-        Err(format!("Failed to inspect container {}", container_name).into())
-    }
-}
-
-/// Get the last N lines of Docker container logs
-pub fn get_container_logs(container_name: &str, lines: usize) -> Result<String, Box<dyn Error>> {
-    let lines_arg = lines.to_string();
-    let output = DockerCli::new(Path::new("."))
-        .raw_output(["logs", "--tail", lines_arg.as_str(), container_name].as_slice())
-        .map_err(io::Error::other)?;
-
-    Ok(String::from_utf8_lossy(&output.stderr).to_string())
-}
-
-/// Check if a container has exited and return the exit code
-pub fn get_container_exit_code(container_name: &str) -> Result<Option<i32>, Box<dyn Error>> {
-    let output = DockerCli::new(Path::new("."))
-        .raw_output(["inspect", "--format", "{{.State.ExitCode}}", container_name].as_slice())
-        .map_err(io::Error::other)?;
-
-    if output.status.success() {
-        let exit_code_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if let Ok(code) = exit_code_str.parse::<i32>() {
-            if code != 0 {
-                return Ok(Some(code));
-            }
-        }
-    }
-    Ok(None)
-}
-
-/// Check if container logs contain errors that require immediate intervention
-fn has_unrecoverable_error(logs: &str) -> bool {
-    logs.contains("permission denied")
-        || logs.contains("Permission denied")
-        || logs.contains("bind: address already in use")
-        || logs.contains("no space left on device")
-        || logs.contains("command not found")
-        || logs.contains("No such file or directory")
-}
-
-fn detect_known_startup_failure(logs: &str) -> Option<&'static str> {
-    if logs.contains("could not find protoc plugin for name openapiv2") {
-        return Some(
-            "Missing protoc plugin 'protoc-gen-openapiv2' in container PATH (required for OpenAPI generation)",
-        );
-    }
-
-    if logs.contains("failed to generate openapi spec")
-        && logs.contains("buf generate")
-        && logs.contains("context deadline exceeded")
-    {
-        return Some(
-            "Ignite failed while generating OpenAPI specs via buf (context deadline exceeded)",
-        );
-    }
-
-    if logs.contains("failed to generate openapi spec") && logs.contains("buf generate") {
-        return Some("Ignite failed while generating OpenAPI specs via buf");
-    }
-
-    None
-}
-
-fn format_log_excerpt(logs: &str, line_count: usize) -> String {
-    logs.lines()
-        .rev()
-        .take(line_count)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .map(|line| format!("   {}", line))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Diagnose why Docker containers failed to start
-/// Returns (diagnostics_string, should_fail_fast)
-pub fn diagnose_container_failure(container_names: &[&str]) -> (String, bool) {
-    let mut diagnostics = String::new();
-    let mut should_fail_fast = false;
-
-    for container_name in container_names {
-        match check_container_status(container_name) {
-            Ok(status) => {
-                let logs = get_container_logs(container_name, 80).ok();
-
-                if let Some(logs_content) = logs.as_deref() {
-                    if let Some(reason) = detect_known_startup_failure(logs_content) {
-                        diagnostics.push_str(&format!(
-                            "\n\nContainer '{}' reported startup failure: {}",
-                            container_name, reason
-                        ));
-                        diagnostics.push_str(&format!("\n   Container status: {}", status));
-                        diagnostics.push_str(&format!(
-                            "\n   Last log entries:\n{}",
-                            format_log_excerpt(logs_content, 12)
-                        ));
-                        should_fail_fast = true;
-
-                        // The container may still be "running" while the main startup process is
-                        // stuck/failing (for example, Ignite failing proto/OpenAPI generation).
-                        // In that case this diagnostic is already the actionable root cause.
-                        if status == "running" {
-                            continue;
-                        }
-                    }
-                }
-
-                if status != "running" {
-                    diagnostics.push_str(&format!(
-                        "\n\nContainer '{}' is not running (status: {})",
-                        container_name, status
-                    ));
-
-                    // Get exit code if container exited
-                    if let Ok(Some(exit_code)) = get_container_exit_code(container_name) {
-                        diagnostics.push_str(&format!("\n   Exit code: {}", exit_code));
-                    }
-
-                    // Get last 20 lines of logs
-                    if let Some(logs) = logs.as_deref() {
-                        // Check for errors that require immediate intervention
-                        if logs.contains("permission denied") || logs.contains("Permission denied")
-                        {
-                            diagnostics.push_str("\n   PERMISSION ERROR detected - requires fixing volume/socket permissions");
-                            should_fail_fast = true;
-                        }
-                        if logs.contains("bind: address already in use") {
-                            diagnostics.push_str("\n   PORT CONFLICT detected - requires stopping conflicting services");
-                            should_fail_fast = true;
-                        }
-                        if logs.contains("no space left on device") {
-                            diagnostics.push_str(
-                                "\n   DISK SPACE ERROR detected - requires freeing up disk space",
-                            );
-                            should_fail_fast = true;
-                        }
-
-                        // Determine if we should fail fast based on container state and error type
-                        if has_unrecoverable_error(logs) {
-                            // Unrecoverable errors should always fail fast, regardless of container state
-                            diagnostics.push_str("\n   UNRECOVERABLE ERROR detected - requires developer intervention");
-                            should_fail_fast = true;
-                        } else if status == "restarting" {
-                            // Container is restarting with transient errors, Docker may recover
-                            diagnostics.push_str(
-                                "\n   Container is restarting, Docker may recover automatically",
-                            );
-                            should_fail_fast = false;
-                        }
-
-                        diagnostics.push_str(&format!(
-                            "\n   Last log entries:\n{}",
-                            format_log_excerpt(logs, 10)
-                        ));
-                    }
-                }
-            }
-            Err(e) => {
-                diagnostics.push_str(&format!(
-                    "\n\nFailed to check container '{}': {}",
-                    container_name, e
-                ));
-            }
-        }
-    }
-
-    if diagnostics.is_empty() {
-        diagnostics
-            .push_str("\n\nAll containers appear to be running, but services are not responding.");
-        diagnostics.push_str(
-            "\n   This might be a network issue or the services need more time to initialize.",
-        );
-    }
-
-    (diagnostics, should_fail_fast)
-}
-
-/// Get current user's UID and GID for Docker containers
-/// - macOS: Returns 0:0 (root) for compatibility
-/// - Linux: Returns actual user UID/GID
-/// - Windows: Returns default 1000:1000
 pub fn get_user_ids() -> (String, String) {
     #[cfg(target_os = "macos")]
     {
@@ -704,5 +450,85 @@ pub fn get_user_ids() -> (String, String) {
     {
         // Default UID/GID for other systems (Windows, etc.)
         ("1000".to_string(), "1000".to_string())
+    }
+}
+
+#[cfg(test)]
+mod backup_operator_tests {
+    use super::parse_backup_operator;
+
+    #[test]
+    fn backup_operator_accepts_optional_input_and_normalizes_hashes() {
+        assert_eq!(parse_backup_operator(" \n").unwrap(), None);
+        assert_eq!(
+            parse_backup_operator(&format!(" {}\n", "AB".repeat(28))).unwrap(),
+            Some("ab".repeat(28))
+        );
+    }
+
+    #[test]
+    fn backup_operator_rejects_addresses_and_malformed_hashes() {
+        for value in [
+            "addr_test1example".to_string(),
+            "aa".repeat(27),
+            "aa".repeat(29),
+            "zz".repeat(28),
+        ] {
+            assert!(parse_backup_operator(&value).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::SystemTime;
+    use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
+
+    #[test]
+    fn unzip_repository_archive_preserves_files_and_executable_permissions() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("caribic-unzip-{}-{unique}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let archive_path = root.join("repository.zip");
+        let destination = root.join("repository");
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        let mut archive = ZipWriter::new(File::create(&archive_path).unwrap());
+        archive.add_directory("repository-main/", options).unwrap();
+        archive
+            .start_file("repository-main/README.md", options)
+            .unwrap();
+        archive.write_all(b"Repository contents\n").unwrap();
+        archive
+            .start_file(
+                "repository-main/scripts/start.sh",
+                options.unix_permissions(0o755),
+            )
+            .unwrap();
+        archive.write_all(b"#!/bin/sh\nexit 0\n").unwrap();
+        archive.finish().unwrap();
+
+        unzip_file(&archive_path, &destination).unwrap();
+
+        assert_eq!(
+            fs::read(destination.join("README.md")).unwrap(),
+            b"Repository contents\n"
+        );
+        let script = destination.join("scripts/start.sh");
+        assert_eq!(fs::read(&script).unwrap(), b"#!/bin/sh\nexit 0\n");
+        assert!(!destination.join("repository-main").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(script).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 }

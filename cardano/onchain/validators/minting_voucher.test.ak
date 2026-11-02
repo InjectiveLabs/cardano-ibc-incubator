@@ -1,5 +1,7 @@
 use aiken/builtin
+use aiken/collection/dict
 use aiken/collection/list
+use aiken/collection/pairs
 use aiken/crypto
 use aiken/fuzz
 use aiken/primitive/bytearray
@@ -11,8 +13,9 @@ use cardano/transaction.{
   ScriptPurpose, Spend, Transaction,
 }
 use ibc/apps/transfer/mint_voucher_redeemer.{
-  BurnVoucher, MintVoucher, MintVoucherRedeemer, RefundVoucher,
+  BurnVoucher, MintVoucher, MintVoucherRedeemer, PacketBatch, RefundVoucher,
 }
+use ibc/apps/transfer/packet_batch
 use ibc/apps/transfer/trace_registry.{
   Directory, InsertTrace, Shard, TraceRegistryDatum,
   TraceRegistryDirectoryBucket, TraceRegistryDirectoryDatum, TraceRegistryEntry,
@@ -27,8 +30,10 @@ use ibc/apps/transfer/voucher_metadata
 use ibc/auth.{AuthToken}
 use ibc/client/ics_007_tendermint_client/height.{Height}
 use ibc/core/ics_004/channel_redeemer.{
-  AcknowledgePacket, RecvPacket, SendPacket, TimeoutOnClose, TimeoutPacket,
+  AcknowledgePacket, RecvPacket, SendPacket, SpendChannelRedeemer,
+  TimeoutOnClose, TimeoutPacket,
 }
+use ibc/core/ics_004/packet_config.{PacketConfig}
 use ibc/core/ics_004/types/acknowledgement
 use ibc/core/ics_004/types/keys as channel_keys
 use ibc/core/ics_004/types/packet.{Packet}
@@ -38,8 +43,8 @@ use ibc/core/ics_005/types/ibc_module_redeemer.{
 }
 use ibc/core/ics_023_vector_commitments/merkle.{MerkleProof}
 use ibc/core/ics_025_handler_interface/host_state.{host_state_token_name}
+use ibc/encoding/hex
 use ibc/testing/fuzz_dsl
-use ibc/utils/string as string_utils
 use minting_voucher
 use trace_registry as trace_registry_validator
 
@@ -539,8 +544,7 @@ fn first_seen_voucher_fixture(
           1,
         )
 
-  expect Some(receiver_public_key_hash) =
-    string_utils.hex_string_to_bytes(receiver)
+  expect Some(receiver_public_key_hash) = hex.decode(receiver)
   let voucher_output =
     Output {
       address: from_verification_key(receiver_public_key_hash),
@@ -631,12 +635,13 @@ fn run_first_seen_voucher_mint_transition(
   )
     |> fuzz_dsl.with_protocol_validator_check(
         "minting_voucher",
-        minting_voucher.mint_voucher.mint(
+        check_packet_voucher(
           fixture.mock_data.module_token,
           fixture.mock_data.directory_auth_token,
           fixture.mock_data.voucher_metadata_script_hash,
           fixture.mock_data.channel_minting_policy_id,
           fixture.mock_data.host_state_nft_policy_id,
+          fixture.mock_data.module_token,
           fixture.redeemer,
           fixture.mock_data.voucher_minting_policy_id,
           fixture.transaction,
@@ -655,6 +660,7 @@ fn run_first_seen_voucher_mint_tx(
           fixture.mock_data.directory_auth_token,
           fixture.mock_data.voucher_minting_policy_id,
           "",
+          #"00000000000000000000000000000000000000000000000000000000",
           Some(fixture.trace_registry_datum),
           fixture.trace_registry_redeemer,
           fixture.trace_registry_spent_output_ref,
@@ -686,9 +692,7 @@ fn first_seen_metadata_datum_with(
   )
 }
 
-test prop_voucher_first_mint_policy_accepts_valid_metadata(_seed via fuzz.int()) {
-  fuzz.label(@"regression.contract.voucher.first_mint.valid_metadata")
-
+test regression_voucher_first_mint_policy_accepts_valid_metadata() {
   // First-seen voucher mint must create the canonical CIP-68 metadata output
   // for the full denom trace and voucher policy.
   first_seen_voucher_fixture(
@@ -699,10 +703,7 @@ test prop_voucher_first_mint_policy_accepts_valid_metadata(_seed via fuzz.int())
     |> fuzz_dsl.assert_protocol_checks_accept
 }
 
-test prop_tx_first_seen_voucher_mint_couples_registry_append(
-  _seed via fuzz.int(),
-) {
-  fuzz.label(@"regression.contract.voucher.first_mint.valid_registry_coupled")
+test regression_tx_first_seen_voucher_mint_couples_registry_append() {
   fuzz.label(@"regression.contract.packet.recv.valid_sink_mints_voucher")
 
   // tx.* depth: voucher mint and trace-registry append are checked together so
@@ -715,13 +716,7 @@ test prop_tx_first_seen_voucher_mint_couples_registry_append(
     |> fuzz_dsl.assert_protocol_checks_accept
 }
 
-test prop_tx_first_seen_voucher_mint_rejects_wrong_metadata_registry_coupled(
-  _seed via fuzz.int(),
-) {
-  fuzz.label(
-    @"regression.contract.voucher.first_mint.invalid_wrong_metadata_registry_coupled",
-  )
-
+test regression_tx_first_seen_voucher_mint_rejects_wrong_metadata_registry_coupled() {
   // The trace-registry append still matches the minted denom, but the CIP-68
   // metadata output tells a different human-readable story. The composed tx
   // must fail through the voucher policy while the registry check remains
@@ -753,9 +748,7 @@ test prop_tx_first_seen_voucher_mint_rejects_wrong_metadata_registry_coupled(
     |> fuzz_dsl.assert_protocol_checks_reject
 }
 
-test prop_voucher_first_mint_policy_rejects_wrong_name(_seed via fuzz.int()) {
-  fuzz.label(@"regression.contract.voucher.first_mint.invalid_wrong_name")
-
+test regression_voucher_first_mint_policy_rejects_wrong_name() {
   // Human-readable name must be derived from the same full denom as the token.
   let full_denom = "port-99/channel-99/ibc/usdt"
   let metadata_datum =
@@ -784,9 +777,7 @@ test prop_voucher_first_mint_policy_rejects_wrong_name(_seed via fuzz.int()) {
     |> fuzz_dsl.assert_protocol_checks_reject
 }
 
-test prop_voucher_first_mint_policy_rejects_wrong_ticker(_seed via fuzz.int()) {
-  fuzz.label(@"regression.contract.voucher.first_mint.invalid_wrong_ticker")
-
+test regression_voucher_first_mint_policy_rejects_wrong_ticker() {
   // Ticker is also canonical; otherwise wallets could display a misleading
   // asset symbol for a correctly named voucher.
   let full_denom = "port-99/channel-99/ibc/usdt"
@@ -816,13 +807,7 @@ test prop_voucher_first_mint_policy_rejects_wrong_ticker(_seed via fuzz.int()) {
     |> fuzz_dsl.assert_protocol_checks_reject
 }
 
-test prop_voucher_first_mint_policy_rejects_wrong_description(
-  _seed via fuzz.int(),
-) {
-  fuzz.label(
-    @"regression.contract.voucher.first_mint.invalid_wrong_description",
-  )
-
+test regression_voucher_first_mint_policy_rejects_wrong_description() {
   // Description carries the denom trace. It must not tell a different route
   // story than the actual voucher asset name.
   let full_denom = "port-99/channel-99/ibc/usdt"
@@ -852,11 +837,7 @@ test prop_voucher_first_mint_policy_rejects_wrong_description(
     |> fuzz_dsl.assert_protocol_checks_reject
 }
 
-test prop_voucher_first_mint_policy_rejects_wrong_full_denom(
-  _seed via fuzz.int(),
-) {
-  fuzz.label(@"regression.contract.voucher.first_mint.invalid_wrong_full_denom")
-
+test regression_voucher_first_mint_policy_rejects_wrong_full_denom() {
   // The metadata is internally consistent for the wrong denom, but the minted
   // asset name is derived from the correct denom. That mismatch must fail.
   let wrong_full_denom = "port-99/channel-404/ibc/usdt"
@@ -888,9 +869,7 @@ test prop_voucher_first_mint_policy_rejects_wrong_full_denom(
     |> fuzz_dsl.assert_protocol_checks_reject
 }
 
-test prop_voucher_first_mint_policy_rejects_wrong_policy(_seed via fuzz.int()) {
-  fuzz.label(@"regression.contract.voucher.first_mint.invalid_wrong_policy")
-
+test regression_voucher_first_mint_policy_rejects_wrong_policy() {
   // Metadata must name the policy that actually controls the voucher supply.
   let full_denom = "port-99/channel-99/ibc/usdt"
   let metadata_datum =
@@ -919,13 +898,7 @@ test prop_voucher_first_mint_policy_rejects_wrong_policy(_seed via fuzz.int()) {
     |> fuzz_dsl.assert_protocol_checks_reject
 }
 
-test prop_voucher_first_mint_policy_rejects_wrong_reference_asset(
-  _seed via fuzz.int(),
-) {
-  fuzz.label(
-    @"regression.contract.voucher.first_mint.invalid_wrong_reference_asset",
-  )
-
+test regression_voucher_first_mint_policy_rejects_wrong_reference_asset() {
   // The CIP-68 reference NFT name is derived from the same denom hash as the
   // user token. A wrong reference asset would let metadata attach to another
   // denom.
@@ -1211,8 +1184,7 @@ fn mint_voucher_succeeds_with_archive_profile(
           1,
         )
 
-  expect Some(receiver_public_key_hash) =
-    string_utils.hex_string_to_bytes(receiver)
+  expect Some(receiver_public_key_hash) = hex.decode(receiver)
 
   let voucher_output =
     Output {
@@ -1244,12 +1216,13 @@ fn mint_voucher_succeeds_with_archive_profile(
       mint,
     }
 
-  minting_voucher.mint_voucher.mint(
+  check_packet_voucher(
     mock_data.module_token,
     mock_data.directory_auth_token,
     mock_data.voucher_metadata_script_hash,
     mock_data.channel_minting_policy_id,
     mock_data.host_state_nft_policy_id,
+    mock_data.module_token,
     mint_voucher_redeemer,
     mock_data.voucher_minting_policy_id,
     transaction,
@@ -1437,8 +1410,7 @@ test test_mint_voucher_fails_with_wrong_mint_quantity() fail {
           1,
         )
 
-  expect Some(receiver_public_key_hash) =
-    string_utils.hex_string_to_bytes(receiver)
+  expect Some(receiver_public_key_hash) = hex.decode(receiver)
   let voucher_output =
     Output {
       address: from_verification_key(receiver_public_key_hash),
@@ -1482,12 +1454,13 @@ test test_mint_voucher_fails_with_wrong_mint_quantity() fail {
       mint,
     }
 
-  minting_voucher.mint_voucher.mint(
+  check_packet_voucher(
     mock_data.module_token,
     mock_data.directory_auth_token,
     mock_data.voucher_metadata_script_hash,
     mock_data.channel_minting_policy_id,
     mock_data.host_state_nft_policy_id,
+    mock_data.module_token,
     mint_voucher_redeemer,
     mock_data.voucher_minting_policy_id,
     transaction,
@@ -1614,8 +1587,7 @@ test test_mint_voucher_fails_with_noncanonical_metadata_datum() fail {
           1,
         )
 
-  expect Some(receiver_public_key_hash) =
-    string_utils.hex_string_to_bytes(receiver)
+  expect Some(receiver_public_key_hash) = hex.decode(receiver)
 
   let voucher_output =
     Output {
@@ -1647,12 +1619,13 @@ test test_mint_voucher_fails_with_noncanonical_metadata_datum() fail {
       mint,
     }
 
-  minting_voucher.mint_voucher.mint(
+  check_packet_voucher(
     mock_data.module_token,
     mock_data.directory_auth_token,
     mock_data.voucher_metadata_script_hash,
     mock_data.channel_minting_policy_id,
     mock_data.host_state_nft_policy_id,
+    mock_data.module_token,
     mint_voucher_redeemer,
     mock_data.voucher_minting_policy_id,
     transaction,
@@ -1726,8 +1699,7 @@ test test_mint_voucher_fails_without_trace_registry_witness() fail {
       },
     )
 
-  expect Some(receiver_public_key_hash) =
-    string_utils.hex_string_to_bytes(receiver)
+  expect Some(receiver_public_key_hash) = hex.decode(receiver)
 
   let transaction =
     Transaction {
@@ -1758,12 +1730,13 @@ test test_mint_voucher_fails_without_trace_registry_witness() fail {
       mint,
     }
 
-  minting_voucher.mint_voucher.mint(
+  check_packet_voucher(
     mock_data.module_token,
     mock_data.directory_auth_token,
     mock_data.voucher_metadata_script_hash,
     mock_data.channel_minting_policy_id,
     mock_data.host_state_nft_policy_id,
+    mock_data.module_token,
     mint_voucher_redeemer,
     mock_data.voucher_minting_policy_id,
     transaction,
@@ -1847,12 +1820,13 @@ test test_burn_voucher() {
       ),
     }
 
-  minting_voucher.mint_voucher.mint(
+  check_packet_voucher(
     mock_data.module_token,
     mock_data.directory_auth_token,
     mock_data.voucher_metadata_script_hash,
     mock_data.channel_minting_policy_id,
     mock_data.host_state_nft_policy_id,
+    mock_data.module_token,
     mint_voucher_redeemer,
     mock_data.voucher_minting_policy_id,
     transaction,
@@ -1933,12 +1907,13 @@ test test_burn_voucher_fails_with_wrong_burn_quantity() fail {
       ),
     }
 
-  minting_voucher.mint_voucher.mint(
+  check_packet_voucher(
     mock_data.module_token,
     mock_data.directory_auth_token,
     mock_data.voucher_metadata_script_hash,
     mock_data.channel_minting_policy_id,
     mock_data.host_state_nft_policy_id,
+    mock_data.module_token,
     mint_voucher_redeemer,
     mock_data.voucher_minting_policy_id,
     transaction,
@@ -1986,7 +1961,7 @@ fn check_refund_voucher(use_timeout_on_close: Bool) {
       reference_token_name,
     )
 
-  expect Some(sender_public_key_hash) = string_utils.hex_string_to_bytes(sender)
+  expect Some(sender_public_key_hash) = hex.decode(sender)
 
   let mint =
     from_asset(mock_data.voucher_minting_policy_id, token_name, transfer_amount)
@@ -2027,6 +2002,7 @@ fn check_refund_voucher(use_timeout_on_close: Bool) {
         proof_close: mock_proof(),
         proof_height: Height { revision_number: 1, revision_height: 1 },
         next_sequence_recv: 1,
+        counterparty_upgrade_sequence: 0,
       }
     } else {
       TimeoutPacket {
@@ -2070,12 +2046,13 @@ fn check_refund_voucher(use_timeout_on_close: Bool) {
       mint,
     }
 
-  minting_voucher.mint_voucher.mint(
+  check_packet_voucher(
     mock_data.module_token,
     mock_data.directory_auth_token,
     mock_data.voucher_metadata_script_hash,
     mock_data.channel_minting_policy_id,
     mock_data.host_state_nft_policy_id,
+    mock_data.module_token,
     mint_voucher_redeemer,
     mock_data.voucher_minting_policy_id,
     transaction,
@@ -2131,7 +2108,7 @@ test test_refund_voucher_fails_with_wrong_mint_quantity() fail {
       reference_token_name,
     )
 
-  expect Some(sender_public_key_hash) = string_utils.hex_string_to_bytes(sender)
+  expect Some(sender_public_key_hash) = hex.decode(sender)
 
   let wrong_mint =
     from_asset(
@@ -2207,12 +2184,13 @@ test test_refund_voucher_fails_with_wrong_mint_quantity() fail {
       mint: wrong_mint,
     }
 
-  minting_voucher.mint_voucher.mint(
+  check_packet_voucher(
     mock_data.module_token,
     mock_data.directory_auth_token,
     mock_data.voucher_metadata_script_hash,
     mock_data.channel_minting_policy_id,
     mock_data.host_state_nft_policy_id,
+    mock_data.module_token,
     mint_voucher_redeemer,
     mock_data.voucher_minting_policy_id,
     transaction,
@@ -2260,7 +2238,7 @@ test test_refund_voucher_fails_with_wrong_metadata_mapping() fail {
       reference_token_name,
     )
 
-  expect Some(sender_public_key_hash) = string_utils.hex_string_to_bytes(sender)
+  expect Some(sender_public_key_hash) = hex.decode(sender)
 
   let mint =
     from_asset(mock_data.voucher_minting_policy_id, token_name, transfer_amount)
@@ -2332,12 +2310,13 @@ test test_refund_voucher_fails_with_wrong_metadata_mapping() fail {
       mint,
     }
 
-  minting_voucher.mint_voucher.mint(
+  check_packet_voucher(
     mock_data.module_token,
     mock_data.directory_auth_token,
     mock_data.voucher_metadata_script_hash,
     mock_data.channel_minting_policy_id,
     mock_data.host_state_nft_policy_id,
+    mock_data.module_token,
     mint_voucher_redeemer,
     mock_data.voucher_minting_policy_id,
     transaction,
@@ -2391,7 +2370,7 @@ test test_refund_voucher_fail() fail {
       ftpd.denom,
     )
 
-  expect Some(sender_public_key_hash) = string_utils.hex_string_to_bytes(sender)
+  expect Some(sender_public_key_hash) = hex.decode(sender)
 
   let mint =
     from_asset(mock_data.voucher_minting_policy_id, token_name, transfer_amount)
@@ -2465,14 +2444,227 @@ test test_refund_voucher_fail() fail {
       mint,
     }
 
-  minting_voucher.mint_voucher.mint(
+  check_packet_voucher(
     mock_data.module_token,
     mock_data.directory_auth_token,
     mock_data.voucher_metadata_script_hash,
     mock_data.channel_minting_policy_id,
     mock_data.host_state_nft_policy_id,
+    mock_data.module_token,
     mint_voucher_redeemer,
     mock_data.voucher_minting_policy_id,
     transaction,
+  )
+}
+
+// Reuse the metadata and registry regression fixtures with the canonical
+// packet authorization. Full operation validation is covered by compiled
+// funded-send and receive transactions in the offchain suite.
+fn check_packet_voucher(
+  module_token: AuthToken,
+  directory_token: AuthToken,
+  metadata_hash: ByteArray,
+  channel_policy: PolicyId,
+  host_policy: PolicyId,
+  config_token: AuthToken,
+  requested: MintVoucherRedeemer,
+  voucher_policy: PolicyId,
+  tx: Transaction,
+) -> Bool {
+  let batch_policy = #"abababababababababababababababababababababababababababab"
+  expect Some(channel_input) =
+    list.find(
+      tx.inputs,
+      fn(input) {
+        !dict.is_empty(assets.tokens(input.output.value, channel_policy))
+      },
+    )
+  expect Some(raw) =
+    pairs.get_first(tx.redeemers, Spend(channel_input.output_reference))
+  expect channel_action: SpendChannelRedeemer = raw
+  let packet =
+    when channel_action is {
+      RecvPacket { packet, .. } |
+      SendPacket { packet } |
+      AcknowledgePacket { packet, .. } |
+      TimeoutPacket { packet, .. } |
+      TimeoutOnClose { packet, .. } -> packet
+      _ -> fail
+    }
+  let lane =
+    packet_batch.LaneInputUpdate {
+      input_ref: channel_input.output_reference,
+      updates: [],
+    }
+  let empty_proof = MerkleProof { proofs: [] }
+  let h = Height { revision_number: 1, revision_height: 1 }
+  let (operation, extra_inputs) =
+    when requested is {
+      MintVoucher {
+        data,
+        packet_source_port,
+        packet_source_channel,
+        packet_dest_port,
+        packet_dest_channel,
+      } -> {
+        expect
+          packet.source_port == packet_source_port && packet.source_channel == packet_source_channel
+        expect
+          packet.destination_port == packet_dest_port && packet.destination_channel == packet_dest_channel
+        expect fungible_token_packet_data.matches_bytes(data, packet.data)
+        (
+          packet_batch.Receive {
+            packet,
+            data,
+            proof_height: h,
+            proof: empty_proof,
+            lane,
+            liquidity_refs: [],
+          },
+          [],
+        )
+      }
+      BurnVoucher { data, packet_source_port, packet_source_channel } -> {
+        expect
+          packet.source_port == packet_source_port && packet.source_channel == packet_source_channel
+        expect fungible_token_packet_data.matches_bytes(data, packet.data)
+        let intent =
+          packet_batch.TransferIntent {
+            port_id: packet_source_port,
+            channel_id: packet_source_channel,
+            owner: #"11",
+            data,
+            timeout_timestamp: packet.timeout_timestamp,
+          }
+        let input =
+          Input {
+            output_reference: OutputReference {
+              transaction_id: #"ac",
+              output_index: 0,
+            },
+            output: Output {
+              ..channel_input.output,
+              datum: InlineDatum(intent),
+            },
+          }
+        (
+          packet_batch.SendBatch {
+            sequencer_ref: channel_input.output_reference,
+            intents: [input.output_reference],
+            packets: [packet],
+            lanes: [],
+          },
+          [input],
+        )
+      }
+      RefundVoucher { data, packet_source_port, packet_source_channel, .. } -> {
+        expect
+          packet.source_port == packet_source_port && packet.source_channel == packet_source_channel
+        expect fungible_token_packet_data.matches_bytes(data, packet.data)
+        (
+          packet_batch.Timeout {
+            packet,
+            data,
+            proof_height: h,
+            proof: empty_proof,
+            lane,
+            liquidity_refs: [],
+          },
+          [],
+        )
+      }
+      _ -> fail
+    }
+  let config =
+    PacketConfig {
+      host_policy,
+      state_policy: #"00",
+      batch_policy,
+      guard_hash: #"00",
+      lane_count: 16,
+      trace_registry_hash: "trace registry script hash",
+    }
+  let reference =
+    Input {
+      output_reference: OutputReference {
+        transaction_id: #"ad",
+        output_index: 0,
+      },
+      output: Output {
+        ..channel_input.output,
+        value: assets.from_asset(config_token.policy_id, config_token.name, 1),
+        datum: InlineDatum(config),
+      },
+    }
+  let authorized: Data =
+    packet_batch.AuthorizedOperation {
+      channel_token: module_token,
+      operation,
+      history_witness: None,
+    }
+  let transaction =
+    Transaction {
+      ..tx,
+      inputs: list.concat(tx.inputs, extra_inputs),
+      reference_inputs: [reference, ..tx.reference_inputs],
+      redeemers: [Pair(Mint(batch_policy), authorized), ..tx.redeemers],
+    }
+  minting_voucher.mint_voucher.mint(
+    module_token,
+    directory_token,
+    metadata_hash,
+    channel_policy,
+    host_policy,
+    config_token,
+    PacketBatch,
+    voucher_policy,
+    transaction,
+  )
+}
+
+test legacy_voucher_actions_are_disabled() {
+  let mock = prepare_mock_data()
+  let data =
+    FungibleTokenPacketData {
+      denom: "transfer/channel-0/test",
+      amount: "1",
+      sender: "a",
+      receiver: "b",
+      memo: "",
+    }
+  list.all(
+    [
+      MintVoucher {
+        packet_source_port: "transfer",
+        packet_source_channel: "channel-1",
+        packet_dest_port: "transfer",
+        packet_dest_channel: "channel-0",
+        data,
+      },
+      BurnVoucher {
+        packet_source_port: "transfer",
+        packet_source_channel: "channel-0",
+        data,
+      },
+      RefundVoucher {
+        packet_source_port: "transfer",
+        packet_source_channel: "channel-0",
+        data,
+        acknowledgement: None,
+      },
+    ],
+    fn(action) {
+      !minting_voucher.mint_voucher.mint(
+        mock.module_token,
+        mock.directory_auth_token,
+        mock.voucher_metadata_script_hash,
+        mock.channel_minting_policy_id,
+        mock.host_state_nft_policy_id,
+        mock.module_token,
+        action,
+        mock.voucher_minting_policy_id,
+        transaction.placeholder,
+      )
+    },
   )
 }

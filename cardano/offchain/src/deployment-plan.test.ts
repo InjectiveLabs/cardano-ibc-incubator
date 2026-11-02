@@ -1,0 +1,306 @@
+import {
+  assert,
+  assertEquals,
+  assertNotEquals,
+  assertRejects,
+} from "@std/assert";
+import {
+  Lucid,
+  type LucidEvolution,
+  PROTOCOL_PARAMETERS_DEFAULT,
+  walletFromSeed,
+} from "@lucid-evolution/lucid";
+import { Emulator } from "@lucid-evolution/provider";
+import { createCardanoScalusEvaluator } from "./scalus-evaluator.ts";
+import {
+  DEPLOYMENT_PLAN_FIXTURE,
+  loadDeploymentPlan,
+  loadStagedTendermintValidators,
+} from "./deployment-plan.ts";
+import {
+  buildReferenceValidatorSizeReport,
+  createDeployment,
+} from "./deployment.ts";
+import { RESERVED_DEPLOYMENT_NONCE_COUNT } from "./constants.ts";
+
+const lucidLoader = {
+  config: () => ({ network: "Preview" }),
+} as unknown as LucidEvolution;
+const inputs = { ...DEPLOYMENT_PLAN_FIXTURE, benchmarkVoucherEnabled: false };
+
+Deno.test("mainnet requires a distinct backup operator before loading deployment scripts", async () => {
+  const mainnet = {
+    config: () => ({ network: "Mainnet" }),
+  } as unknown as LucidEvolution;
+  for (const backupOperatorKeyHash of [undefined, "", "   "]) {
+    await assertRejects(
+      () => loadDeploymentPlan(mainnet, { ...inputs, backupOperatorKeyHash }),
+      Error,
+      "Mainnet deployment requires DEPLOYER_BACKUP_PAYMENT_KEY_HASH",
+    );
+  }
+  for (
+    const backupOperatorKeyHash of [inputs.deployerPaymentKeyHash, "invalid"]
+  ) {
+    await assertRejects(
+      () => loadDeploymentPlan(mainnet, { ...inputs, backupOperatorKeyHash }),
+      Error,
+      "different 28-byte payment key hash",
+    );
+  }
+  await loadDeploymentPlan(mainnet, {
+    ...inputs,
+    backupOperatorKeyHash: "55".repeat(28),
+  });
+});
+
+Deno.test("the backup is fixed in the deployed HostState script", async () => {
+  const withoutBackup = await loadDeploymentPlan(lucidLoader, inputs);
+  const withBackup = await loadDeploymentPlan(lucidLoader, {
+    ...inputs,
+    backupOperatorKeyHash: "55".repeat(28),
+  });
+  assertNotEquals(withBackup.hostState.hash, withoutBackup.hostState.hash);
+  assertEquals(withBackup.hostNft.hash, withoutBackup.hostNft.hash);
+  await assertRejects(
+    () =>
+      loadDeploymentPlan(lucidLoader, {
+        ...inputs,
+        backupOperatorKeyHash: inputs.deployerPaymentKeyHash,
+      }),
+    Error,
+    "different 28-byte payment key hash",
+  );
+  await assertRejects(
+    () =>
+      loadDeploymentPlan(lucidLoader, {
+        ...inputs,
+        backupOperatorKeyHash: "not-a-key-hash",
+      }),
+    Error,
+    "different 28-byte payment key hash",
+  );
+});
+
+Deno.test("production plan is deterministic and partitions every loaded script by publication", async () => {
+  const plan = await loadDeploymentPlan(lucidLoader, inputs);
+  assertEquals(await loadDeploymentPlan(lucidLoader, inputs), plan);
+  assertEquals(
+    plan.validators.length,
+    plan.referenceValidators.length + plan.inlineValidators.length,
+  );
+  assertEquals(
+    new Set(plan.validators.map(({ title }) => title)).size,
+    plan.validators.length,
+  );
+  assertEquals(
+    new Set(plan.referenceValidators.map(({ hash }) => hash)).size,
+    plan.referenceValidators.length,
+  );
+  assert(plan.referenceValidators.includes(plan.hostState));
+  assert(plan.referenceValidators.includes(plan.genericModule));
+  assert(plan.inlineValidators.includes(plan.hostNft));
+  assert(plan.inlineValidators.includes(plan.mockToken));
+  assert(
+    plan.referenceValidators.every(({ publication }) =>
+      publication === "bootstrap" || publication === "runtime"
+    ),
+  );
+  assert(
+    plan.inlineValidators.every(({ publication }) => publication === "inline"),
+  );
+});
+
+Deno.test("the optional benchmark policy is inventoried and pins the registry variant", async () => {
+  const production = await loadDeploymentPlan(lucidLoader, inputs);
+  const benchmark = await loadDeploymentPlan(lucidLoader, {
+    ...inputs,
+    benchmarkVoucherEnabled: true,
+  });
+  assertEquals(production.benchmarkVoucher, null);
+  assert(benchmark.benchmarkVoucher);
+  assert(benchmark.referenceValidators.includes(benchmark.benchmarkVoucher));
+  assertEquals(
+    benchmark.referenceValidators.length,
+    production.referenceValidators.length + 1,
+  );
+  assertNotEquals(benchmark.traceRegistry.hash, production.traceRegistry.hash);
+  for (
+    const validator of production.validators.filter(({ title }) =>
+      title !== production.traceRegistry.title
+    )
+  ) {
+    assertEquals(
+      benchmark.validators.find(({ title }) => title === validator.title),
+      validator,
+    );
+  }
+});
+
+Deno.test("the deployment inventory uses the staged client and session policy graph", async () => {
+  const plan = await loadDeploymentPlan(lucidLoader, inputs);
+  const staged = loadStagedTendermintValidators(
+    lucidLoader,
+    plan.hostNft.hash,
+    plan.recoverClient.hash,
+  );
+  assertEquals(plan.updateClient.hash, staged.updateClient.scriptHash);
+  assertEquals(plan.sessionSpend.hash, staged.sessionSpend.scriptHash);
+  assertEquals(plan.sessionMint.hash, staged.sessionMint.policyId);
+  assertEquals(plan.spendClient.hash, staged.clientSpend.scriptHash);
+  assertEquals(
+    plan.spendClient.title,
+    "spending_multitx_client.spend_multitx_client.spend",
+  );
+  for (
+    const validator of [
+      plan.sessionSpend,
+      plan.sessionMint,
+      plan.spendClient,
+      plan.recoverClient,
+      plan.updateClient,
+    ]
+  ) {
+    assert(plan.referenceValidators.includes(validator));
+  }
+});
+
+Deno.test("the plan carries nonce changes through the full applied dependency graph", async () => {
+  const original = await loadDeploymentPlan(lucidLoader, inputs);
+  const hostChanged = await loadDeploymentPlan(lucidLoader, {
+    ...inputs,
+    hostStateNonce: { ...inputs.hostStateNonce, output_index: 24n },
+  });
+  for (
+    const key of [
+      "hostNft",
+      "hostState",
+      "mintPort",
+      "updateClient",
+      "sessionSpend",
+      "sessionMint",
+      "spendClient",
+      "spendConnection",
+      "spendTransferModule",
+      "genericModule",
+      "traceRegistry",
+      "referenceHolder",
+    ] as const
+  ) {
+    assertNotEquals(hostChanged[key].hash, original[key].hash, key);
+  }
+  assertEquals(hostChanged.verifyProof, original.verifyProof);
+  const transferChanged = await loadDeploymentPlan(lucidLoader, {
+    ...inputs,
+    transferModuleNonce: { ...inputs.transferModuleNonce, output_index: 24n },
+  });
+  assertNotEquals(transferChanged.mintVoucher.hash, original.mintVoucher.hash);
+  assertNotEquals(
+    transferChanged.spendTransferModule.hash,
+    original.spendTransferModule.hash,
+  );
+  assertNotEquals(
+    transferChanged.traceRegistry.hash,
+    original.traceRegistry.hash,
+  );
+  assertEquals(transferChanged.hostState, original.hostState);
+  const directoryChanged = await loadDeploymentPlan(lucidLoader, {
+    ...inputs,
+    traceDirectoryNonce: { ...inputs.traceDirectoryNonce, output_index: 24n },
+  });
+  assertNotEquals(
+    directoryChanged.directoryAuthToken,
+    original.directoryAuthToken,
+  );
+  assertNotEquals(directoryChanged.mintVoucher.hash, original.mintVoucher.hash);
+  assertNotEquals(
+    directoryChanged.traceRegistry.hash,
+    original.traceRegistry.hash,
+  );
+});
+
+Deno.test("every reference in both production deployment modes satisfies the publication guard", async () => {
+  for (const benchmarkVoucherEnabled of [false, true]) {
+    const plan = await loadDeploymentPlan(lucidLoader, {
+      ...inputs,
+      benchmarkVoucherEnabled,
+    });
+    const report = buildReferenceValidatorSizeReport(
+      plan.referenceValidators.map(({ script }) => script),
+      16_384,
+    );
+    const intrinsicallyOversized = report.filter(({ intrinsicallyOversized }) =>
+      intrinsicallyOversized
+    ).map((
+      entry,
+    ) => ({ title: plan.referenceValidators[entry.index].title, ...entry }));
+    assertEquals(
+      intrinsicallyOversized,
+      [],
+      `benchmarkVoucherEnabled=${benchmarkVoucherEnabled}`,
+    );
+  }
+});
+
+for (const splitRequired of [false, true]) {
+  Deno.test(`deployment preflight aborts before submitting ${splitRequired ? "nonce split" : "recovery registration"}`, async () => {
+    // Public BIP-39 test vector. This wallet exists only in the Emulator.
+    const seed = "abandon ".repeat(11) + "about";
+    const address = walletFromSeed(seed, { network: "Custom" }).address;
+    const funding = splitRequired
+      ? [2_000_000_000n]
+      : Array(RESERVED_DEPLOYMENT_NONCE_COUNT + 16).fill(20_000_000n);
+    const emulator = new Emulator(
+      funding.map((lovelace) => ({
+        seedPhrase: seed,
+        privateKey: "",
+        address,
+        assets: { lovelace },
+      })),
+      {
+        ...PROTOCOL_PARAMETERS_DEFAULT,
+        maxTxSize: 5_000,
+      },
+    );
+    const lucid = await Lucid(emulator, "Custom", {
+      evaluator: createCardanoScalusEvaluator(),
+    });
+    lucid.selectWallet.fromSeed(seed);
+    let submissions = 0;
+    emulator.submitTx = () => {
+      submissions++;
+      return Promise.reject(new Error("Preflight must stop before submission"));
+    };
+    await assertRejects(
+      () => createDeployment(lucid, undefined, { deploymentMode: "legacy" }),
+      Error,
+      "complete deployment validator preflight",
+    );
+    assertEquals(submissions, 0);
+  });
+}
+
+Deno.test("channel upgrade deployment fixture pins its applied validators", async () => {
+  const pins = JSON.parse(
+    Deno.readTextFileSync(
+      new URL(
+        "../../../tests/ibc-state-commitment/channel-upgrade-deployment.json",
+        import.meta.url,
+      ),
+    ),
+  );
+  const plan = await loadDeploymentPlan(lucidLoader, inputs);
+  const validators = [
+    plan.spendingChannel.base,
+    ...Object.values(plan.spendingChannel.referredScripts).filter(({ title }) =>
+      title.includes("chan_upgrade")
+    ),
+    plan.hostState,
+    plan.verifyProof,
+  ];
+  assertEquals(pins.schema_version, 6);
+  assertEquals(
+    Object.fromEntries(validators.map(({ title, hash }) => [title, hash])),
+    pins.validators,
+  );
+});

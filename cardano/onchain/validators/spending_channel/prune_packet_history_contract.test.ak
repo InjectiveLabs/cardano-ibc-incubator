@@ -11,11 +11,13 @@ use ibc/client/ics_007_tendermint_client/client_datum.{ClientDatum}
 use ibc/client/ics_007_tendermint_client/consensus_state.{ConsensusState}
 use ibc/client/ics_007_tendermint_client/height.{Height}
 use ibc/client/ics_007_tendermint_client/types/verify_proof_redeemer.{
-  VerifyNonMembership, VerifyProofRedeemer,
+  VerifyNonMembership, VerifyProofEnvelope, VerifyProofRedeemer,
 }
 use ibc/core/ics_003_connection_semantics/connection_datum.{ConnectionDatum}
 use ibc/core/ics_003_connection_semantics/verify as verify_mod
-use ibc/core/ics_004/channel_datum.{ChannelDatum, ChannelDatumState}
+use ibc/core/ics_004/channel_datum.{
+  ChannelDatum, ChannelDatumState, initial_upgrade_state,
+}
 use ibc/core/ics_004/channel_redeemer.{PrunePacketHistory, SpendChannelRedeemer}
 use ibc/core/ics_004/types/channel.{Channel}
 use ibc/core/ics_004/types/counterparty.{ChannelCounterparty}
@@ -246,6 +248,7 @@ fn check_composed_prune(mutation: Mutation) -> Bool {
       },
       connection_hops: [mock.connection_id],
       version: "ics20-1",
+      upgrade_sequence: 0,
     }
   let input_channel_datum =
     ChannelDatum {
@@ -273,6 +276,7 @@ fn check_composed_prune(mutation: Mutation) -> Bool {
           revision_number: 1,
           revision_height: 10,
         },
+        upgrade: initial_upgrade_state,
       },
       port_id: mock.port_id,
       token: mock.channel_token,
@@ -467,7 +471,8 @@ fn check_composed_prune(mutation: Mutation) -> Bool {
     }
   let channel_redeemer_data: Redeemer = channel_redeemer
   let host_redeemer_data: Redeemer = host_redeemer
-  let verify_redeemer_data: Redeemer = verify_redeemer
+  let verify_redeemer_data: Redeemer =
+    VerifyProofEnvelope { proof: verify_redeemer, history_witness: None }
   let marker_redeemer: Redeemer = mock.channel_token
   let redeemers: Pairs<ScriptPurpose, Redeemer> =
     [
@@ -499,6 +504,7 @@ fn check_composed_prune(mutation: Mutation) -> Bool {
     )
   let spending_channel_valid =
     spending_channel.spend_channel.spend(
+      #"",
       mock.chan_open_ack_policy_id,
       mock.chan_open_confirm_policy_id,
       mock.chan_close_init_policy_id,
@@ -508,6 +514,9 @@ fn check_composed_prune(mutation: Mutation) -> Bool {
       mock.timeout_packet_policy_id,
       mock.acknowledge_packet_policy_id,
       mock.prune_packet_history_policy_id,
+      mock.chan_upgrade_policy_id,
+      mock.chan_upgrade_handshake_policy_id,
+      mock.chan_upgrade_finish_policy_id,
       mock.host_state_nft_policy_id,
       Some(input_channel_datum),
       channel_redeemer,
@@ -523,6 +532,7 @@ fn check_composed_prune(mutation: Mutation) -> Bool {
       mock.client_minting_policy_id,
       mock.connection_minting_policy_id,
       mock.channel_minting_policy_id,
+      "",
       None,
       host_redeemer,
       host_input.output_reference,
@@ -530,7 +540,7 @@ fn check_composed_prune(mutation: Mutation) -> Bool {
     )
   let verify_proof_valid =
     verifying_proof.verify_proof.mint(
-      verify_redeemer,
+      VerifyProofEnvelope { proof: verify_redeemer, history_witness: None },
       mock.verify_proof_policy_id,
       transaction,
     )

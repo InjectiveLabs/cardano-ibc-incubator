@@ -41,6 +41,7 @@ interface UnsignedTx {
 }
 
 interface TransferResponseData {
+  intentChannel: string;
   unsignedTx?: UnsignedTx;
   feeLovelace?: string;
 }
@@ -407,15 +408,19 @@ export async function submitSignedCardanoTx(
 
 export async function lookupCardanoAssetDenomTrace(
   assetId: string,
+  options: { silent?: boolean } = {},
 ): Promise<CardanoAssetDenomTrace | null> {
   try {
     const response = await axios.get<CardanoAssetDenomTrace>(
       dappApiPath(`/api/cardano/trace-registry/${encodeURIComponent(assetId)}`),
+      { timeout: 10_000 },
     );
     return response.data;
   } catch (error) {
-    const errorMessage = getGatewayErrorMessage(error);
-    toast.error(errorMessage, { theme: 'colored' });
+    if (!options.silent) {
+      const errorMessage = getGatewayErrorMessage(error);
+      toast.error(errorMessage, { theme: 'colored' });
+    }
     return null;
   }
 }

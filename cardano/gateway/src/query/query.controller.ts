@@ -8,6 +8,10 @@ import {
   QueryClientStatesResponse,
   QueryConsensusStateRequest,
   QueryConsensusStateResponse,
+  QueryConsensusStatesRequest,
+  QueryConsensusStatesResponse,
+  QueryConsensusStateHeightsRequest,
+  QueryConsensusStateHeightsResponse,
   QueryLatestHeightRequest,
   QueryLatestHeightResponse,
   QueryNewClientRequest,
@@ -24,6 +28,10 @@ import {
 
 import {
   QueryChannelRequest,
+  QueryUpgradeErrorRequest,
+  QueryUpgradeErrorResponse,
+  QueryUpgradeRequest,
+  QueryUpgradeResponse,
   QueryChannelResponse,
   QueryChannelsRequest,
   QueryChannelsResponse,
@@ -57,6 +65,8 @@ import {
   QueryTransactionByHashResponse,
   QueryIBCHeaderRequest,
   QueryIBCHeaderResponse,
+  QueryMithrilStakeCertificatesRequest,
+  QueryMithrilStakeCertificatesResponse,
 } from '@cardano-ibc/proto-types/build/ibc/core/types/v1/query';
 import {
   QueryBridgeManifestRequest,
@@ -118,6 +128,26 @@ export class QueryController {
     return response;
   }
 
+  @GrpcMethod('Query', 'ConsensusStates')
+  async queryConsensusStates(
+    data: QueryConsensusStatesRequest,
+    metadata?: Metadata,
+  ): Promise<QueryConsensusStatesResponse> {
+    return this.queryService.queryConsensusStates(data, {
+      queryHeight: getQueryHeightFromMetadata(metadata),
+    });
+  }
+
+  @GrpcMethod('Query', 'ConsensusStateHeights')
+  async queryConsensusStateHeights(
+    data: QueryConsensusStateHeightsRequest,
+    metadata?: Metadata,
+  ): Promise<QueryConsensusStateHeightsResponse> {
+    return this.queryService.queryConsensusStateHeights(data, {
+      queryHeight: getQueryHeightFromMetadata(metadata),
+    });
+  }
+
   @GrpcMethod('Query', 'LatestHeight')
   async LatestHeight(data: QueryLatestHeightRequest): Promise<QueryLatestHeightResponse> {
     const response: QueryLatestHeightResponse = await this.queryService.latestHeight(data);
@@ -168,6 +198,16 @@ export class QueryController {
       queryHeight: getQueryHeightFromMetadata(metadata),
     });
     return response as unknown as QueryChannelResponse;
+  }
+
+  @GrpcMethod('Query', 'Upgrade')
+  async queryUpgrade(request: QueryUpgradeRequest, metadata?: Metadata): Promise<QueryUpgradeResponse> {
+    return this.channelService.queryUpgrade(request, { queryHeight: getQueryHeightFromMetadata(metadata) });
+  }
+
+  @GrpcMethod('Query', 'UpgradeError')
+  async queryUpgradeError(request: QueryUpgradeErrorRequest, metadata?: Metadata): Promise<QueryUpgradeErrorResponse> {
+    return this.channelService.queryUpgradeError(request, { queryHeight: getQueryHeightFromMetadata(metadata) });
   }
 
   @GrpcMethod('Query', 'ConnectionChannels')
@@ -255,6 +295,13 @@ export class QueryController {
   async queryIBCHeader(request: QueryIBCHeaderRequest): Promise<QueryIBCHeaderResponse> {
     const response: QueryIBCHeaderResponse = await this.queryService.queryIBCHeader(request);
     return response as unknown as QueryIBCHeaderResponse;
+  }
+
+  @GrpcMethod('Query', 'MithrilStakeCertificates')
+  async queryMithrilStakeCertificates(
+    request: QueryMithrilStakeCertificatesRequest,
+  ): Promise<QueryMithrilStakeCertificatesResponse> {
+    return this.queryService.queryMithrilStakeCertificates(request);
   }
   @GrpcMethod('Query', 'NextSequenceReceive')
   async queryNextSequenceReceive(

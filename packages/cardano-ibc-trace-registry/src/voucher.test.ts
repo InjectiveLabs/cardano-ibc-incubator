@@ -1,5 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import * as RealLucid from '@lucid-evolution/lucid';
 import {
   assertUniqueTraceRegistryEntries,
   buildIbcDenomHashFromFullDenom,
@@ -10,6 +11,7 @@ import {
   buildVoucherUserTokenNameFromDenomHash,
   CIP67_FT_LABEL_HEX,
   CIP67_REFERENCE_NFT_LABEL_HEX,
+  createTraceRegistryClient,
   decodeVerifiedVoucherCip68MetadataDatum,
   decodeVoucherCip68MetadataDatum,
   deriveVoucherCanonicalLabel,
@@ -58,6 +60,26 @@ const TestLucidData: LucidDataModule = {
 };
 
 describe('voucher asset naming', () => {
+  it('does not resolve reference NFTs or assets from another policy as user vouchers', async () => {
+    const policy = 'ab'.repeat(28);
+    const hash = buildVoucherDenomHashFromFullDenom('transfer/channel-0/uatom');
+    const client = createTraceRegistryClient({
+      bridgeManifestUrl: 'https://example.test/manifest',
+      kupmiosUrl: 'https://example.test/kupo,https://example.test/ogmios',
+      fetchImpl: async () => new Response(JSON.stringify({
+        validators: { mint_voucher: { script_hash: policy } },
+      })),
+    });
+    const reference = policy + buildVoucherReferenceTokenNameFromDenomHash(hash);
+    const foreign = 'cd'.repeat(28) + buildVoucherUserTokenNameFromDenomHash(hash);
+    const traces = await Promise.all([
+      client.lookupCardanoAssetDenomTrace(reference),
+      client.lookupCardanoAssetDenomTrace(foreign),
+    ]);
+    assert.deepEqual(traces.map((trace) => trace.kind), ['native', 'native']);
+    assert.deepEqual(traces.map((trace) => trace.assetId), [reference, foreign]);
+  });
+
   it('derives CIP-67 user and reference asset names from a full denom trace', () => {
     const fullDenom = 'transfer/channel-0/transfer/channel-22/uosmo';
     const denomHash = buildVoucherDenomHashFromFullDenom(fullDenom);
@@ -89,6 +111,27 @@ describe('voucher asset naming', () => {
 });
 
 describe('voucher CIP-68 metadata', () => {
+  it('uses the ordered Plutus maps required by the on-chain metadata datum', () => {
+    const fullDenom = 'transfer/channel-0/utest';
+    const params = {
+      ...splitFullDenomTrace(fullDenom), fullDenom,
+      voucherTokenName: buildVoucherUserTokenNameFromDenomHash(buildVoucherDenomHashFromFullDenom(fullDenom)),
+      voucherPolicyId: 'ab'.repeat(28),
+      ibcDenomHash: buildIbcDenomHashFromFullDenom(fullDenom),
+    };
+    const encoded = encodeVoucherCip68MetadataDatum(
+      buildVoucherCip68Metadata(params), RealLucid as unknown as LucidDataModule,
+    );
+    const datum = RealLucid.Data.from(encoded) as RealLucid.Constr<RealLucid.Data>;
+    const keys = (value: unknown) => [...(value as Map<string, unknown>).keys()]
+      .map(key => Buffer.from(key, 'hex').toString('utf8'));
+    // voucher_metadata.build_datum defines these Plutus map entry orders.
+    assert.deepEqual(keys(datum.fields[0]), ['description', 'name', 'ticker']);
+    assert.deepEqual(keys(datum.fields[2]), [
+      'baseDenom', 'fullDenom', 'ibcDenomHash', 'path', 'traceVersion', 'voucherPolicyId', 'voucherTokenName',
+    ]);
+  });
+
   it('encodes, decodes, and verifies canonical voucher metadata', () => {
     const fullDenom = 'transfer/channel-0/uosmo';
     const trace = splitFullDenomTrace(fullDenom);

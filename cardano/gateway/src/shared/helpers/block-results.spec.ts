@@ -15,6 +15,7 @@ import {
   normalizeTxsResultFromClientDatum,
   normalizeTxsResultFromChannelRedeemer,
   normalizeTxsResultFromRecvPacketSuccessAcknowledgement,
+  normalizeTxsResultFromChannelUpgrade,
 } from './block-results';
 import headerMockBuilder from '../../tx/test/mock/header';
 import { clientDatumMockBuilder } from '../../tx/test/mock/client-datum';
@@ -26,12 +27,24 @@ function eventAttributeValue(result: ResponseDeliverTx, key: string): string {
 }
 
 describe('normalizeTxsResultFromClientDatum', () => {
+  it('uses the client latest height when a staged update has no replayable header', () => {
+    const clientDatum = clientDatumMockBuilder.withLatestHeight(9n, 321n).build();
+
+    const result = normalizeTxsResultFromClientDatum(clientDatum, EVENT_TYPE_CLIENT.UPDATE_CLIENT, '0', null);
+
+    expect(eventAttributeValue(result, ATTRIBUTE_KEY_CLIENT.CONSENSUS_HEIGHT)).toBe('9-321');
+    expect(eventAttributeValue(result, ATTRIBUTE_KEY_CLIENT.HEADER)).toBe('');
+    expect(eventAttributeValue(result, ATTRIBUTE_KEY_CLIENT.CLIENT_MESSAGE_ANY_HEX)).toBe('');
+  });
+
   it('derives replayed update_client consensus height from the submitted header', () => {
     const clientDatum = clientDatumMockBuilder.build();
     const headerMsg = headerMockBuilder.withHeight(123n).withCommitHeight(123n).withTrustedHeight(42n, 7n).build();
     const updateHeader = initializeHeader(headerMsg);
     const redeemer: SpendClientRedeemer = {
       UpdateClient: {
+        history_witnesses: [],
+        history_siblings: [],
         msg: {
           HeaderCase: [updateHeader],
         },
@@ -60,6 +73,34 @@ describe('normalizeTxsResultFromClientDatum', () => {
     );
   });
 
+  it('emits a historically reconstructed staged header without a legacy redeemer', () => {
+    const clientDatum = clientDatumMockBuilder.build();
+    const headerMsg = headerMockBuilder.withHeight(124n).withCommitHeight(124n).withTrustedHeight(43n, 7n).build();
+    const stagedHeader = initializeHeader(headerMsg);
+
+    const result = normalizeTxsResultFromClientDatum(
+      clientDatum,
+      EVENT_TYPE_CLIENT.UPDATE_CLIENT,
+      '0',
+      null,
+      undefined,
+      stagedHeader,
+    );
+
+    expect(eventAttributeValue(result, ATTRIBUTE_KEY_CLIENT.CONSENSUS_HEIGHT)).toBe('7-124');
+    const clientMessageAny = Any.decode(
+      Buffer.from(eventAttributeValue(result, ATTRIBUTE_KEY_CLIENT.CLIENT_MESSAGE_ANY_HEX), 'hex'),
+    );
+    const emittedHeader = HeaderMsg.decode(clientMessageAny.value);
+    const emittedSignedHeader = emittedHeader.signed_header;
+    if (!emittedSignedHeader?.header || !emittedSignedHeader.commit) {
+      throw new Error('Decoded fixture is missing its signed header fields');
+    }
+    expect(clientMessageAny.type_url).toBe('/ibc.lightclients.tendermint.v1.Header');
+    expect(emittedSignedHeader.header.height).toBe(124n);
+    expect(emittedSignedHeader.commit.signatures).toHaveLength(1);
+  });
+
   it('uses frozen height for replayed client_misbehaviour events', () => {
     const clientDatum = clientDatumMockBuilder.withFrozenHeight(0n, 1n).build();
     const header1 = initializeHeader(
@@ -70,6 +111,8 @@ describe('normalizeTxsResultFromClientDatum', () => {
     );
     const redeemer: SpendClientRedeemer = {
       UpdateClient: {
+        history_witnesses: [],
+        history_siblings: [],
         msg: {
           MisbehaviourCase: [{ client_id: '07-tendermint-0', header1, header2 }],
         },
@@ -84,10 +127,30 @@ describe('normalizeTxsResultFromClientDatum', () => {
     expect(eventAttributeValue(result, ATTRIBUTE_KEY_CLIENT.CLIENT_MESSAGE_ANY_HEX)).not.toBe('');
   });
 
+  it('reports a staged header that froze the client as misbehaviour', () => {
+    const clientDatum = clientDatumMockBuilder.withFrozenHeight(0n, 1n).build();
+    const stagedHeader = initializeHeader(headerMockBuilder.withHeight(123n).withCommitHeight(123n).build());
+    const result = normalizeTxsResultFromClientDatum(
+      clientDatum,
+      EVENT_TYPE_CLIENT.UPDATE_CLIENT,
+      '0',
+      null,
+      undefined,
+      stagedHeader,
+    );
+    expect(result.events[0].type).toBe(EVENT_TYPE_CLIENT.CLIENT_MISBEHAVIOR);
+    expect(eventAttributeValue(result, ATTRIBUTE_KEY_CLIENT.CONSENSUS_HEIGHT)).toBe('0-1');
+    const message = Any.decode(
+      Buffer.from(eventAttributeValue(result, ATTRIBUTE_KEY_CLIENT.CLIENT_MESSAGE_ANY_HEX), 'hex'),
+    );
+    expect(message.type_url).toBe('/ibc.lightclients.tendermint.v1.Header');
+  });
+
   it('reports recovery as recover_client with both client IDs', () => {
     const clientDatum = clientDatumMockBuilder.build();
     const redeemer: SpendClientRedeemer = {
       RecoverClient: {
+        history_siblings: [],
         substitute_token: {
           policyId: '11'.repeat(28),
           name: '22'.repeat(24) + Buffer.from('9').toString('hex'),
@@ -169,6 +232,7 @@ describe('normalizeTxsResultFromChannelRedeemer', () => {
           proof_close: { proofs: [] },
           proof_height: { revisionNumber: 0n, revisionHeight: 50n },
           next_sequence_recv: 2n,
+          counterparty_upgrade_sequence: 0n,
         },
       },
       channelDatum,
@@ -177,5 +241,85 @@ describe('normalizeTxsResultFromChannelRedeemer', () => {
     expect(result.events[0].type).toBe('timeout_on_close_packet');
     expect(eventAttributeValue(result, ATTRIBUTE_KEY_PACKET.PACKET_SEQUENCE).toString()).toBe('3');
     expect(eventAttributeValue(result, ATTRIBUTE_KEY_PACKET.PACKET_DATA)).toBe('{"denom":"uosmo"}');
+  });
+});
+
+describe('channel upgrade events', () => {
+  const hex = (value: string) => Buffer.from(value).toString('hex');
+  const upgrade = {
+    fields: { ordering: 'Unordered', connection_hops: [hex('connection-1')], version: hex('ics20-1') },
+    timeout: { height: { revisionNumber: 0n, revisionHeight: 0n }, timestamp: 0n },
+    next_sequence_send: 0n,
+  };
+  const datum = (state: string, pending: unknown, errorReceipt: unknown = null) =>
+    ({
+      port: hex('transfer'),
+      state: {
+        channel: {
+          state,
+          ordering: 'Unordered',
+          counterparty: { port_id: hex('transfer'), channel_id: hex('channel-7') },
+          connection_hops: [hex('connection-0')],
+          version: hex('ics20-1'),
+          upgrade_sequence: 2n,
+        },
+        upgrade: { pending, error_receipt: errorReceipt, recv_start_sequence: 0n },
+      },
+    }) as any;
+  const redeemer = (step: unknown, errorReceiptSiblings: string[] = []) =>
+    ({ step, channel_siblings: [], upgrade_siblings: [], error_receipt_siblings: errorReceiptSiblings }) as any;
+  const attributes = (event: any) =>
+    Object.fromEntries(event.event_attribute.map((attr: any) => [attr.key, attr.value]));
+  const pending = { upgrade, timeout_period: 3_600_000n, counterparty_upgrade: null, flushed_lanes: 0n };
+
+  it('reports INIT with the proposed fields, as ibc-go does', () => {
+    const result = normalizeTxsResultFromChannelUpgrade(
+      redeemer({ InitUpgrade: { fields: upgrade.fields, timeout_period: 3_600_000n } }),
+      datum('Open', pending),
+      '0',
+    );
+
+    expect(result.events.map((event) => event.type)).toEqual(['channel_upgrade_init']);
+    expect(attributes(result.events[0])).toEqual({
+      port_id: 'transfer',
+      channel_id: 'channel-0',
+      counterparty_port_id: 'transfer',
+      counterparty_channel_id: 'channel-7',
+      upgrade_sequence: '2',
+      upgrade_connection_hops: 'connection-1',
+      upgrade_version: 'ics20-1',
+      upgrade_ordering: 'ORDER_UNORDERED',
+    });
+  });
+
+  it('reports the error receipt a TIMEOUT writes, which relayers cancel on', () => {
+    const message = 'ABCI code: 34: restored channel to pre-upgrade state';
+    const result = normalizeTxsResultFromChannelUpgrade(
+      redeemer({ TimeoutUpgrade: {} }, ['aa']),
+      datum('Open', null, { sequence: 2n, message: hex(message) }),
+      '0',
+    );
+
+    expect(result.events.map((event) => event.type)).toEqual(['channel_upgrade_timeout', 'channel_upgrade_error']);
+    expect(attributes(result.events[1]).error_receipt).toBe(message);
+  });
+
+  it('does not repeat an older receipt for an INIT that replaces nothing', () => {
+    const result = normalizeTxsResultFromChannelUpgrade(
+      redeemer({ InitUpgrade: { fields: upgrade.fields, timeout_period: 3_600_000n } }),
+      datum('Open', pending, { sequence: 1n, message: hex('old') }),
+      '0',
+    );
+
+    expect(result.events.map((event) => event.type)).toEqual(['channel_upgrade_init']);
+  });
+
+  it('reports a FLUSH only when it completes flushing', () => {
+    const flush = redeemer({ FlushUpgrade: { lanes: 8n } });
+
+    expect(normalizeTxsResultFromChannelUpgrade(flush, datum('Flushing', pending), '0').events).toEqual([]);
+    expect(
+      normalizeTxsResultFromChannelUpgrade(flush, datum('FlushComplete', pending), '0').events.map((e) => e.type),
+    ).toEqual(['channel_flush_complete']);
   });
 });

@@ -2,7 +2,11 @@ import { Inject, Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Network, TxBuilder, UTxO } from '@lucid-evolution/lucid';
 
-import { TRANSACTION_SET_COLLATERAL, TRANSACTION_TIME_TO_LIVE } from '~@/config/constant.config';
+import {
+  HOST_STATE_HEARTBEAT_INTERVAL_MS,
+  TRANSACTION_SET_COLLATERAL,
+  TRANSACTION_TIME_TO_LIVE,
+} from '~@/config/constant.config';
 import {
   GrpcFailedPreconditionException,
   GrpcInternalException,
@@ -14,10 +18,7 @@ import { computeLedgerAnchoredValidityWindow } from '../shared/helpers/time';
 import { LucidService } from '../shared/modules/lucid/lucid.service';
 import { HostStateDatum } from '../shared/types/host-state-datum';
 import { HISTORY_SERVICE, HistoryService } from '../query/services/history.service';
-import {
-  BuildHostStateHeartbeatRequest,
-  BuildHostStateHeartbeatResponse,
-} from './dto/host-state-heartbeat.dto';
+import { BuildHostStateHeartbeatRequest, BuildHostStateHeartbeatResponse } from './dto/host-state-heartbeat.dto';
 import { TxOperationRunnerService } from './tx-operation-runner.service';
 
 type HeartbeatContext = {
@@ -25,6 +26,7 @@ type HeartbeatContext = {
   hostStateDatum: HostStateDatum;
   currentEpoch: number;
   hostStateEpoch: number;
+  hostStateTimestamp: number;
 };
 
 @Injectable()
@@ -38,9 +40,7 @@ export class HostStateHeartbeatService {
     private readonly ibcTreeStore: IbcTreeStateStore,
   ) {}
 
-  async buildHeartbeat(
-    request: BuildHostStateHeartbeatRequest,
-  ): Promise<BuildHostStateHeartbeatResponse> {
+  async buildHeartbeat(request: BuildHostStateHeartbeatRequest): Promise<BuildHostStateHeartbeatResponse> {
     if (!request.signer?.trim()) {
       throw new GrpcInvalidArgumentException('HostState heartbeat signer is required');
     }
@@ -50,76 +50,67 @@ export class HostStateHeartbeatService {
     try {
       signerKeyHash = await this.lucidService.getPublicKeyHash(request.signer);
     } catch {
-      throw new GrpcInvalidArgumentException(
-        'HostState heartbeat signer is not a valid Cardano address',
-      );
+      throw new GrpcInvalidArgumentException('HostState heartbeat signer is not a valid Cardano address');
     }
     if (!signerKeyHash) {
-      throw new GrpcInvalidArgumentException(
-        'HostState heartbeat signer must use a key payment credential',
-      );
+      throw new GrpcInvalidArgumentException('HostState heartbeat signer must use a key payment credential');
     }
-    if (signerKeyHash.toLowerCase() !== context.hostStateDatum.deployer.toLowerCase()) {
-      throw new GrpcFailedPreconditionException(
-        'HostState heartbeat signer does not match the deployment heartbeat authority',
-      );
+    const validity = await this.computeTxValidityWindow();
+    const lastHeartbeat = Number(context.hostStateDatum.control.last_heartbeat_time);
+    if (!Number.isSafeInteger(lastHeartbeat) || lastHeartbeat < 0) {
+      throw new GrpcFailedPreconditionException('Invalid HostState heartbeat clock');
     }
-
-    if (context.hostStateEpoch === context.currentEpoch) {
-      this.logger.debug(
-        `HostState heartbeat not required: epoch ${context.currentEpoch} already has an anchor`,
-      );
-      return this.statusResponse(context, false);
+    // A recent ordinary HostState transaction also provides a proof anchor.
+    // Its block timestamp comes from indexed chain evidence, not datum metadata.
+    if (!Number.isSafeInteger(context.hostStateTimestamp) || context.hostStateTimestamp < 0) {
+      throw new GrpcFailedPreconditionException('Invalid HostState anchor timestamp');
+    }
+    const lastAnchor = Math.max(lastHeartbeat, context.hostStateTimestamp);
+    const nextHeartbeat = lastAnchor + HOST_STATE_HEARTBEAT_INTERVAL_MS;
+    if (validity.validFromTime < nextHeartbeat) {
+      return this.statusResponse(context, false, nextHeartbeat - validity.validFromTime);
     }
 
     if (context.hostStateDatum.control.shutdown !== 'Active') {
-      throw new GrpcFailedPreconditionException(
-        'HostState heartbeat is disabled while the bridge is shutting down',
-      );
+      throw new GrpcFailedPreconditionException('HostState heartbeat is disabled while the bridge is shutting down');
     }
 
     const snapshot = await this.ibcTreeStore.getAlignedSnapshot();
-    if (snapshot.root !== context.hostStateDatum.state.ibc_state_root ||
+    if (
+      snapshot.root !== context.hostStateDatum.state.ibc_state_root ||
       snapshot.hostState.txHash !== context.hostStateUtxo.txHash ||
-      snapshot.hostState.outputIndex !== context.hostStateUtxo.outputIndex) {
+      snapshot.hostState.outputIndex !== context.hostStateUtxo.outputIndex
+    ) {
       throw new GrpcFailedPreconditionException('HostState changed before heartbeat, retry with current inputs');
     }
     const treeUpdate = this.ibcTreeStore.computeRootWithHeartbeatUpdate(snapshot.root);
 
-    const validity = await this.computeTxValidityWindow();
     const updatedHostStateDatum: HostStateDatum = {
       ...context.hostStateDatum,
       state: {
         ...context.hostStateDatum.state,
         version: context.hostStateDatum.state.version + 1n,
-        last_update_time: this.nextUpdateTime(
-          context.hostStateDatum.state.last_update_time,
-          validity.currentLedgerTime,
-        ),
+        last_update_time: BigInt(validity.validToTime),
+      },
+      control: {
+        ...context.hostStateDatum.control,
+        last_heartbeat_time: BigInt(validity.validToTime),
       },
     };
 
-    const encodedHostStateRedeemer = await this.lucidService.encode(
-      'Heartbeat',
-      'host_state_redeemer',
-    );
-    const encodedUpdatedHostStateDatum = await this.lucidService.encode(
-      updatedHostStateDatum,
-      'host_state',
-    );
-    const unsignedTx = this.lucidService.createUnsignedHostStateHeartbeatTransaction(
-      context.hostStateUtxo,
-      encodedHostStateRedeemer,
-      encodedUpdatedHostStateDatum,
-      signerKeyHash,
-    );
-
+    const encodedHostStateRedeemer = await this.lucidService.encode('Heartbeat', 'host_state_redeemer');
+    const encodedUpdatedHostStateDatum = await this.lucidService.encode(updatedHostStateDatum, 'host_state');
     const { unsignedTxBytes } = await this.txOperationRunnerService.run({
       operationName: 'hostStateHeartbeat',
-      unsignedTx,
+      unsignedTx: () =>
+        this.lucidService.createUnsignedHostStateHeartbeatTransaction(
+          context.hostStateUtxo,
+          encodedHostStateRedeemer,
+          encodedUpdatedHostStateDatum,
+          signerKeyHash,
+        ),
       validity: {
-        apply: (builder: TxBuilder) =>
-          builder.validFrom(validity.validFromTime).validTo(validity.validToTime),
+        apply: (builder: TxBuilder) => builder.validFrom(validity.validFromTime).validTo(validity.validToTime),
       },
       wallet: {
         mode: 'refresh_from_address',
@@ -141,7 +132,11 @@ export class HostStateHeartbeatService {
       `Built HostState heartbeat from epoch ${context.hostStateEpoch} for current epoch ${context.currentEpoch}`,
     );
     return {
-      ...this.statusResponse(context, true),
+      ...this.statusResponse(
+        context,
+        true,
+        HOST_STATE_HEARTBEAT_INTERVAL_MS + validity.validToTime - validity.validFromTime,
+      ),
       unsigned_tx: {
         type_url: '',
         value: unsignedTxBytes,
@@ -151,7 +146,7 @@ export class HostStateHeartbeatService {
 
   private async resolveHeartbeatContext(): Promise<HeartbeatContext> {
     const [hostStateUtxo, latestBlock] = await Promise.all([
-      this.lucidService.findUtxoAtHostStateNFT(),
+      this.lucidService.findUtxoAtHostStateNFT(4n),
       this.historyService.findLatestBlock(),
     ]);
     if (!latestBlock) {
@@ -163,17 +158,11 @@ export class HostStateHeartbeatService {
       throw new GrpcInternalException('HostState UTxO has no inline datum');
     }
 
-    const hostStateEvidence = await this.historyService.findTransactionEvidenceByHash(
-      hostStateUtxo.txHash,
-    );
+    const hostStateEvidence = await this.historyService.findTransactionEvidenceByHash(hostStateUtxo.txHash);
     if (!hostStateEvidence) {
-      throw new GrpcFailedPreconditionException(
-        `HostState transaction ${hostStateUtxo.txHash} is not indexed yet`,
-      );
+      throw new GrpcFailedPreconditionException(`HostState transaction ${hostStateUtxo.txHash} is not indexed yet`);
     }
-    const hostStateBlock = await this.historyService.findBlockByHeight(
-      BigInt(hostStateEvidence.blockNo),
-    );
+    const hostStateBlock = await this.historyService.findBlockByHeight(BigInt(hostStateEvidence.blockNo));
     if (!hostStateBlock) {
       throw new GrpcFailedPreconditionException(
         `Block ${hostStateEvidence.blockNo} for HostState transaction ${hostStateUtxo.txHash} is not indexed yet`,
@@ -187,12 +176,10 @@ export class HostStateHeartbeatService {
 
     return {
       hostStateUtxo,
-      hostStateDatum: await this.lucidService.decodeDatum<HostStateDatum>(
-        hostStateUtxo.datum,
-        'host_state',
-      ),
+      hostStateDatum: await this.lucidService.decodeDatum<HostStateDatum>(hostStateUtxo.datum, 'host_state'),
       currentEpoch: latestBlock.epochNo,
       hostStateEpoch: hostStateBlock.epochNo,
+      hostStateTimestamp: Number(hostStateBlock.timestampUnixNs / 1_000_000n),
     };
   }
 
@@ -201,30 +188,21 @@ export class HostStateHeartbeatService {
     const network = this.configService.get('cardanoNetwork') as Network;
     const slotConfig = this.lucidService.LucidImporter.SLOT_CONFIG_NETWORK?.[network];
     if (!ogmiosEndpoint || !slotConfig || slotConfig.slotLength <= 0) {
-      throw new GrpcInternalException(
-        `HostState heartbeat has no valid Ogmios/slot configuration for ${network}`,
-      );
+      throw new GrpcInternalException(`HostState heartbeat has no valid Ogmios/slot configuration for ${network}`);
     }
-    return computeLedgerAnchoredValidityWindow(
-      ogmiosEndpoint,
-      slotConfig,
-      TRANSACTION_TIME_TO_LIVE,
-    );
-  }
-
-  private nextUpdateTime(previous: bigint, currentLedgerTime: number): bigint {
-    const ledgerTime = BigInt(Math.trunc(currentLedgerTime));
-    return ledgerTime > previous ? ledgerTime : previous + 1n;
+    return computeLedgerAnchoredValidityWindow(ogmiosEndpoint, slotConfig, TRANSACTION_TIME_TO_LIVE);
   }
 
   private statusResponse(
-    context: Pick<HeartbeatContext, 'currentEpoch' | 'hostStateEpoch'>,
+    context: HeartbeatContext,
     heartbeatRequired: boolean,
+    nextCheckDelayMs: number,
   ): BuildHostStateHeartbeatResponse {
     return {
       heartbeat_required: heartbeatRequired,
       current_epoch: context.currentEpoch,
       host_state_epoch: context.hostStateEpoch,
+      next_check_delay_ms: Math.max(1_000, nextCheckDelayMs),
     };
   }
 }

@@ -1,3 +1,4 @@
+import { MIN_CARDANO_CLIENT_TRUSTING_PERIOD_SECONDS } from './constant.config';
 import { Network } from '@lucid-evolution/lucid';
 import { PostgresConnectionOptions } from 'typeorm/driver/postgres/PostgresConnectionOptions';
 
@@ -46,12 +47,14 @@ type DeploymentConfig = {
   };
 };
 
-const defaultKoiosEndpoint = (networkMagic?: string): string | undefined => {
+const defaultBlockfrostEndpoint = (networkMagic?: string): string | undefined => {
   switch (networkMagic) {
+    case '764824073':
+      return 'https://cardano-mainnet.blockfrost.io/api/v0';
     case '1':
-      return 'https://preprod.koios.rest/api/v1';
+      return 'https://cardano-preprod.blockfrost.io/api/v0';
     case '2':
-      return 'https://preview.koios.rest/api/v1';
+      return 'https://cardano-preview.blockfrost.io/api/v0';
     default:
       return undefined;
   }
@@ -73,12 +76,13 @@ export const validatePublicNetworkStabilityConfig = (network?: string, endpoint?
     return;
   }
   if (!endpoint?.trim().replace(/\/+$/, '')) {
-    throw new Error(`CARDANO_EPOCH_PARAMS_ENDPOINT is required for stake-weighted-stability on ${network}`);
+    throw new Error(`CARDANO_BLOCKFROST_ENDPOINT is required for stake-weighted-stability on ${network}`);
   }
   for (const name of [
     'CARDANO_STABILITY_ASSUME_STATIC_STAKE',
     'CARDANO_STABILITY_ASSUME_POOL_REGISTRATION_SLOT',
     'CARDANO_PROBABILISTIC_EPOCH_NONCE_OVERRIDE',
+    'CARDANO_LOCAL_EPOCH_CONTEXT_ENDPOINT',
   ]) {
     const enabled =
       name === 'CARDANO_STABILITY_ASSUME_STATIC_STAKE' ? process.env[name] === '1' : process.env[name] !== undefined;
@@ -128,19 +132,18 @@ interface Config {
   // Logical identifier for the Cardano chain used by Hermes (e.g., "cardano-devnet").
   // Cardano itself does not have a Cosmos-style chain-id; we use this as the IBC identifier.
   cardanoChainId: string;
-  cardanoLightClientMode: 'mithril' | 'stake-weighted-stability';
   cardanoNetwork: Network;
   cardanoEpochLength: number;
   cardanoClientTrustingPeriodSeconds: number;
   cardanoClientMaxClockDriftSeconds: number;
+  cardanoRandomnessStabilisationWindowSlots?: string;
   cardanoStabilityCheckpointMaxBridgeBlocks: number;
-  cardanoStabilityCheckpointMaxHeaderBytes: number;
   cardanoEpochParamsEndpoint?: string;
+  cardanoLocalEpochContextEndpoint?: string;
   cardanoPoolRegistrationHistoryEndpoint?: string;
-  cardanoKoiosApiKey?: string;
-
-  mithrilEndpoint: string;
-  mtithrilGenesisVerificationKey: string;
+  cardanoBlockfrostProjectId?: string;
+  // Optional Mithril aggregator for certified Cardano stake distributions.
+  mithrilEndpoint?: string;
 }
 
 export default (): Partial<Config> => {
@@ -153,12 +156,18 @@ export default (): Partial<Config> => {
     cardanoNetwork = 'Mainnet';
   }
 
-  const cardanoLightClientMode =
-    process.env.CARDANO_LIGHT_CLIENT_MODE === 'mithril' ? 'mithril' : 'stake-weighted-stability';
   const cardanoEpochParamsEndpoint =
-    process.env.CARDANO_EPOCH_PARAMS_ENDPOINT || defaultKoiosEndpoint(process.env.CARDANO_NETWORK_MAGIC);
-  if (cardanoLightClientMode === 'stake-weighted-stability') {
-    validatePublicNetworkStabilityConfig(cardanoNetwork, cardanoEpochParamsEndpoint);
+    (process.env.CARDANO_NETWORK_MAGIC === '42' ? process.env.CARDANO_EPOCH_PARAMS_ENDPOINT : undefined) ||
+    process.env.CARDANO_BLOCKFROST_ENDPOINT || defaultBlockfrostEndpoint(process.env.CARDANO_NETWORK_MAGIC);
+  validatePublicNetworkStabilityConfig(cardanoNetwork, cardanoEpochParamsEndpoint);
+
+  const defaultTrustingPeriod = 172_800;
+  const cardanoClientTrustingPeriodSeconds = Number(process.env.CARDANO_CLIENT_TRUSTING_PERIOD_SECONDS || defaultTrustingPeriod);
+  if (
+    !Number.isSafeInteger(cardanoClientTrustingPeriodSeconds) ||
+    cardanoClientTrustingPeriodSeconds < MIN_CARDANO_CLIENT_TRUSTING_PERIOD_SECONDS
+  ) {
+    throw new Error('CARDANO_CLIENT_TRUSTING_PERIOD_SECONDS must be at least 172800 for bounded initialization and the response window');
   }
 
   return {
@@ -175,29 +184,28 @@ export default (): Partial<Config> => {
     cardanoChainPort: Number(process.env.CARDANO_CHAIN_PORT || 3001),
     cardanoChainNetworkMagic: Number(process.env.CARDANO_CHAIN_NETWORK_MAGIC || 42),
     cardanoChainId: process.env.CARDANO_CHAIN_ID || 'cardano-devnet',
-    cardanoLightClientMode,
     cardanoNetwork: cardanoNetwork,
     cardanoEpochLength: Number(
       process.env.CARDANO_EPOCH_LENGTH || defaultEpochLength(process.env.CARDANO_NETWORK_MAGIC),
     ),
-    cardanoClientTrustingPeriodSeconds: Number(process.env.CARDANO_CLIENT_TRUSTING_PERIOD_SECONDS || 86_400),
+    cardanoRandomnessStabilisationWindowSlots: process.env.CARDANO_RANDOMNESS_STABILISATION_WINDOW_SLOTS,
+    cardanoClientTrustingPeriodSeconds,
     cardanoClientMaxClockDriftSeconds: positiveGoDurationSecondsEnv(
       'CARDANO_CLIENT_MAX_CLOCK_DRIFT_SECONDS',
       10,
     ),
     cardanoStabilityCheckpointMaxBridgeBlocks: Number(
-      process.env.CARDANO_STABILITY_CHECKPOINT_MAX_BRIDGE_BLOCKS || 32,
-    ),
-    cardanoStabilityCheckpointMaxHeaderBytes: Number(
-      process.env.CARDANO_STABILITY_CHECKPOINT_MAX_HEADER_BYTES || 768 * 1024,
+      process.env.CARDANO_STABILITY_CHECKPOINT_MAX_BRIDGE_BLOCKS || 96,
     ),
     cardanoEpochParamsEndpoint,
+    cardanoLocalEpochContextEndpoint: cardanoNetwork === 'Custom'
+      ? process.env.CARDANO_LOCAL_EPOCH_CONTEXT_ENDPOINT?.trim() || undefined
+      : undefined,
     cardanoPoolRegistrationHistoryEndpoint:
-      process.env.CARDANO_POOL_REGISTRATION_HISTORY_ENDPOINT || defaultKoiosEndpoint(process.env.CARDANO_NETWORK_MAGIC),
-    cardanoKoiosApiKey:
-      process.env.CARDANO_KOIOS_API_KEY || process.env.CARIBIC_KOIOS_API_KEY || process.env.KOIOS_API_KEY,
+      process.env.CARDANO_BLOCKFROST_ENDPOINT || defaultBlockfrostEndpoint(process.env.CARDANO_NETWORK_MAGIC),
+    cardanoBlockfrostProjectId:
+      process.env.CARDANO_BLOCKFROST_PROJECT_ID || process.env.BLOCKFROST_PROJECT_ID,
 
     mithrilEndpoint: process.env.MITHRIL_ENDPOINT,
-    mtithrilGenesisVerificationKey: process.env.MITHRIL_GENESIS_VERIFICATION_KEY,
   };
 };

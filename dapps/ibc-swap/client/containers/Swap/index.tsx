@@ -1,9 +1,13 @@
 'use client';
 
-import React, { useContext, useEffect, useState } from 'react';
+import { CardanoIntentProgress } from '@/components/CardanoIntentProgress';
+import type { FundedIntent, IntentStatus } from '@/utils/cardanoIntent';
+
+import React, { useContext, useEffect, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
 import {
   Box,
+  Button,
   Checkbox,
   Heading,
   Image,
@@ -23,7 +27,16 @@ import DefaultCosmosNetworkIcon from '@/assets/icons/cosmos-icon.svg';
 import { COLOR } from '@/styles/color';
 import SwapContext from '@/contexts/SwapContext';
 import { NetworkItemProps } from '@/components/NetworkItem/NetworkItem';
-import { formatNumberInput, formatPrice } from '@/utils/string';
+import {
+  baseAmountToDisplayAmount,
+  formatNumberInput,
+  formatPrice,
+} from '@/utils/string';
+import { swapRequestKey, tokenAmount } from '@/utils/token';
+import {
+  tokenPrimaryLabel,
+  tokenUsesBaseUnits,
+} from '@/utils/cardanoAssetPresentation';
 import { allChains } from '@/configs/customChainInfo';
 import TransferContext from '@/contexts/TransferContext';
 import {
@@ -46,9 +59,11 @@ import StyledSwap, {
 } from './index.style';
 
 type EstimateFeeType = {
+  requestKey?: string;
   display: boolean;
   canEst: boolean;
   msgs: any[];
+  intentChannel?: string;
   estReceiveAmount: string;
   estMinimumReceived: string;
   estTime: string;
@@ -74,6 +89,8 @@ const SwapContainer = () => {
 
   const [networkList, setNetworkList] = useState<NetworkItemProps[]>([]);
   const [lastTxHash, setLastTxHash] = useState<string>('');
+  const [fundedIntent, setFundedIntent] = useState<FundedIntent>();
+  const [intentStatus, setIntentStatus] = useState<IntentStatus>();
   const [isSubmitSwap, setIsSubmitSwap] = useState<boolean>(false);
   const [errorAddressMsg, setErrorAddressMsg] = useState<string>('');
   const [isEstimating, setIsEstimating] = useState<boolean>(false);
@@ -85,9 +102,29 @@ const SwapContainer = () => {
   const { swapData, setSwapData, handleResetData } = useContext(SwapContext);
   const { handleReset: handleResetTransferData } = useContext(TransferContext);
 
+  const receiver = isCheckedAnotherWallet
+    ? swapData.receiveAdrress
+    : cardanoAddress;
+  const requestKey = errorAddressMsg
+    ? undefined
+    : swapRequestKey(
+        swapData,
+        cardanoAddress || undefined,
+        receiver || undefined,
+      );
+  const currentRequestKey = useRef(requestKey);
+  currentRequestKey.current = requestKey;
+  const estimateGeneration = useRef(0);
+  const estimateMatches = Boolean(
+    requestKey && estData.canEst && estData.requestKey === requestKey,
+  );
+
   const resetLastTxData = () => {
     setEstimateData(initEstData);
     setLastTxHash('');
+    setFundedIntent(undefined);
+    setIntentStatus(undefined);
+    localStorage.removeItem('ibc-swap:funded-swap');
     handleResetData();
   };
 
@@ -139,8 +176,23 @@ const SwapContainer = () => {
     });
   };
 
+  useEffect(() => {
+    try {
+      const intent = JSON.parse(
+        localStorage.getItem('ibc-swap:funded-swap') || 'null',
+      ) as FundedIntent | null;
+      if (intent && intent.signer === cardanoAddress) {
+        setFundedIntent(intent);
+        setLastTxHash(intent.hash);
+        setIsSubmitSwap(true);
+      }
+    } catch {
+      /* Ignore malformed browser state. */
+    }
+  }, [cardanoAddress]);
+
   const handleSwap = async () => {
-    if (!estData.canEst || !cardanoWallet?.signTx) {
+    if (!estimateMatches || !cardanoWallet?.signTx) {
       return;
     }
 
@@ -148,6 +200,13 @@ const SwapContainer = () => {
       const signedTx = await cardanoWallet.signTx(estData.msgs[0], true);
       const txHash = await cardanoWallet.submitTx(signedTx);
       if (txHash) {
+        const intent = {
+          hash: txHash,
+          channel: estData.intentChannel!,
+          signer: cardanoAddress!,
+        };
+        localStorage.setItem('ibc-swap:funded-swap', JSON.stringify(intent));
+        setFundedIntent(intent);
         setLastTxHash(txHash);
         setIsSubmitSwap(true);
       }
@@ -170,8 +229,16 @@ const SwapContainer = () => {
     setNetworkList(networkListData);
   }, [handleResetTransferData]);
 
-  const calculateAndSetSwapEst = async () => {
+  const calculateAndSetSwapEst = async (generation: number, key: string) => {
+    const isCurrent = () =>
+      estimateGeneration.current === generation &&
+      currentRequestKey.current === key;
     setEstimateData({ ...initEstData });
+    const inputToken = tokenAmount(
+      swapData.fromToken,
+      swapData.fromToken.swapAmount || '',
+    );
+    if (!inputToken) return;
     setIsEstimating(true);
 
     try {
@@ -179,14 +246,15 @@ const SwapContainer = () => {
         fromChainId:
           swapData.fromToken.network.ibcChainId ||
           swapData.fromToken.network.networkId!,
-        tokenInDenom: swapData.fromToken.tokenId,
-        tokenInAmount: swapData.fromToken.swapAmount!,
+        tokenInDenom: inputToken.denom,
+        tokenInAmount: inputToken.amount,
         toChainId:
           swapData.toToken.network.ibcChainId ||
           swapData.toToken.network.networkId!,
         tokenOutDenom: swapData.toToken.tokenId,
       });
 
+      if (!isCurrent()) return;
       if (!res) {
         setEstimateData({ ...initEstData });
         return;
@@ -212,27 +280,28 @@ const SwapContainer = () => {
         return;
       }
 
-      setSwapData({
-        ...swapData,
-        toToken: {
-          ...swapData.toToken,
-          swapAmount: tokenOutAmount,
-        },
-      });
-
       const msg = await unsignedTxSwapFromCardano({
         sender: cardanoAddress!,
-        tokenIn: {
-          amount: swapData.fromToken.swapAmount!,
-          denom: swapData.fromToken.tokenId,
-        },
+        tokenIn: inputToken,
         tokenOutDenom: outToken,
-        receiver: swapData.receiveAdrress || cardanoAddress!,
+        receiver: receiver!,
         transferRoutes,
         transferBackRoutes,
         slippagePercentage: swapData.slippageTolerance!,
         timeoutTimeOffset: PACKET_TIMEOUT_NANOSEC,
       });
+
+      if (!isCurrent()) return;
+      setSwapData((prev) => ({
+        ...prev,
+        toToken: {
+          ...prev.toToken,
+          swapAmount: baseAmountToDisplayAmount(
+            tokenOutAmount,
+            swapData.toToken.tokenExponent ?? 0,
+          ),
+        },
+      }));
 
       let estDataResult: any;
       try {
@@ -243,6 +312,7 @@ const SwapContainer = () => {
           display: true,
           canEst: true,
           msgs: [unsignedTx],
+          intentChannel: msg[0].intentChannel,
           estFee: `${formatPrice(estFee)} lovelace`,
           estTime: '~2 mins',
         };
@@ -258,42 +328,48 @@ const SwapContainer = () => {
       setEstimateData({
         ...initEstData,
         ...estDataResult,
-        estReceiveAmount: tokenOutAmount,
-        estMinimumReceived: `${tokenOutTransferBackAmount} ${swapData.toToken.tokenId.toUpperCase()}`,
+        requestKey: key,
+        estReceiveAmount: baseAmountToDisplayAmount(
+          tokenOutAmount,
+          swapData.toToken.tokenExponent ?? 0,
+        ),
+        estMinimumReceived: `${baseAmountToDisplayAmount(
+          tokenOutTransferBackAmount,
+          swapData.toToken.tokenExponent ?? 0,
+        )} ${
+          tokenUsesBaseUnits(swapData.toToken) ? 'base units ' : ''
+        }${tokenPrimaryLabel(swapData.toToken)}`,
       });
+    } catch (error) {
+      if (isCurrent()) {
+        setEstimateData(initEstData);
+        toast.error(
+          error instanceof Error ? error.message : 'Swap estimation failed',
+          { theme: 'colored' },
+        );
+      }
     } finally {
-      setIsEstimating(false);
+      if (isCurrent()) setIsEstimating(false);
     }
   };
 
   useEffect(() => {
+    estimateGeneration.current += 1;
+    const generation = estimateGeneration.current;
     setEstimateData(initEstData);
-
-    if (
-      swapData?.fromToken?.swapAmount &&
-      cardanoAddress &&
-      swapData?.fromToken?.network?.networkId &&
-      swapData?.fromToken?.tokenId &&
-      swapData?.toToken?.network?.networkId &&
-      swapData?.toToken?.tokenId
-    ) {
-      const timeout = window.setTimeout(() => {
-        calculateAndSetSwapEst();
-      }, 450);
-
-      return () => {
-        window.clearTimeout(timeout);
-      };
-    }
-
-    return undefined;
-  }, [
-    JSON.stringify(swapData?.fromToken),
-    JSON.stringify(swapData?.toToken?.network),
-    swapData?.toToken?.tokenId,
-    isCheckedAnotherWallet,
-    cardanoAddress,
-  ]);
+    setIsEstimating(false);
+    if (!requestKey) return undefined;
+    const timeout = window.setTimeout(() => {
+      calculateAndSetSwapEst(generation, requestKey);
+    }, 450);
+    return () => {
+      estimateGeneration.current = generation + 1;
+      window.clearTimeout(timeout);
+    };
+    // The key includes every transaction input. Output display amounts do not
+    // change the request and must not start another estimate.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [requestKey]);
 
   return (
     <AnimatePresence mode="wait">
@@ -305,13 +381,36 @@ const SwapContainer = () => {
           exit={{ opacity: 0, y: -12 }}
           transition={{ duration: 0.2 }}
         >
-          <SwapResult
-            setIsSubmitted={setIsSubmitSwap}
-            minimumReceived={estData.estMinimumReceived || ''}
-            estFee={estData.estFee}
-            resetLastTxData={resetLastTxData}
-            lastTxHash={lastTxHash}
-          />
+          {fundedIntent && (
+            <CardanoIntentProgress
+              intent={fundedIntent}
+              onStatus={(status) => {
+                setIntentStatus(status);
+                if (status.stage === 'sent' && status.packetTxHash)
+                  setLastTxHash(status.packetTxHash);
+              }}
+            />
+          )}
+          {intentStatus?.stage === 'cancelled' && (
+            <Button
+              mt={4}
+              onClick={() => {
+                resetLastTxData();
+                setIsSubmitSwap(false);
+              }}
+            >
+              Start another swap
+            </Button>
+          )}
+          {(!fundedIntent || intentStatus?.stage === 'sent') && (
+            <SwapResult
+              setIsSubmitted={setIsSubmitSwap}
+              minimumReceived={estData.estMinimumReceived || ''}
+              estFee={estData.estFee}
+              resetLastTxData={resetLastTxData}
+              lastTxHash={lastTxHash}
+            />
+          )}
         </motion.div>
       ) : (
         <motion.div
@@ -358,7 +457,7 @@ const SwapContainer = () => {
                 handleChangeAmount={() => {}}
               />
               <AnimatePresence initial={false}>
-                {(isEstimating || estData.canEst) && (
+                {(isEstimating || estimateMatches) && (
                   <motion.div
                     key="swap-estimate"
                     initial={{ opacity: 0, y: 8 }}
@@ -416,7 +515,7 @@ const SwapContainer = () => {
                 )}
               </AnimatePresence>
               <StyledSwapButton
-                disabled={!estData.canEst || isEstimating}
+                disabled={!estimateMatches || isEstimating}
                 onClick={() => handleSwap()}
               >
                 <Text fontSize={18} fontWeight={700} lineHeight="24px">

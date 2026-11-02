@@ -1,7 +1,9 @@
 use aiken/primitive/bytearray
 use aiken/primitive/int
-use ibc/utils/string
+use ibc/utils/text_bytes
 
+// Frozen public commitment primitive. Keep its fields and order unchanged.
+// Put private metadata in a separate type. See docs/cardano-commitment-codec.md.
 pub type Height {
   // the revision that the client is currently on
   revision_number: Int,
@@ -22,7 +24,7 @@ pub fn parse_chain_id(chain_id: ByteArray) -> Int {
     0
   } else {
     let revision_number = bytearray.drop(chain_id, dash_index + 1)
-    if string.is_uint_string(revision_number) {
+    if text_bytes.is_canonical_unsigned_decimal(revision_number) {
       expect Some(parsed_revision_number) = int.from_utf8(revision_number)
       parsed_revision_number
     } else {
@@ -50,6 +52,10 @@ pub fn is_valid(height: Height) -> Bool {
   height.revision_number >= 0 && height.revision_height >= 0
 }
 
+pub fn equal(left: Height, right: Height) -> Bool {
+  left.revision_number == right.revision_number && left.revision_height == right.revision_height
+}
+
 pub fn compare(h1: Height, h2: Height) -> Ordering {
   if h1.revision_number < h2.revision_number {
     Less
@@ -72,4 +78,15 @@ pub fn zero_height() -> Height {
 
 pub fn is_zero(height: Height) -> Bool {
   height.revision_number == 0 && height.revision_height == 0
+}
+
+/// IBC paths include both revision and height, including revision zero.
+pub fn to_string(value: Height) -> ByteArray {
+  bytearray.concat(
+    text_bytes.int_to_decimal_bytes(value.revision_number),
+    bytearray.concat(
+      "-",
+      text_bytes.int_to_decimal_bytes(value.revision_height),
+    ),
+  )
 }

@@ -23,7 +23,31 @@ function manifest(): BridgeManifest {
   });
 
   return {
-    schema_version: 4,
+    schema_version: 6,
+    packet_state: {
+      format: 'packet-lanes-v1',
+      receipt_storage: 'merkle-history-v1',
+      lane_count: 16,
+      config_token: { policy_id: 'config-policy', token_name: 'config-token' },
+      state: validator('state'),
+      batch: validator('batch'),
+      guard: validator('guard'),
+      operations: Object.fromEntries(
+        [
+          'send',
+          'acknowledge',
+          'timeout',
+          'reject',
+          'receive',
+          'prune',
+          'timeout_on_close',
+          'retire',
+          'funds',
+          'send_funds',
+        ].map((name) => [name, validator(name)]),
+      ),
+    },
+    consensus_history_format: 'proof-backed-v1',
     deployment_id: 'cardano-devnet:host-policy.host-token',
     deployed_at: '2026-04-01T12:34:56.000Z',
     ics20_packet_codec: ICS20_PACKET_CODEC.STRICT,
@@ -32,6 +56,7 @@ function manifest(): BridgeManifest {
     validators: {
       host_state_stt: validator('host'),
       recover_client: validator('recover', 12),
+      update_client: validator('update', 13),
       spend_client: validator('client'),
       spend_connection: validator('connection'),
       spend_channel: {
@@ -46,6 +71,9 @@ function manifest(): BridgeManifest {
           prune_packet_history: referredValidator('prune'),
           send_packet: referredValidator('send'),
           timeout_packet: referredValidator('timeout'),
+          chan_upgrade: referredValidator('upgrade'),
+          chan_upgrade_handshake: referredValidator('upgrade-handshake'),
+          chan_upgrade_finish: referredValidator('upgrade-finish'),
         },
       },
       spend_transfer_module: validator('transfer'),
@@ -67,10 +95,20 @@ function manifest(): BridgeManifest {
 describe('BridgeManifestService', () => {
   it('includes the recovery validator in the encoded gRPC manifest', () => {
     const bridgeManifest = manifest();
+    bridgeManifest.history = {
+      format: 'cardano-history-v1',
+      start: { slot: 123, block_height: 10, block_hash: 'aa'.repeat(32) },
+      host_state_nft_mint: { tx_hash: 'bb'.repeat(32), output_index: 0 },
+    };
     const configService = {
       get: jest.fn().mockReturnValue(bridgeManifest),
     } as unknown as ConfigService;
     const response = new BridgeManifestService(configService).getGrpcBridgeManifestResponse();
+    expect(
+      JSON.parse(
+        QueryBridgeManifestResponse.decode(QueryBridgeManifestResponse.encode(response).finish()).manifest_json,
+      ),
+    ).toEqual(bridgeManifest);
 
     expect(response.manifest?.validators?.recover_client?.ref_utxo?.output_index).toBe(12n);
 

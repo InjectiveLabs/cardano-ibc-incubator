@@ -28,7 +28,6 @@ const BindPortSchema = Data.Object({
 const UpdateClientSchema = Data.Object({
   client_state_siblings: SiblingHashesSchema,
   consensus_state_siblings: SiblingHashesSchema,
-  removed_consensus_state_siblings: Data.Array(SiblingHashesSchema),
 });
 
 const UpdateChannelSchema = Data.Object({
@@ -61,6 +60,14 @@ export const HostStateRedeemerSchema = Data.Enum([
   Data.Object({ EnterShutdown: EnterShutdownSchema }),
   Data.Literal("FinalizeShutdown"),
   Data.Literal("Heartbeat"),
+  Data.Literal("AuthorizeFinalization"),
+  Data.Object({
+    RetireState: Data.Object({
+      kind: Data.Integer(),
+      token_name: Data.Bytes(),
+    }),
+  }),
+  Data.Literal("ClaimBackup"),
 ]);
 
 export type HostStateRedeemer = Data.Static<typeof HostStateRedeemerSchema>;

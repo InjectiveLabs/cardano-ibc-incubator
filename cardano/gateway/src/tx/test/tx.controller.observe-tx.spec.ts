@@ -25,6 +25,8 @@ describe('TxController ObserveTx', () => {
       {} as any,
       {} as any,
       {} as any,
+      {} as any,
+      {} as any,
       submissionService as any,
       {} as any,
     );

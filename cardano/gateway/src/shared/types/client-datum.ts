@@ -5,6 +5,7 @@ import { ClientDatumState } from './client-datum-state';
 export type ClientDatum = {
   state: ClientDatumState;
   token: AuthToken;
+  history_root: string;
 };
 export async function encodeClientDatum(
   clientDatum: ClientDatum,
@@ -67,6 +68,7 @@ export async function encodeClientDatum(
       height(value.frozenHeight),
       height(value.latestHeight),
       list(value.proofSpecs.map(proofSpec)),
+      list(value.upgradePath.map(bytes)),
     ]);
   const consensusState = (value: any) =>
     constr(0, [int(value.timestamp), bytes(value.next_validators_hash), constr(0, [bytes(value.root.hash)])]);
@@ -82,6 +84,7 @@ export async function encodeClientDatum(
       dataMap(mapEntries(clientDatum.state.processedHeights).map(([key, value]) => [height(key), int(value)])),
     ]),
     authToken(clientDatum.token),
+    bytes(clientDatum.history_root),
   ]).to_cbor_hex();
 }
 
@@ -131,6 +134,7 @@ export async function decodeClientDatum(
     frozenHeight: HeightSchema,
     latestHeight: HeightSchema,
     proofSpecs: Data.Array(ProofSpecSchema),
+    upgradePath: Data.Array(Data.Bytes()),
   });
 
   const MerkleRootSchema = Data.Object({
@@ -155,6 +159,7 @@ export async function decodeClientDatum(
   const ClientDatumSchema = Data.Object({
     state: ClientDatumStateSchema,
     token: AuthTokenSchema,
+    history_root: Data.Bytes({ minLength: 32, maxLength: 32 }),
   });
   type TClientDatum = Data.Static<typeof ClientDatumSchema>;
   const TClientDatum = ClientDatumSchema as unknown as ClientDatum;

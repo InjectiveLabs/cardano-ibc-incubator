@@ -3,8 +3,6 @@ use std::path::Path;
 use std::time::Duration;
 use std::time::Instant;
 
-use indicatif::{ProgressBar, ProgressStyle};
-
 use crate::{
     chains, config, logger,
     start::{
@@ -18,7 +16,7 @@ use crate::{
 
 const HERMES_BUILD_PROGRESS_LOG_INTERVAL_SECS: u64 = 10;
 const HERMES_BUILD_POLL_INTERVAL_SECS: u64 = 2;
-const MITHRIL_DEPRECATED_ERROR: &str = "ERROR: Mithril setup is deprecated, disabled, and not maintained. Use the default stake-weighted-stability light-client mode. The Mithril source remains in-tree for historical reference only.";
+const DEVKIT_DAPP_LIMITATION: &str = "The swap UI is not supported on the local network yet. Use `caribic demo token-transfer --chain cosmos --network v8-classic`.";
 
 fn requires_injective_testnet_route(network: config::CoreCardanoNetwork) -> bool {
     network.is_public_testnet()
@@ -38,25 +36,6 @@ fn ensure_public_testnet_relayer_route(
             error
         )
     })
-}
-
-fn require_public_bridge_artifact(
-    network: config::CoreCardanoNetwork,
-    artifact_path: &Path,
-    label: &str,
-) -> Result<(), String> {
-    if artifact_path.exists() {
-        return Ok(());
-    }
-
-    Err(format!(
-        "ERROR: Missing required {} {} at {}.\nProvide an existing {} bridge deployment artifact before starting against --network {}.",
-        network.as_str(),
-        label,
-        artifact_path.display(),
-        network.as_str(),
-        network.as_str()
-    ))
 }
 
 fn require_public_gateway_bootstrap_artifact(
@@ -108,15 +87,24 @@ fn target_requires_runtime_deployer_sk(target: Option<StartTarget>) -> bool {
         || target == Some(StartTarget::Relayer)
 }
 
-fn target_starts_dapp(target: Option<&StartTarget>) -> bool {
-    target.is_none() || matches!(target, Some(StartTarget::All) | Some(StartTarget::Dapp))
+fn target_starts_dapp(
+    target: Option<&StartTarget>,
+    network: config::CoreCardanoNetwork,
+) -> Result<bool, String> {
+    if network == config::CoreCardanoNetwork::Local {
+        return if matches!(target, Some(StartTarget::Dapp)) {
+            Err(DEVKIT_DAPP_LIMITATION.into())
+        } else {
+            Ok(false)
+        };
+    }
+    Ok(target.is_none() || matches!(target, Some(StartTarget::All) | Some(StartTarget::Dapp)))
 }
 
 /// Starts the requested target and orchestrates the network, bridge, and dapp components.
 pub async fn run_start(
     target: Option<StartTarget>,
     clean: bool,
-    with_mithril: bool,
     network: Option<String>,
     chain_flags: Vec<String>,
 ) -> Result<(), String> {
@@ -125,15 +113,10 @@ pub async fn run_start(
     let project_config = config::get_config();
     let project_root_path = Path::new(&project_config.project_root);
 
-    if with_mithril || target == Some(StartTarget::Mithril) {
-        return Err(MITHRIL_DEPRECATED_ERROR.to_string());
-    }
-
     // Determine what to start.
     let start_all = target.is_none() || target == Some(StartTarget::All);
     let start_network = start_all || target == Some(StartTarget::Network);
     let start_bridge = start_all || target == Some(StartTarget::Bridge);
-    let start_dapp_target = target_starts_dapp(target.as_ref());
 
     if !chain_flags.is_empty() {
         return Err(
@@ -144,6 +127,7 @@ pub async fn run_start(
 
     let core_cardano_network = config::CoreCardanoNetwork::parse(network.as_deref())?;
     let core_cardano_profile = config::cardano_network_profile(core_cardano_network);
+    let start_dapp_target = target_starts_dapp(target.as_ref(), core_cardano_network)?;
 
     crate::start::ensure_cardano_network_switch_is_safe(project_root_path, core_cardano_network)?;
 
@@ -167,7 +151,6 @@ pub async fn run_start(
 
     let mut aiken_build_handle = None;
     let mut hermes_build_handle = None;
-    let mut mithril_genesis_handle = None;
 
     if start_all {
         if start_bridge {
@@ -206,11 +189,10 @@ pub async fn run_start(
                     error
                 )
             })?;
-            crate::setup::prepare_db_sync_and_gateway(
+            crate::setup::prepare_gateway(
                 project_root_path.join("chains/cardano").as_path(),
                 clean,
                 core_cardano_network,
-                "stake-weighted-stability",
             )
             .map_err(|error| format!("ERROR: Failed to prepare gateway runtime: {}", error))?;
         }
@@ -222,14 +204,6 @@ pub async fn run_start(
     }
 
     if target == Some(StartTarget::Relayer) {
-        if core_cardano_network.is_public_testnet() {
-            require_public_bridge_artifact(
-                core_cardano_network,
-                Path::new(core_cardano_profile.handler_json_path.as_str()),
-                "handler.json",
-            )?;
-        }
-
         match start_relayer(
             project_root_path.join("relayer").as_path(),
             project_root_path.join("relayer/.env.example").as_path(),
@@ -268,16 +242,14 @@ pub async fn run_start(
         match crate::start::start_local_cardano_network(
             project_root_path,
             clean,
-            false,
             core_cardano_network,
         )
         .await
         {
-            Ok(handle) => {
-                mithril_genesis_handle = handle;
+            Ok(()) => {
                 let managed_services = match core_cardano_network {
                     config::CoreCardanoNetwork::Local => {
-                        "cardano-node, ogmios, kupo, postgres, yaci-store, yaci-store-postgres"
+                        "Yaci DevKit five-producer network, Ogmios, Kupo, Yaci Store, Mithril, databases"
                     }
                     config::CoreCardanoNetwork::Preprod | config::CoreCardanoNetwork::Preview => {
                         "postgres, yaci-store, yaci-store-postgres; external Cardano relay, Kupo, and Ogmios"
@@ -360,11 +332,10 @@ pub async fn run_start(
                     )
                 })?;
             }
-            crate::setup::prepare_db_sync_and_gateway(
+            crate::setup::prepare_gateway(
                 project_root_path.join("chains/cardano").as_path(),
                 clean,
                 core_cardano_network,
-                "stake-weighted-stability",
             )
             .map_err(|error| {
                 format!(
@@ -406,7 +377,7 @@ pub async fn run_start(
                 .await
                 {
                     Ok(_) => logger::log(&format!(
-                        "PASS: IBC smart contracts deployed to Cardano {} and deployment artifacts exported",
+                        "PASS: Bridge deployment ready on Cardano {}",
                         core_cardano_network.as_str()
                     )),
                     Err(error) => {
@@ -573,57 +544,6 @@ pub async fn run_start(
             logger::log(&format!("Final balance {}", &balance.to_string().as_str()));
         }
 
-        if let Some(handle) = mithril_genesis_handle.take() {
-            let optional_progress_bar = match logger::get_verbosity() {
-                logger::Verbosity::Verbose => None,
-                _ => Some(ProgressBar::new_spinner()),
-            };
-
-            if let Some(progress_bar) = &optional_progress_bar {
-                progress_bar.enable_steady_tick(Duration::from_millis(100));
-                progress_bar.set_style(
-                    ProgressStyle::with_template(
-                        "{prefix:.bold} {spinner} [{elapsed_precise}] {wide_msg}",
-                    )
-                    .map_err(|error| {
-                        format!("ERROR: Failed to configure progress output: {error}")
-                    })?
-                    .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ "),
-                );
-                progress_bar.set_prefix("Waiting for Mithril to become ready ...".to_owned());
-                progress_bar
-                    .set_message("This can take a few minutes on a fresh devnet".to_owned());
-            } else {
-                logger::log(
-                    "Waiting for Mithril to become ready (this can take a few minutes on a fresh devnet) ...",
-                );
-            }
-
-            let result = handle.await;
-
-            if let Some(progress_bar) = &optional_progress_bar {
-                progress_bar.finish_and_clear();
-            }
-
-            match result {
-                Ok(Ok(())) => logger::log(
-                    "PASS: Immutable Cardano node files have been created, and Mithril is working as expected",
-                ),
-                Ok(Err(error)) => {
-                    return fail_and_stop_started_services(project_root_path, StopTarget::Bridge, core_cardano_network, &format!(
-                        "ERROR: Mithril failed to read the immutable cardano node files: {}",
-                        error
-                    ))
-                }
-                Err(error) => {
-                    return fail_and_stop_started_services(project_root_path, StopTarget::Bridge, core_cardano_network, &format!(
-                        "ERROR: Mithril genesis bootstrap task failed: {}",
-                        error
-                    ))
-                }
-            }
-        }
-
         logger::log("\nBridge started successfully!");
         if core_cardano_network == config::CoreCardanoNetwork::Local {
             logger::log("Keys have been automatically configured for cardano-devnet.");
@@ -647,6 +567,9 @@ pub async fn run_start(
         }
     }
 
+    if start_all && !start_dapp_target {
+        logger::log(&format!("Skipping swap UI. {DEVKIT_DAPP_LIMITATION}"));
+    }
     if start_dapp_target {
         ensure_active_cardano_runtime_identity(project_root_path, core_cardano_network)?;
         match start_dapp(project_root_path, clean, core_cardano_network) {
@@ -725,26 +648,32 @@ mod tests {
     use crate::{config::CoreCardanoNetwork, StartTarget};
 
     #[test]
-    fn default_and_all_targets_start_the_dapp() {
-        assert!(target_starts_dapp(None));
-        assert!(target_starts_dapp(Some(&StartTarget::All)));
+    fn public_network_targets_start_the_dapp() {
+        for network in [CoreCardanoNetwork::Preprod, CoreCardanoNetwork::Preview] {
+            for target in [None, Some(&StartTarget::All), Some(&StartTarget::Dapp)] {
+                assert!(target_starts_dapp(target, network).unwrap());
+            }
+        }
     }
 
     #[test]
-    fn standalone_dapp_target_starts_the_dapp() {
-        assert!(target_starts_dapp(Some(&StartTarget::Dapp)));
-    }
-
-    #[test]
-    fn non_dapp_targets_do_not_start_the_dapp() {
+    fn devkit_dispatch_skips_default_ui_and_rejects_explicit_ui_without_affecting_public_networks()
+    {
         for target in [
-            StartTarget::Network,
-            StartTarget::Bridge,
-            StartTarget::Gateway,
-            StartTarget::Relayer,
-            StartTarget::Mithril,
+            None,
+            Some(&StartTarget::All),
+            Some(&StartTarget::Network),
+            Some(&StartTarget::Bridge),
         ] {
-            assert!(!target_starts_dapp(Some(&target)));
+            assert!(!target_starts_dapp(target, CoreCardanoNetwork::Local).unwrap());
+        }
+        let error =
+            target_starts_dapp(Some(&StartTarget::Dapp), CoreCardanoNetwork::Local).unwrap_err();
+        assert!(error.contains("not supported on the local network yet"));
+        for network in [CoreCardanoNetwork::Preprod, CoreCardanoNetwork::Preview] {
+            for target in [None, Some(&StartTarget::All), Some(&StartTarget::Dapp)] {
+                assert!(target_starts_dapp(target, network).unwrap());
+            }
         }
     }
 

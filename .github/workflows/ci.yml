@@ -6,6 +6,11 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      populated_migration:
+        description: Run the full disposable V1 to V2 to V3 migration rehearsal
+        type: boolean
+        default: false
 
 permissions:
   actions: read
@@ -13,7 +18,7 @@ permissions:
   pull-requests: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ inputs.populated_migration && 'migration' || 'checks' }}
   cancel-in-progress: true
 
 env:
@@ -23,24 +28,58 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  docs-update:
+    uses: ./.github/workflows/check-docs-update.yml
+    with:
+      workflow: .github/workflows/ci.yml
+
+  populated-migration:
+    if: ${{ needs.docs-update.outputs.run_jobs == 'true' && github.event_name == 'workflow_dispatch' && inputs.populated_migration }}
+    needs: docs-update
+    uses: ./.github/workflows/migration-rehearsal.yml
+    permissions:
+      contents: read
+
   aiken-changes:
     name: Detect Aiken Changes
-    if: ${{ github.event_name != 'pull_request' || !startsWith(github.head_ref, 'docs/') }}
+    if: ${{ needs.docs-update.outputs.run_jobs == 'true' && (github.event_name != 'pull_request' || !startsWith(github.head_ref, 'docs/')) }}
+    needs: docs-update
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       aiken_changed: ${{ steps.detect.outputs.aiken_changed }}
       aiken_files_changed: ${{ steps.detect.outputs.aiken_files_changed }}
       aiken_pr_changed: ${{ steps.detect.outputs.aiken_pr_changed }}
+      hermes_changed: ${{ steps.hermes.outputs.changed }}
+      aiken_fuzz_changed: ${{ steps.detect.outputs.aiken_fuzz_changed }}
+      property_matrix: ${{ steps.properties.outputs.matrix }}
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
 
+      - name: Detect Hermes changes
+        id: hermes
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          changed=true
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]] &&
+             git diff --quiet --ignore-submodules=none --no-ext-diff \
+               "${PR_BASE_SHA}...${PR_HEAD_SHA}" -- \
+               relayer .gitmodules .github/workflows/ci.yml \
+               cosmos/cardano-probabilistic-light-client-core \
+               cosmos/cardano-probabilistic-light-client-v8 \
+               cosmos/cardano-probabilistic-light-client-v10; then
+            changed=false
+          fi
+          echo "changed=${changed}" >> "${GITHUB_OUTPUT}"
+
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 22
 
@@ -49,6 +88,16 @@ jobs:
 
       - name: Test Aiken wire schema lock
         run: node --test scripts/ci/check-aiken-wire-schema.test.mjs
+
+      - name: Test image publishing guards
+        run: node --test scripts/ci/image-*.test.mjs scripts/ci/release-*.test.mjs
+
+      - name: Test fuzz assurance helpers
+        run: node --test scripts/ci/aiken-property-inventory.test.mjs scripts/ci/check-aiken-fuzz-coverage.test.mjs
+
+      - name: Discover every Aiken property
+        id: properties
+        run: echo "matrix=$(node scripts/ci/aiken-property-inventory.mjs)" >> "$GITHUB_OUTPUT"
 
       - name: Detect Aiken-relevant changes
         id: detect
@@ -67,6 +116,7 @@ jobs:
               echo "aiken_changed=$1"
               echo "aiken_files_changed=$2"
               echo "aiken_pr_changed=$3"
+              echo "aiken_fuzz_changed=${4:-true}"
             } >> "$GITHUB_OUTPUT"
           }
 
@@ -75,6 +125,7 @@ jobs:
               type == "object" and
               (.aikenFilesChanged | type == "boolean") and
               (.aikenRelevantChanged | type == "boolean") and
+              (.aikenFuzzChanged | type == "boolean") and
               (.changedFiles | type == "array" and all(.[]; type == "string")) and
               (.reasons | type == "array" and all(.[]; type == "string"))
             ' >/dev/null <<<"$1"
@@ -123,6 +174,10 @@ jobs:
           aiken_files_changed=$(jq -r '.aikenFilesChanged' <<<"${full_pr}")
           aiken_changed=$(jq -r '.aikenRelevantChanged' <<<"${classification}")
           aiken_pr_changed=$(jq -r '.aikenRelevantChanged' <<<"${full_pr}")
+          # Use the full PR until the existing reuse check attests a successful
+          # previous run against the same base. A budget-only update must not
+          # hide an earlier untested validator change.
+          aiken_fuzz_changed=$(jq -r '.aikenFuzzChanged' <<<"${full_pr}")
           jq -r '.reasons[]?' <<<"${classification}"
 
           # A synchronize event compares only the newly pushed commits. If the
@@ -228,6 +283,7 @@ jobs:
               fi
 
               if [ "${can_reuse}" = "true" ]; then
+                aiken_fuzz_changed=false
                 echo "The latest update changed only Aiken comments/whitespace or unrelated files."
                 echo "Reusing successful Aiken checks from ${EVENT_BEFORE_SHA}."
               else
@@ -235,7 +291,7 @@ jobs:
               fi
           fi
 
-          set_outputs "${aiken_changed}" "${aiken_files_changed}" "${aiken_pr_changed}"
+          set_outputs "${aiken_changed}" "${aiken_files_changed}" "${aiken_pr_changed}" "${aiken_fuzz_changed}"
           if [ "${aiken_changed}" = "true" ]; then
             echo "Aiken-relevant changes detected."
           else
@@ -291,16 +347,17 @@ jobs:
 
   repo-invariants:
     name: Repository Invariants
-    if: ${{ github.event_name != 'pull_request' || !startsWith(github.head_ref, 'docs/') }}
+    if: ${{ needs.docs-update.outputs.run_jobs == 'true' && (github.event_name != 'pull_request' || !startsWith(github.head_ref, 'docs/')) }}
+    needs: docs-update
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 22
 
@@ -309,16 +366,17 @@ jobs:
 
   quality-ratchets:
     name: Quality Ratchets
-    if: ${{ github.event_name != 'pull_request' || !startsWith(github.head_ref, 'docs/') }}
+    if: ${{ needs.docs-update.outputs.run_jobs == 'true' && (github.event_name != 'pull_request' || !startsWith(github.head_ref, 'docs/')) }}
+    needs: docs-update
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 22
 
@@ -328,21 +386,40 @@ jobs:
       - name: Check unused exports
         run: node scripts/ci/check-knip-ratchet.mjs
 
+      - name: Test npm audit ratchet
+        run: node --test scripts/ci/check-npm-audit-ratchet.test.mjs
+
       - name: Check npm audit ratchet
         run: node scripts/ci/check-npm-audit-ratchet.mjs
 
   gateway:
     name: Cardano Gateway
-    if: ${{ github.event_name != 'pull_request' || !startsWith(github.head_ref, 'docs/') }}
+    if: ${{ needs.docs-update.outputs.run_jobs == 'true' && (github.event_name != 'pull_request' || !startsWith(github.head_ref, 'docs/')) }}
+    needs: docs-update
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: gateway_history_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
@@ -364,37 +441,111 @@ jobs:
           npm ci --prefix packages/cardano-ibc-planner
           npm run --prefix packages/cardano-ibc-planner build
 
-          npm ci --prefix packages/cardano-ibc-tx-builder --legacy-peer-deps
+          npm ci --prefix packages/cardano-ibc-tx-builder
           npm run --prefix packages/cardano-ibc-tx-builder build
 
-          npm ci --prefix packages/cardano-ibc-trace-registry --legacy-peer-deps
+          npm ci --prefix packages/cardano-ibc-trace-registry
           npm run --prefix packages/cardano-ibc-trace-registry build
 
-          npm ci --prefix packages/cardano-ibc-tx-builder-runtime --legacy-peer-deps
+          npm ci --prefix packages/cardano-ibc-tx-builder-runtime
           npm run --prefix packages/cardano-ibc-tx-builder-runtime build
 
       - name: Prune package-local installs for gateway
         run: |
           rm -rf packages/cardano-ibc-planner/node_modules
-          npm ci --prefix packages/cardano-ibc-tx-builder --omit=dev --legacy-peer-deps
-          npm ci --prefix packages/cardano-ibc-trace-registry --omit=dev --legacy-peer-deps
-          npm ci --prefix packages/cardano-ibc-tx-builder-runtime --omit=dev --legacy-peer-deps
+          npm ci --prefix packages/cardano-ibc-tx-builder --omit=dev
+          npm ci --prefix packages/cardano-ibc-trace-registry --omit=dev
+          npm ci --prefix packages/cardano-ibc-tx-builder-runtime --omit=dev
 
       - name: Install dependencies
-        run: npm ci --prefix cardano/gateway --legacy-peer-deps
+        run: npm ci --prefix cardano/gateway
 
       - name: Lint
         run: npm run --prefix cardano/gateway lint:check
 
+      - name: Setup Go for client preparation
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: cosmos/cardano-probabilistic-light-client-v8/go.mod
+          cache-dependency-path: cosmos/cardano-probabilistic-light-client-v8/go.sum
+
       - name: Build
         run: npm run --prefix cardano/gateway build
 
+      - name: Setup Deno for Gateway packet integration
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.9.6
+
+      - name: Setup Aiken for Gateway packet integration
+        uses: aiken-lang/setup-aiken@v1
+        with:
+          version: v1.1.24
+
+      - name: Build validators for Gateway packet integration
+        working-directory: cardano/onchain
+        # Aiken hides build errors without a terminal. Preserve diagnostics and exit status.
+        run: script --quiet --return --command 'aiken build --deny --trace-level silent' /dev/null
+
+      - name: Exercise production Gateway backlog and fee reservations
+        working-directory: cardano/offchain
+        run: deno run --allow-env --allow-read --allow-net --allow-run scripts/test-gateway-packet-backlog.ts
+
+      - name: Check independent migration rehearsal evidence controls
+        run: |
+          python3 scripts/ci/aiken-contract-migration/test-migration-evidence.py
+          node --test scripts/ci/aiken-contract-migration/test-migration-packet-evidence.cjs
+          node --test scripts/ci/aiken-contract-migration/test-owned-sdk-rehearsal.cjs
+          python3 scripts/ci/aiken-contract-migration/test-deployment-references.py
+      - name: Check Lucid transaction compatibility
+        run: |
+          npm run --prefix cardano/gateway test:lucid-wallet
+          npm run --prefix cardano/gateway test:lucid-ogmios
+
       - name: Test with coverage
+        env:
+          BRIDGE_HISTORY_TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/gateway_history_test
+          CLIENT_INITIALIZATION_FIXTURE: ${{ runner.temp }}/client-initialization.pb.json
         run: npm run --prefix cardano/gateway test:cov:ci
+
+      - name: Save client creation responses
+        uses: actions/upload-artifact@v7
+        with:
+          name: client-initialization-responses
+          path: ${{ runner.temp }}/client-initialization.pb.json
+          if-no-files-found: error
+
+  client-initialization:
+    name: Client creation (${{ matrix.adapter }})
+    if: ${{ needs.docs-update.outputs.run_jobs == 'true' && (github.event_name != 'pull_request' || !startsWith(github.head_ref, 'docs/')) }}
+    needs: [docs-update, gateway]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        adapter: [v8, v10]
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: cosmos/cardano-probabilistic-light-client-${{ matrix.adapter }}/go.mod
+          cache-dependency-path: cosmos/cardano-probabilistic-light-client-${{ matrix.adapter }}/go.sum
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          name: client-initialization-responses
+          path: ${{ runner.temp }}
+      - name: Create and initialize through the SDK keeper
+        working-directory: cosmos/cardano-probabilistic-light-client-${{ matrix.adapter }}
+        env:
+          GOWORK: off
+          CLIENT_INITIALIZATION_FIXTURE: ${{ runner.temp }}/client-initialization.pb.json
+        run: go test . -run '^TestGatewayClientInitialization$' -count=1 -v
 
   proto-types:
     name: Proto Types
-    if: ${{ github.event_name != 'pull_request' || !startsWith(github.head_ref, 'docs/') }}
+    if: ${{ needs.docs-update.outputs.run_jobs == 'true' && (github.event_name != 'pull_request' || !startsWith(github.head_ref, 'docs/')) }}
+    needs: docs-update
     runs-on: ubuntu-latest
     timeout-minutes: 20
     defaults:
@@ -403,10 +554,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
@@ -420,16 +571,17 @@ jobs:
 
   typescript-packages:
     name: TypeScript Packages
-    if: ${{ github.event_name != 'pull_request' || !startsWith(github.head_ref, 'docs/') }}
+    if: ${{ needs.docs-update.outputs.run_jobs == 'true' && (github.event_name != 'pull_request' || !startsWith(github.head_ref, 'docs/')) }}
+    needs: docs-update
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
@@ -437,6 +589,7 @@ jobs:
             packages/cardano-ibc-planner/package-lock.json
             packages/cardano-ibc-tx-builder/package-lock.json
             packages/cardano-ibc-trace-registry/package-lock.json
+            dapps/ibc-swap/client/package-lock.json
             packages/cardano-ibc-tx-builder-runtime/package-lock.json
 
       - name: Build planner
@@ -447,80 +600,259 @@ jobs:
 
       - name: Build tx builder
         run: |
-          npm ci --prefix packages/cardano-ibc-tx-builder --legacy-peer-deps
+          npm ci --prefix packages/cardano-ibc-tx-builder
           npm run --prefix packages/cardano-ibc-tx-builder build
           npm test --prefix packages/cardano-ibc-tx-builder
           npm prune --omit=dev --prefix packages/cardano-ibc-tx-builder
 
       - name: Build trace registry
         run: |
-          npm ci --prefix packages/cardano-ibc-trace-registry --legacy-peer-deps
+          npm ci --prefix packages/cardano-ibc-trace-registry
           npm run --prefix packages/cardano-ibc-trace-registry build
           npm test --prefix packages/cardano-ibc-trace-registry
 
       - name: Build tx builder runtime
         run: |
-          npm ci --prefix packages/cardano-ibc-tx-builder-runtime --legacy-peer-deps
+          npm ci --prefix packages/cardano-ibc-tx-builder-runtime
           npm run --prefix packages/cardano-ibc-tx-builder-runtime build
           npm test --prefix packages/cardano-ibc-tx-builder-runtime
 
+      - name: Test Dapp asset presentation
+        run: |
+          npm ci --prefix dapps/ibc-swap/client --ignore-scripts --legacy-peer-deps
+          npm test --prefix dapps/ibc-swap/client
+
   deno-offchain:
-    name: Cardano Offchain Deno
-    if: ${{ github.event_name != 'pull_request' || !startsWith(github.head_ref, 'docs/') }}
-    needs: aiken-changes
+    name: Cardano Offchain Deno (${{ matrix.suite }})
+    if: ${{ needs.docs-update.outputs.run_jobs == 'true' && (github.event_name != 'pull_request' || !startsWith(github.head_ref, 'docs/')) }}
+    needs: [docs-update, aiken-changes]
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # The channel fuzz suite alone takes about 21 minutes on a hosted runner.
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [deployment, channels, packet-lanes, shutdown, consensus-history]
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
 
       - name: Setup Deno
         uses: denoland/setup-deno@v2
         with:
-          deno-version: v2.x
+          deno-version: v2.9.6
 
       - name: Setup Aiken
         uses: aiken-lang/setup-aiken@v1
         with:
-          version: v1.1.21
+          version: v1.1.24
 
       - name: Build Aiken blueprint
         working-directory: cardano/onchain
         run: aiken build --deny --trace-level silent
 
       - name: Check formatting
+        if: ${{ matrix.suite == 'deployment' }}
         working-directory: cardano/offchain
         run: deno task fmt:check
 
       - name: Lint
+        if: ${{ matrix.suite == 'deployment' }}
         working-directory: cardano/offchain
         run: deno task lint
 
       - name: Type check
+        if: ${{ matrix.suite == 'deployment' }}
         working-directory: cardano/offchain
         run: deno task check
 
       - name: Test deployment
+        if: ${{ matrix.suite == 'deployment' }}
         working-directory: cardano/offchain
         run: deno task test:deployment
 
       - name: Evaluate channel actions with compiled validators
+        if: ${{ matrix.suite == 'channels' }}
         working-directory: cardano/offchain
         run: deno task test:channels
 
       - name: Fuzz channel transactions with compiled validators
+        if: ${{ matrix.suite == 'channels' }}
         working-directory: cardano/offchain
         run: deno task test:channels:fuzz
 
+      - name: Evaluate funded packet batches and independent lanes
+        if: ${{ matrix.suite == 'packet-lanes' }}
+        working-directory: cardano/offchain
+        run: deno task test:packet-lanes
+
       - name: Test shutdown finalization
+        if: ${{ matrix.suite == 'shutdown' }}
         working-directory: cardano/offchain
         run: deno task test:shutdown
 
+      - name: Fuzz shutdown sequences and populated state cleanup
+        if: ${{ matrix.suite == 'shutdown' }}
+        working-directory: cardano/offchain
+        run: deno task test:shutdown:fuzz
+
+      - name: Test production proof-backed consensus history
+        if: ${{ matrix.suite == 'consensus-history' }}
+        working-directory: cardano/offchain
+        run: deno task test:consensus-history
+
+      - name: Test consensus history indexing and recovery
+        if: ${{ matrix.suite == 'consensus-history' }}
+        working-directory: cardano/offchain
+        run: deno task test:consensus-history-index
+
+      - name: Test recovery escrow observations
+        if: ${{ matrix.suite == 'consensus-history' }}
+        working-directory: cardano/offchain
+        run: deno task test:recovery-escrow
+
+  migration-assurance:
+    name: Cardano Migration Assurance
+    if: ${{ needs.docs-update.outputs.run_jobs == 'true' && (github.event_name != 'pull_request' || !startsWith(github.head_ref, 'docs/')) }}
+    needs: [docs-update, aiken-changes]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Setup Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.9.6
+
+      - name: Setup Aiken
+        uses: aiken-lang/setup-aiken@v1
+        with:
+          version: v1.1.24
+
+      - name: Build Aiken blueprint
+        working-directory: cardano/onchain
+        run: aiken build --deny --trace-level silent
+
+      - name: Build distinct migration successors
+        run: |
+          python3 scripts/ci/aiken-contract-migration/build-migration-successor.py --out "$RUNNER_TEMP/migration-v2" --window-ms 600000
+          python3 scripts/ci/aiken-contract-migration/build-migration-successor.py --out "$RUNNER_TEMP/migration-v3" --window-ms 900000
+
+      - name: Evaluate repeated authorized migration and adversarial accounting
+        working-directory: cardano/offchain
+        env:
+          MIGRATION_SUCCESSOR_V2_BLUEPRINT: ${{ runner.temp }}/migration-v2/plutus.json
+          MIGRATION_SUCCESSOR_V3_BLUEPRINT: ${{ runner.temp }}/migration-v3/plutus.json
+        run: deno task test:migration
+
+      - name: Verify full-validator migration guard controls
+        run: python3 scripts/ci/aiken-contract-migration/test-migration-guards.py --report migration-guard-controls.json
+
+      - name: Measure compiled migration steps at retained protocol-11 parameters
+        run: >-
+          deno run --allow-read --allow-env --allow-write
+          --config cardano/offchain/deno.json scripts/ci/aiken-contract-migration/measure-migration-scaling.ts
+          chains/cardano/config/protocol-parameters.json
+          migration-scaling.json
+
+      - name: Measure complete serialized operator recovery and authenticated cache scaling
+        run: >-
+          deno run --allow-read --allow-env --allow-write
+          --config cardano/offchain/deno.json scripts/ci/aiken-contract-migration/measure-migration-operator.ts
+          migration-operator-scaling.json
+
+      - name: Upload migration guard evidence
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: migration-guard-controls
+          path: |
+            migration-guard-controls.json
+            migration-scaling.json
+            migration-operator-scaling.json
+
+  migration-packet-model:
+    name: Cardano Migration Packet Model
+    if: ${{ needs.docs-update.outputs.run_jobs == 'true' && (github.event_name != 'pull_request' || !startsWith(github.head_ref, 'docs/')) }}
+    needs: [docs-update, aiken-changes]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Setup Aiken
+        uses: aiken-lang/setup-aiken@v1
+        with:
+          version: v1.1.24
+
+      - name: Check independent migration packet model and transition coverage
+        working-directory: cardano/onchain
+        run: |
+          aiken check --deny -m migration_packet_ --seed 462 --max-success 1 --property-coverage relative-to-tests > ../../migration-packet-smoke.json
+          aiken check --deny -m migration_packet_ --seed 462 --max-success 1000 --property-coverage relative-to-tests > ../../migration-packet-model.json
+          node ../../scripts/ci/check-aiken-fuzz-coverage.mjs ../../migration-packet-model.json ../../migration-packet-smoke.json ../../scripts/ci/aiken-contract-migration/aiken-migration-required-labels.json
+
+      - name: Upload migration packet model evidence
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: migration-packet-model
+          path: |
+            migration-packet-model.json
+            migration-packet-smoke.json
+
+  deno-funds:
+    name: Cardano Compiled Funds (${{ matrix.suite }})
+    if: ${{ needs.docs-update.outputs.run_jobs == 'true' && (github.event_name != 'pull_request' || !startsWith(github.head_ref, 'docs/')) }}
+    needs: [docs-update, aiken-changes]
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: ada
+            filter: compiled ADA
+          - suite: native
+            filter: compiled native token
+          - suite: voucher
+            filter: compiled voucher
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - uses: aiken-lang/setup-aiken@v1
+        with:
+          version: v1.1.24
+      - name: Build Aiken blueprint
+        working-directory: cardano/onchain
+        run: aiken build --deny --trace-level silent
+      - name: Test accounting oracles
+        working-directory: cardano/offchain
+        run: deno task test:funds:oracles
+      - name: Fuzz funds histories with compiled validators
+        working-directory: cardano/offchain
+        env:
+          TX_FUZZ_RUNS: 5
+        run: deno test --allow-env --allow-read --filter "${{ matrix.filter }}" src/funds-lifecycle.fuzz.test.ts > ../../funds-fuzz.log 2>&1
+      - name: Preserve compiled funds counterexamples
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: funds-fuzz-${{ matrix.suite }}
+          path: funds-fuzz.log
+
   aiken-static:
     name: Cardano Onchain Aiken Static
-    if: ${{ (github.event_name != 'pull_request' || !startsWith(github.head_ref, 'docs/')) && (needs.aiken-changes.outputs.aiken_files_changed == 'true' || needs.aiken-changes.outputs.aiken_changed == 'true') }}
-    needs: aiken-changes
+    if: ${{ needs.docs-update.outputs.run_jobs == 'true' && ((github.event_name != 'pull_request' || !startsWith(github.head_ref, 'docs/')) && (needs.aiken-changes.outputs.aiken_files_changed == 'true' || needs.aiken-changes.outputs.aiken_changed == 'true')) }}
+    needs: [docs-update, aiken-changes]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     defaults:
@@ -529,15 +861,21 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
 
-      - name: Setup Aiken
+      # Keep the existing source format while upgrading the compiler.
+      - name: Setup Aiken formatter
         uses: aiken-lang/setup-aiken@v1
         with:
           version: v1.1.21
 
       - name: Check formatting
         run: aiken fmt --check
+
+      - name: Setup Aiken compiler
+        uses: aiken-lang/setup-aiken@v1
+        with:
+          version: v1.1.24
 
       - name: Check fuzz imports stay in tests
         working-directory: .
@@ -560,24 +898,24 @@ jobs:
 
   aiken-smoke:
     name: Cardano Onchain Aiken Smoke
-    if: ${{ (github.event_name != 'pull_request' || !startsWith(github.head_ref, 'docs/')) && needs.aiken-changes.outputs.aiken_changed == 'true' }}
-    needs: aiken-changes
+    if: ${{ needs.docs-update.outputs.run_jobs == 'true' && ((github.event_name != 'pull_request' || !startsWith(github.head_ref, 'docs/')) && needs.aiken-changes.outputs.aiken_fuzz_changed == 'true') }}
+    needs: [docs-update, aiken-changes]
     runs-on: ubuntu-latest
-    # The expanded suite can spend fourteen minutes collecting on hosted
-    # runners. Leave time for execution while keeping every test in this pass.
-    timeout-minutes: 30
+    # Full collection takes over 23 minutes on hosted runners. Leave time for
+    # execution while keeping every unit and property test in this pass.
+    timeout-minutes: 45
     defaults:
       run:
         working-directory: cardano/onchain
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
 
       - name: Setup Aiken
         uses: aiken-lang/setup-aiken@v1
         with:
-          version: v1.1.21
+          version: v1.1.24
 
       # This intentionally runs every test once. It catches broad collection or
       # fixture-construction failures before the deeper fuzz shards finish.
@@ -586,188 +924,86 @@ jobs:
 
       - name: Upload smoke report
         if: ${{ always() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: aiken-smoke
           path: aiken-smoke.json
 
   aiken-fuzz:
     name: Cardano Onchain Aiken Property/Fuzz (${{ matrix.suite }})
-    if: ${{ (github.event_name != 'pull_request' || !startsWith(github.head_ref, 'docs/')) && needs.aiken-changes.outputs.aiken_changed == 'true' }}
-    needs: aiken-changes
+    if: ${{ needs.docs-update.outputs.run_jobs == 'true' && ((github.event_name != 'pull_request' || !startsWith(github.head_ref, 'docs/')) && needs.aiken-changes.outputs.aiken_fuzz_changed == 'true') }}
+    needs: [docs-update, aiken-changes]
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ matrix.timeout_minutes || 20 }}
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: cardano/onchain
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          # Each shard is a protocol domain or a costly transition family. The
-          # split keeps max-success=500 meaningful without putting all generated
-          # cases behind one 30-minute job timeout.
-          - suite: host-update-client
-            match_tests: >-
-              -m prop_host_update_client_
-          - suite: host-update-connection
-            match_tests: >-
-              -m prop_host_update_connection_
-          - suite: host-update-channel
-            match_tests: >-
-              -m prop_host_update_channel_
-          - suite: host-handle-packet
-            match_tests: >-
-              -m prop_host_handle_packet_accepts_
-              -m prop_host_handle_packet_rejects_channel_only_change
-              -m prop_host_handle_packet_rejects_wrong_packet_key
-          - suite: host-handle-packet-recv-successor
-            match_tests: >-
-              -m prop_host_handle_packet_rejects_recv_with_unrelated_channel_mutation
-          # Capacity cases build the full 64-entry bounded state. Their seed
-          # only varies unrelated metadata, so 400 cases keep each label above
-          # the global 0.50% share ratchet without repeating the boundary 500
-          # times. The slight margin accommodates new labeled properties.
-          - suite: host-packet-capacity-receipt
-            max_success: 400
-            match_tests: >-
-              -m prop_host_handle_packet_rejects_history_capacity_overflow
-          - suite: host-packet-capacity-acknowledgement
-            max_success: 400
-            match_tests: >-
-              -m prop_host_handle_packet_rejects_acknowledgement_capacity_overflow
-          - suite: host-packet-capacity-commitment
-            max_success: 400
-            match_tests: >-
-              -m prop_host_handle_packet_rejects_commitment_capacity_overflow
-          - suite: host-bind-port
-            match_tests: >-
-              -m prop_host_bind_port_
-          - suite: client
-            # Collection and execution can exceed the default 20-minute limit.
-            timeout_minutes: 30
-            match_tests: >-
-              -m ibc/client/ics_007_tendermint_client/client_datum
-              -m ibc/client/ics_007_tendermint_client/client_state
-              -m ibc/client/ics_007_tendermint_client/height_set
-              -m ibc/client/ics_007_tendermint_client/misbehaviour_handle
-              -m prop_client_update_
-              -m prop_client_recovery_
-          - suite: connection
-            match_tests: >-
-              -m ibc/core/ics_003_connection_semantics/connection_datum
-              -m ibc/core/ics_003_connection_semantics/connection_handshake_contract
-              -m prop_conn_open_try_
-              -m prop_tx_conn_open_try_
-          - suite: channel-packet
-            timeout_minutes: 30
-            match_tests: >-
-              -m ibc/core/ics_004/channel_datum_test/channel_handshake_contract
-              -m ibc/core/ics_004/channel_datum_test/packet_lifecycle_contract
-              -m prop_tx_packet_send_
-          - suite: channel-packet-recv-callback
-            match_tests: >-
-              -m prop_tx_recv_packet_rejects_missing_application_callback
-              -m prop_tx_recv_packet_rejects_callback_packet_data_mismatch
-              -m prop_tx_recv_packet_rejects_callback_acknowledgement_mismatch
-          # Each of these properties composes a full HostState transition.
-          # Give them independent timeouts without reducing the 500 cases each.
-          - suite: channel-packet-recv-successor-valid
-            timeout_minutes: 30
-            match_tests: >-
-              -m prop_tx_recv_packet_accepts_atomic_successor_and_callback
-          - suite: channel-packet-recv-port-binding
-            timeout_minutes: 30
-            match_tests: >-
-              -m prop_tx_recv_packet_rejects_moved_port_binding
-          - suite: channel-packet-recv-successor-mutation
-            timeout_minutes: 30
-            match_tests: >-
-              -m prop_tx_recv_packet_rejects_unrelated_successor_mutation
-          - suite: transfer-contract
-            match_tests: >-
-              -m ibc/apps/transfer/transfer_accounting_contract
-          - suite: transfer-module-native-send
-            match_tests: >-
-              -m prop_transfer_module_native_send_
-          - suite: transfer-module-native-timeout
-            match_tests: >-
-              -m prop_transfer_module_native_timeout_
-          - suite: transfer-module-native-other
-            match_tests: >-
-              -m prop_transfer_module_recv_source_
-              -m prop_transfer_module_native_ack_
-              -m prop_transfer_module_root_
-          - suite: transfer-module-voucher
-            match_tests: >-
-              -m prop_transfer_module_voucher_
-              -m prop_transfer_module_recv_sink_
-          - suite: voucher-contract
-            match_tests: >-
-              -m ibc/apps/transfer/voucher_metadata_contract
-          - suite: voucher-policy-valid
-            match_tests: >-
-              -m prop_voucher_first_mint_policy_accepts_valid_metadata
-              -m prop_tx_first_seen_voucher_mint_couples_registry_append
-          - suite: voucher-policy-metadata-text
-            match_tests: >-
-              -m prop_voucher_first_mint_policy_rejects_wrong_name
-              -m prop_voucher_first_mint_policy_rejects_wrong_ticker
-              -m prop_voucher_first_mint_policy_rejects_wrong_description
-              -m prop_voucher_first_mint_policy_rejects_wrong_full_denom
-          - suite: voucher-policy-identity
-            match_tests: >-
-              -m prop_voucher_first_mint_policy_rejects_wrong_policy
-              -m prop_voucher_first_mint_policy_rejects_wrong_reference_asset
-              -m prop_tx_first_seen_voucher_mint_rejects_wrong_metadata_registry_coupled
-          - suite: trace-append
-            match_tests: >-
-              -m prop_trace_registry_append_
-          - suite: trace-rollover
-            match_tests: >-
-              -m prop_trace_registry_rollover_
-          # The model property is substantially more expensive than the
-          # rollover contract properties. Keep both at max-success=500 while
-          # giving them independent job time budgets.
-          - suite: trace-model
-            timeout_minutes: 30
-            match_tests: >-
-              -m prop_model_trace_
-          - suite: proofs
-            match_tests: >-
-              -m prop_proof_
+      # Avoid a burst of dependency resolution requests from every property.
+      max-parallel: 8
+      matrix: ${{ fromJson(needs.aiken-changes.outputs.property_matrix) }}
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
 
       - name: Setup Aiken
         uses: aiken-lang/setup-aiken@v1
         with:
-          version: v1.1.21
+          version: v1.1.24
 
       - name: Run property shard
         run: |
           # Aiken emits JSON when stdout is redirected. The aggregate job merges
-          # these per-shard reports and enforces the global label catalog once.
+          # these reports and verifies every smoke-discovered property ran deeply.
           aiken check \
             --deny \
-            --max-success ${{ matrix.max_success || 500 }} \
+            --max-success 500 \
             --property-coverage relative-to-tests \
-            ${{ matrix.match_tests }} \
-            > ../../aiken-${{ matrix.suite }}.json
+            --exact-match --match-tests "${{ matrix.suite }}" \
+            > ../../aiken-${{ matrix.suite }}.json 2> ../../aiken-${{ matrix.suite }}.log
 
       - name: Upload property report
-        uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: aiken-fuzz-${{ matrix.suite }}
-          path: aiken-${{ matrix.suite }}.json
+          path: |
+            aiken-${{ matrix.suite }}.json
+            aiken-${{ matrix.suite }}.log
+
+  aiken-mutations:
+    name: Cardano Critical Guard Mutations
+    if: ${{ needs.docs-update.outputs.run_jobs == 'true' && ((github.event_name != 'pull_request' || !startsWith(github.head_ref, 'docs/')) && needs.aiken-changes.outputs.aiken_fuzz_changed == 'true') }}
+    needs: [docs-update, aiken-changes]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - uses: aiken-lang/setup-aiken@v1
+        with:
+          version: v1.1.24
+      - name: Fetch and validate Aiken dependencies
+        working-directory: cardano/onchain
+        run: aiken check --deny --skip-tests
+      - name: Verify critical mutants are killed
+        run: node scripts/ci/check-aiken-mutations.mjs
+      - name: Preserve mutation reports and counterexamples
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: aiken-mutations
+          path: aiken-mutations.json*
 
   aiken:
     name: Cardano Onchain Aiken
     if: ${{ always() && (github.event_name != 'pull_request' || !startsWith(github.head_ref, 'docs/')) }}
     needs:
-      [aiken-changes, aiken-static, aiken-smoke, aiken-fuzz, tx-budgets, generated-artifacts]
+      [docs-update, aiken-changes, aiken-static, aiken-smoke, aiken-fuzz, tx-budgets, generated-artifacts, deno-offchain, migration-assurance, migration-packet-model, deno-funds, aiken-mutations]
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -777,6 +1013,8 @@ jobs:
           AIKEN_CHANGED: ${{ needs.aiken-changes.outputs.aiken_changed }}
           AIKEN_FILES_CHANGED: ${{ needs.aiken-changes.outputs.aiken_files_changed }}
           AIKEN_PR_CHANGED: ${{ needs.aiken-changes.outputs.aiken_pr_changed }}
+          AIKEN_FUZZ_CHANGED: ${{ needs.aiken-changes.outputs.aiken_fuzz_changed }}
+          RUN_JOBS: ${{ needs.docs-update.outputs.run_jobs }}
           NEEDS_JSON: ${{ toJson(needs) }}
         run: |
           node - <<'NODE'
@@ -784,10 +1022,20 @@ jobs:
           // "Cardano Onchain Aiken" while the actual work happens in parallel
           // prerequisite jobs.
           const needs = JSON.parse(process.env.NEEDS_JSON);
+          if (needs['docs-update']?.result !== 'success' ||
+              !['true', 'false'].includes(process.env.RUN_JOBS)) {
+            console.error('Documentation gate did not succeed.');
+            process.exit(1);
+          }
+          if (process.env.RUN_JOBS === 'false') {
+            console.log('Reusing successful checks for unchanged code and base.');
+            process.exit(0);
+          }
           for (const name of [
             'AIKEN_CHANGED',
             'AIKEN_FILES_CHANGED',
             'AIKEN_PR_CHANGED',
+            'AIKEN_FUZZ_CHANGED',
           ]) {
             if (!['true', 'false'].includes(process.env[name])) {
               console.error(`${name} has invalid value ${JSON.stringify(process.env[name])}.`);
@@ -798,8 +1046,6 @@ jobs:
             ? [
                 'aiken-changes',
                 'aiken-static',
-                'aiken-smoke',
-                'aiken-fuzz',
                 'tx-budgets',
                 'generated-artifacts',
               ]
@@ -808,6 +1054,10 @@ jobs:
                 ...(process.env.AIKEN_FILES_CHANGED === 'true' ? ['aiken-static'] : []),
                 'generated-artifacts',
               ];
+          if (process.env.AIKEN_FUZZ_CHANGED === 'true') {
+            required.push('aiken-static', 'aiken-smoke', 'aiken-fuzz', 'aiken-mutations');
+          }
+          required.push('deno-offchain', 'migration-assurance', 'migration-packet-model', 'deno-funds');
           const failed = required
             .filter((name) => needs[name]?.result !== 'success')
             .map((name) => [name, needs[name]])
@@ -822,127 +1072,94 @@ jobs:
           NODE
 
       - name: Checkout
-        if: ${{ needs.aiken-changes.outputs.aiken_changed == 'true' }}
-        uses: actions/checkout@v4
+        if: ${{ needs.aiken-changes.outputs.aiken_changed == 'true' || needs.aiken-changes.outputs.aiken_fuzz_changed == 'true' }}
+        uses: actions/checkout@v7.0.1
 
       - name: Setup Node.js
-        if: ${{ needs.aiken-changes.outputs.aiken_changed == 'true' }}
-        uses: actions/setup-node@v4
+        if: ${{ needs.aiken-changes.outputs.aiken_changed == 'true' || needs.aiken-changes.outputs.aiken_fuzz_changed == 'true' }}
+        uses: actions/setup-node@v7
         with:
           node-version: 22
 
       - name: Download fuzz reports
-        if: ${{ needs.aiken-changes.outputs.aiken_changed == 'true' }}
-        uses: actions/download-artifact@v4
+        if: ${{ needs.aiken-changes.outputs.aiken_fuzz_changed == 'true' }}
+        uses: actions/download-artifact@v8.0.2
         with:
           pattern: aiken-fuzz-*
           path: aiken-fuzz-reports
           merge-multiple: true
 
+      - name: Download smoke inventory
+        if: ${{ needs.aiken-changes.outputs.aiken_fuzz_changed == 'true' }}
+        uses: actions/download-artifact@v8.0.2
+        with:
+          name: aiken-smoke
+
       - name: Merge fuzz reports
-        if: ${{ needs.aiken-changes.outputs.aiken_changed == 'true' }}
+        if: ${{ needs.aiken-changes.outputs.aiken_fuzz_changed == 'true' }}
         run: node scripts/ci/merge-aiken-check-reports.mjs aiken-fuzz-reports aiken-fuzz.json
 
-      # Labels are enforced globally, not per shard. That lets shard boundaries
-      # follow runtime and protocol ownership without weakening coverage rules.
+      # Compare smoke/deep inventories and measure buckets within each property.
       - name: Check fuzz label coverage
-        if: ${{ needs.aiken-changes.outputs.aiken_changed == 'true' }}
-        run: node scripts/ci/check-aiken-fuzz-coverage.mjs aiken-fuzz.json
+        if: ${{ needs.aiken-changes.outputs.aiken_fuzz_changed == 'true' }}
+        run: node scripts/ci/check-aiken-fuzz-coverage.mjs aiken-fuzz.json aiken-smoke.json
 
       - name: Attest Aiken base ${{ github.event.pull_request.base.sha || github.sha }}
         run: echo "Aiken checks are valid for base ${{ github.event.pull_request.base.sha || github.sha }}."
 
   tx-budgets:
     name: Cardano Tx Budgets
-    if: ${{ (github.event_name != 'pull_request' || !startsWith(github.head_ref, 'docs/')) && needs.aiken-changes.outputs.aiken_changed == 'true' }}
-    needs: aiken-changes
+    if: ${{ needs.docs-update.outputs.run_jobs == 'true' && ((github.event_name != 'pull_request' || !startsWith(github.head_ref, 'docs/')) && needs.aiken-changes.outputs.aiken_changed == 'true') }}
+    needs: [docs-update, aiken-changes]
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
+
+      - name: Setup Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: |
             cardano/gateway/package-lock.json
             proto-types/package-lock.json
+            packages/cardano-ibc-planner/package-lock.json
             packages/cardano-ibc-tx-builder/package-lock.json
             packages/cardano-ibc-trace-registry/package-lock.json
             packages/cardano-ibc-tx-builder-runtime/package-lock.json
 
+      - name: Setup Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
       - name: Setup Aiken
         uses: aiken-lang/setup-aiken@v1
         with:
-          version: v1.1.21
+          version: v1.1.24
 
       - name: Build Aiken blueprint
         working-directory: cardano/onchain
         run: aiken build --deny --trace-level silent
 
+      - name: Check and export fully applied deployment plan
+        working-directory: cardano/offchain
+        run: deno task export:deployment-plan --output ../../deployment-plan.json
+
       - name: Collect Aiken execution units
-        working-directory: cardano/onchain
-        run: |
-          # Keep traces consistent with production builds. These test-derived
-          # regression estimates are not evaluations of complete transactions.
-          aiken check \
-            --deny \
-            --trace-level silent \
-            --plain-numbers \
-            --exact-match \
-            -m 'ibc/core/ics_003_connection_semantics/connection_datum.{test_is_conn_open_try_valid_succeed}' \
-            -m 'spending_transfer_module.{on_chan_open_try_succeed}' \
-            -m 'spending_connection.{conn_open_ack_succeed}' \
-            -m 'spending_channel.{send_packet_succeed}' \
-            -m 'spending_channel/send_packet.{succeed_send_packet}' \
-            -m 'ibc/core/ics_004/channel_datum_test/validate_send_packet.{succeed_at_packet_commitment_capacity}' \
-            -m 'host_state_stt.{host_state_handle_packet_send_succeeds_at_commitment_capacity}' \
-            -m 'spending_transfer_module.{transfer_escrow_succeed}' \
-            -m 'minting_transfer_escrow_shard.{create_transfer_escrow_shard_succeeds}' \
-            -m 'spending_channel.{recv_packet_succeed}' \
-            -m 'spending_channel/recv_packet.{succeed_recv_packet}' \
-            -m 'ibc/core/ics_004/channel_datum_test/validate_recv_packet.{succeed_at_packet_history_capacity}' \
-            -m 'host_state_stt.{host_state_handle_packet_recv_succeeds_at_history_capacity}' \
-            -m 'host_state_stt.{host_state_handle_packet_acknowledgement_succeeds_at_history_capacity}' \
-            -m 'verifying_proof.{verify_membership_succeed}' \
-            -m 'spending_channel/recv_packet.{succeed_recv_packet_maximum_ics20_packet}' \
-            -m 'spending_transfer_module.{on_recv_packet_mint_voucher_maximum_ics20_packet_succeed}' \
-            -m 'spending_transfer_module.{on_recv_packet_mint_voucher_maximum_v8_ics20_packet_succeed}' \
-            -m 'minting_voucher.{test_mint_voucher_maximum_v10_ics20_packet_with_eight_archives_at_entry_limit}' \
-            -m 'minting_voucher.{test_mint_voucher_maximum_v10_ics20_packet_with_eight_archives_near_byte_limit}' \
-            -m 'minting_voucher.{test_mint_voucher_maximum_v8_ics20_packet_with_eight_archives_at_entry_limit}' \
-            -m 'minting_voucher.{test_mint_voucher_maximum_v8_ics20_packet_with_eight_archives_near_byte_limit}' \
-            -m 'spending_channel.{prune_packet_history_succeed}' \
-            -m 'spending_channel/prune_packet_history.{prune_packet_history_succeeds_at_capacity_boundary}' \
-            -m 'spending_channel/prune_packet_history.{prune_packet_history_accepts_ordered_channel_at_capacity}' \
-            -m 'host_state_stt.{host_state_prune_packet_history_succeeds_at_full_packet_history_capacity}' \
-            -m 'host_state_stt.{host_state_ordered_prune_succeeds_at_full_packet_history_capacity}' \
-            -m 'verifying_proof.{verify_non_membership_succeed}' \
-            -m 'spending_channel.{acknowledge_packet_succeed}' \
-            -m 'spending_channel/acknowledge_packet.{succeed_acknowledge_packet}' \
-            -m 'spending_transfer_module.{on_acknowledgement_packet_result_succeed}' \
-            -m 'spending_channel.{timeout_packet_succeed}' \
-            -m 'spending_channel/timeout_packet.{succeed_timeout_unordered_packet}' \
-            -m 'spending_transfer_module.{on_timeout_packet_mint_voucher_succeed}' \
-            -m 'trace_registry.{trace_registry_insert_trace_succeeds_with_matching_voucher_mint}' \
-            -m 'trace_registry_rollover.{trace_registry_rollover_insert_succeeds_and_preserves_old_shard}' \
-            -m 'trace_registry_rollover.{trace_registry_advance_directory_succeeds_for_valid_rollover}' \
-            -m 'trace_registry_capacity.{trace_registry_boundary_append_eight_archives_at_entry_limit}' \
-            -m 'trace_registry_capacity.{trace_registry_boundary_append_eight_archives_near_byte_limit}' \
-            -m 'host_state_stt.{host_state_bind_tenth_port_succeeds_at_global_cap}' \
-            -m 'host_state_stt.{host_update_client_capacity_minimum_history_succeeds}' \
-            -m 'recover_client.{recover_client_accepts_expired_subject}' \
-            -m 'recover_client.{spend_client_forwards_valid_recovery}' \
-            -m 'spending_client_capacity.{update_client_capacity_adjacent_all_signed_45_succeeds}' \
-            -m 'spending_client_capacity.{update_client_capacity_adjacent_mixed_45_succeeds}' \
-            -m 'spending_client_capacity.{update_client_capacity_non_adjacent_mixed_45_succeeds}' \
-            -m 'minting_port.{mint_port_tenth_port_succeeds_at_module_cap}' \
-            -m 'minting_identifier.{mints_identifier_from_nonce_output_reference}' \
-            > ../../aiken-check.json
+        run: bash scripts/ci/collect-cardano-tx-budget-units.sh "$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/aiken-check.json"
+
+      - name: Enforce ledger limits on evaluated and signed transactions
+        working-directory: cardano/offchain
+        run: deno task test:tx-budgets
 
       - name: Build proto types
         run: |
@@ -951,10 +1168,19 @@ jobs:
 
       - name: Install gateway and runtime dependencies
         run: |
-          npm ci --prefix packages/cardano-ibc-tx-builder --omit=dev --legacy-peer-deps
-          npm ci --prefix packages/cardano-ibc-trace-registry --omit=dev --legacy-peer-deps
-          npm ci --prefix packages/cardano-ibc-tx-builder-runtime --omit=dev --legacy-peer-deps
-          npm ci --prefix cardano/gateway --legacy-peer-deps
+          npm ci --prefix packages/cardano-ibc-planner
+          npm run --prefix packages/cardano-ibc-planner build
+          rm -rf packages/cardano-ibc-planner/node_modules
+          npm ci --prefix packages/cardano-ibc-tx-builder
+          npm run --prefix packages/cardano-ibc-tx-builder build
+          npm ci --prefix packages/cardano-ibc-trace-registry
+          npm run --prefix packages/cardano-ibc-trace-registry build
+          npm ci --prefix packages/cardano-ibc-tx-builder-runtime
+          npm run --prefix packages/cardano-ibc-tx-builder-runtime build
+          npm ci --prefix packages/cardano-ibc-tx-builder --omit=dev
+          npm ci --prefix packages/cardano-ibc-trace-registry --omit=dev
+          npm ci --prefix packages/cardano-ibc-tx-builder-runtime --omit=dev
+          npm ci --prefix cardano/gateway
 
       - name: Check frozen Tendermint capacity fixture
         run: npm run --prefix cardano/gateway check:tendermint-update-capacity-fixture
@@ -962,49 +1188,48 @@ jobs:
       - name: Check generated Aiken capacity fixture
         run: npm run --prefix cardano/gateway check:tendermint-update-capacity-aiken
 
-      - name: Check transaction size and ex-unit budgets
+      - name: Report synthetic transaction cost estimates
         env:
           CARDANO_TX_BUDGET_MAX_TX_SIZE: 16384
-          CARDANO_TX_BUDGET_HEADROOM_BYTES: 750
-          CARDANO_TX_BUDGET_MAX_TX_EX_MEM: 16500000
-          CARDANO_TX_BUDGET_MAX_TX_EX_STEPS: 10000000000
-          CARDANO_TX_BUDGET_EX_UNIT_HEADROOM_BPS: 500
           CARDANO_TX_BUDGET_AIKEN_CHECK_JSON: ../../aiken-check.json
-        run: npm run --prefix cardano/gateway check:tx-budgets
+        run: npm run --prefix cardano/gateway report:tx-budget-models
 
   generated-artifacts:
     name: Generated Artifacts
-    if: ${{ github.event_name != 'pull_request' || !startsWith(github.head_ref, 'docs/') }}
-    needs: aiken-changes
+    if: ${{ needs.docs-update.outputs.run_jobs == 'true' && (github.event_name != 'pull_request' || !startsWith(github.head_ref, 'docs/')) }}
+    needs: [docs-update, aiken-changes]
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: proto-types/package-lock.json
+          cache-dependency-path: |
+            proto-types/package-lock.json
+            packages/cardano-ibc-tx-builder/package-lock.json
+            packages/cardano-ibc-trace-registry/package-lock.json
+            packages/cardano-ibc-tx-builder-runtime/package-lock.json
 
-      - name: Setup Go for ICS-20 vectors
-        uses: actions/setup-go@v5
+      - name: Setup Go for protocol vectors
+        uses: actions/setup-go@v7
         with:
-          go-version: "1.25.13"
+          go-version-file: cosmos/cardano-probabilistic-light-client-v8/go.mod
           cache-dependency-path: |
             cosmos/cardano-probabilistic-light-client-v8/go.sum
-            cosmos/cardano-mithril-light-client-v10/go.sum
+            cosmos/cardano-probabilistic-light-client-v10/go.sum
 
       - name: Setup Aiken
-        if: ${{ needs.aiken-changes.outputs.aiken_changed == 'true' }}
         uses: aiken-lang/setup-aiken@v1
         with:
-          version: v1.1.21
+          version: v1.1.24
 
       - name: Regenerate proto types
         run: |
@@ -1022,15 +1247,35 @@ jobs:
           WIRE_SCHEMA_BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before || '' }}
         run: node scripts/ci/check-aiken-wire-schema.mjs check --base-ref "${WIRE_SCHEMA_BASE_REF}"
 
+      - name: Check frozen commitment codec vectors
+        run: |
+          for package in cardano-ibc-tx-builder cardano-ibc-trace-registry cardano-ibc-tx-builder-runtime; do
+            npm ci --prefix "packages/$package"
+            npm run --prefix "packages/$package" build
+          done
+          node tests/ibc-state-commitment/generate-codec.mjs --check
+
       - name: Check pinned ICS-20 JSON vectors
         run: node tests/ics20-json-vectors/generate.mjs --check
+
+      - name: Setup Aiken vector formatter
+        uses: aiken-lang/setup-aiken@v1
+        with:
+          version: v1.1.21
+
+      - name: Check SDK Tendermint upgrade vectors
+        run: node tests/tendermint-upgrade/generate.mjs --check
+
+      - name: Verify real SDK upgrade proofs
+        run: python3 tests/tendermint-upgrade/verify_capture.py tests/tendermint-upgrade/fixtures/v8-upgrade-proof.json
 
       - name: Check generated artifacts
         run: scripts/ci/check-generated-artifacts-clean.sh
 
   go:
     name: Go (${{ matrix.module.name }})
-    if: ${{ github.event_name != 'pull_request' || !startsWith(github.head_ref, 'docs/') }}
+    if: ${{ needs.docs-update.outputs.run_jobs == 'true' && (github.event_name != 'pull_request' || !startsWith(github.head_ref, 'docs/')) }}
+    needs: docs-update
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -1042,8 +1287,6 @@ jobs:
             path: cosmos/async-icq-v10
           - name: vesseloracle-v10
             path: cosmos/vesseloracle-v10
-          - name: mithril-v10
-            path: cosmos/cardano-mithril-light-client-v10
           - name: ibc-go-v10
             path: cosmos/cardano-probabilistic-light-client-v10
           - name: ibc-go-v8
@@ -1059,18 +1302,40 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
-          go-version: "1.25.13"
+          go-version-file: cosmos/cardano-probabilistic-light-client-core/go.mod
           cache-dependency-path: ${{ matrix.module.path }}/go.sum
 
       - name: Test
         env:
           GOWORK: off
         run: go test ./...
+
+      # gouroboros decoders panicked on malformed relayer block bytes before
+      # v0.205.4 (#687). Fuzzing catches a regression after an upgrade.
+      - name: Fuzz Cardano block decoding
+        if: matrix.module.name == 'core'
+        env:
+          GOWORK: off
+        run: |
+          go test -run '^$' -fuzz '^FuzzDecodeLedgerBlock$' -fuzztime 60s .
+          go test -run '^$' -fuzz '^FuzzDecodeLedgerHeader$' -fuzztime 30s .
+
+      # Mithril certificates and aggregate signatures come from relayers.
+      - name: Fuzz Mithril certificate verification
+        if: matrix.module.name == 'core'
+        env:
+          GOWORK: off
+        run: |
+          go test -run '^$' -fuzz '^FuzzVerifyCertificate$' -fuzztime 30s ./mithril
+          go test -run '^$' -fuzz '^FuzzCanonicalPhiF$' -fuzztime 15s ./mithril
+          go test -run '^$' -fuzz '^FuzzDecodeAggregateSignature$' -fuzztime 30s ./mithril/crypto
+          go test -run '^$' -fuzz '^FuzzDecodeAggregateVerificationKey$' -fuzztime 15s ./mithril/crypto
+          go test -run '^$' -fuzz '^FuzzVerifyAggregateSignature$' -fuzztime 30s ./mithril/crypto
 
       - name: Vet non-generated packages
         env:
@@ -1081,41 +1346,105 @@ jobs:
             go vet "${packages[@]}"
           fi
 
+  # The probabilistic clients link blst through cgo. blst's Go binding assumes
+  # ADX on amd64 unless built portable, so distributed binaries use
+  # -D__BLST_PORTABLE__. Every supported build must reach the same results on
+  # the mithril-stm reference vectors and mainnet certificates.
+  mithril-verifier-builds:
+    name: Mithril verifier (${{ matrix.runner }}, ${{ matrix.blst }})
+    if: ${{ needs.docs-update.outputs.run_jobs == 'true' && (github.event_name != 'pull_request' || !startsWith(github.head_ref, 'docs/')) }}
+    needs: docs-update
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            blst: default
+            cflags: ""
+          - runner: ubuntu-latest
+            blst: portable
+            cflags: "-O2 -D__BLST_PORTABLE__"
+          - runner: ubuntu-24.04-arm
+            blst: default
+            cflags: ""
+          - runner: macos-latest
+            blst: default
+            cflags: ""
+
+    defaults:
+      run:
+        working-directory: cosmos/cardano-probabilistic-light-client-core
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: cosmos/cardano-probabilistic-light-client-core/go.mod
+          cache-dependency-path: cosmos/cardano-probabilistic-light-client-core/go.sum
+
+      - name: Test
+        env:
+          GOWORK: off
+          CGO_ENABLED: "1"
+          BLST_CGO_CFLAGS: ${{ matrix.cflags }}
+        run: |
+          if [ -n "$BLST_CGO_CFLAGS" ]; then export CGO_CFLAGS="$BLST_CGO_CFLAGS"; fi
+          go test -count=1 ./mithril/...
+
   light-client-parity:
     name: Light Client Parity
-    if: ${{ github.event_name != 'pull_request' || !startsWith(github.head_ref, 'docs/') }}
+    if: ${{ needs.docs-update.outputs.run_jobs == 'true' && (github.event_name != 'pull_request' || !startsWith(github.head_ref, 'docs/')) }}
+    needs: docs-update
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 22
 
-      - name: Check v8/v10 parity
-        run: node scripts/ci/check-light-client-parity.mjs
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: cosmos/cardano-probabilistic-light-client-core/go.mod
+          cache: false
+
+      - name: Check v8/v10 parity and adapter boundaries
+        run: |
+          node scripts/ci/generate-light-client-models.mjs --check
+          node scripts/ci/check-light-client-parity.mjs
+          node --test scripts/ci/check-light-client-parity.test.mjs
 
   rust:
     name: Rust
-    if: ${{ github.event_name != 'pull_request' || !startsWith(github.head_ref, 'docs/') }}
+    if: ${{ needs.docs-update.outputs.run_jobs == 'true' && (github.event_name != 'pull_request' || !startsWith(github.head_ref, 'docs/')) }}
+    needs: docs-update
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@1.91.1
+        # Keep compiler upgrades separate from Dependabot action updates.
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
+          toolchain: "1.91.1"
           components: rustfmt, clippy
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -1153,13 +1482,14 @@ jobs:
 
   hermes-relayer:
     name: Hermes Relayer
-    if: ${{ github.event_name != 'pull_request' || !startsWith(github.head_ref, 'docs/') }}
+    if: ${{ !cancelled() && needs.docs-update.outputs.run_jobs == 'true' && (github.event_name != 'pull_request' || !startsWith(github.head_ref, 'docs/')) && needs.aiken-changes.outputs.hermes_changed != 'false' }}
+    needs: [docs-update, aiken-changes]
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
         with:
           submodules: recursive
 
@@ -1168,13 +1498,39 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@1.85.0
+      - name: Setup Go for keeper event integration
+        uses: actions/setup-go@v7
         with:
+          go-version-file: cosmos/cardano-probabilistic-light-client-v8/go.mod
+          cache-dependency-path: |
+            cosmos/cardano-probabilistic-light-client-core/go.sum
+            cosmos/cardano-probabilistic-light-client-v8/go.sum
+            cosmos/cardano-probabilistic-light-client-v10/go.sum
+
+      - name: Execute signed client operations and export keeper events
+        run: |
+          fixture="${RUNNER_TEMP}/probabilistic-operation-events.json"
+          RELAYER_OPERATION_EVENTS="${fixture}" go -C cosmos/cardano-probabilistic-light-client-v8 test . -run '^TestRelayerOperationEvents$' -count=1
+          echo "RELAYER_OPERATION_EVENTS=${fixture}" >> "${GITHUB_ENV}"
+          v10_fixture="${RUNNER_TEMP}/probabilistic-v10-operation-events.json"
+          RELAYER_OPERATION_EVENTS="${v10_fixture}" go -C cosmos/cardano-probabilistic-light-client-v10 test . -run '^TestRelayerOperationEvents$' -count=1
+          echo "RELAYER_V10_OPERATION_EVENTS=${v10_fixture}" >> "${GITHUB_ENV}"
+
+      - name: Export authoritative epoch-usability responses
+        run: |
+          fixture="${RUNNER_TEMP}/probabilistic-epoch-usability.json"
+          HERMES_EPOCH_USABILITY_FIXTURE="${fixture}" go -C cosmos/cardano-probabilistic-light-client-core test ./state -run '^TestEpochUsabilityAcrossHaltAndCertification$' -count=1
+          echo "HERMES_EPOCH_USABILITY_FIXTURE=${fixture}" >> "${GITHUB_ENV}"
+
+      - name: Setup Rust
+        # Keep compiler upgrades separate from Dependabot action updates.
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: "1.85.0"
           components: rustfmt, clippy
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry

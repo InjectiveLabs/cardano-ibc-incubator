@@ -17,7 +17,9 @@ use aiken/builtin
 use aiken/collection/list
 use aiken/collection/pairs
 use aiken/crypto.{Blake2b_224, Hash, Script, VerificationKeyHash}
+use aiken/interval.{Finite}
 use aiken/primitive/bytearray
+use cardano/transaction.{ValidityRange}
 use ibc/auth.{AuthToken}
 
 // Empty ICS-23 Merkle tree root (32 bytes of zeros)
@@ -69,6 +71,8 @@ pub type ShutdownState {
   ShuttingDown { initiated_at: Int, grace_period_end: Int }
 }
 
+// Frozen public commitment primitive. Keep its fields and order unchanged.
+// Put private metadata in a separate type. See docs/cardano-commitment-codec.md.
 /// The immutable authority registered for a bound IBC port.
 ///
 /// Callback validators use this record to distinguish the real application
@@ -88,6 +92,11 @@ pub type ModuleRegistration {
 pub type HostStateControl {
   port_registry: Pairs<ByteArray, ModuleRegistration>,
   shutdown: ShutdownState,
+  live_clients: Int,
+  live_connections: Int,
+  live_channels: Int,
+  // Preserved by all ordinary operations. Only a bounded heartbeat may advance it.
+  last_heartbeat_time: Int,
 }
 
 /// HostState represents the canonical IBC host state on Cardano
@@ -163,6 +172,10 @@ pub fn is_initialized_valid(
     state.next_channel_sequence == 0,
     state.bound_port == [],
     control.port_registry == [],
+    control.live_clients == 0,
+    control.live_connections == 0,
+    control.live_channels == 0,
+    control.last_heartbeat_time == 0,
     state.ibc_state_root == empty_ibc_state_root,
     control.shutdown == Active,
     nft_policy == expected_nft_policy,
@@ -220,7 +233,10 @@ pub fn validate_create_client(old: HostStateDatum, new: HostStateDatum) -> Bool 
       old.state.next_client_sequence + 1,
       old.state.next_connection_sequence,
       old.state.next_channel_sequence,
-      old.control,
+      HostStateControl {
+        ..old.control,
+        live_clients: old.control.live_clients + 1,
+      },
     ),
     old.control.shutdown |> is_active,
   }
@@ -238,7 +254,10 @@ pub fn validate_create_connection(
       old.state.next_client_sequence,
       old.state.next_connection_sequence + 1,
       old.state.next_channel_sequence,
-      old.control,
+      HostStateControl {
+        ..old.control,
+        live_connections: old.control.live_connections + 1,
+      },
     ),
     old.control.shutdown |> is_active,
   }
@@ -253,7 +272,10 @@ pub fn validate_create_channel(old: HostStateDatum, new: HostStateDatum) -> Bool
       old.state.next_client_sequence,
       old.state.next_connection_sequence,
       old.state.next_channel_sequence + 1,
-      old.control,
+      HostStateControl {
+        ..old.control,
+        live_channels: old.control.live_channels + 1,
+      },
     ),
     old.control.shutdown |> is_active,
   }
@@ -287,13 +309,13 @@ pub fn validate_bind_port(
       old.state.next_channel_sequence,
       // Port registrations are immutable and kept in canonical CBOR map order.
       HostStateControl {
+        ..old.control,
         port_registry: pairs.insert_by_ascending_key(
           old.control.port_registry,
           port_id,
           registration,
           compare_port_keys_for_insertion,
         ),
-        shutdown: old.control.shutdown,
       },
     ),
     old.control.shutdown |> is_active,
@@ -325,19 +347,87 @@ pub fn validate_update_only_root(
   )
 }
 
-/// Validate a liveness heartbeat which advances the HostState UTxO without
-/// changing any committed IBC state.
-///
-/// A heartbeat is deliberately narrower than a normal root update: it may only
-/// increment the version and advance the monitoring timestamp. In particular,
-/// it cannot be used during shutdown or to alter the IBC root, counters, ports,
-/// NFT identity, or deployer authority.
-pub fn validate_heartbeat(old: HostStateDatum, new: HostStateDatum) -> Bool {
+/// A heartbeat preserves all committed IBC state and pays for its own transaction.
+/// Only its version, monitoring timestamp and protected heartbeat clock advance.
+/// Finite ledger bounds prevent forged timestamps from bypassing the cooldown or
+/// postponing the next heartbeat indefinitely. Other operations preserve this clock.
+pub fn validate_heartbeat(
+  old: HostStateDatum,
+  new: HostStateDatum,
+  validity_range: ValidityRange,
+) -> Bool {
+  expect Finite(valid_from) = validity_range.lower_bound.bound_type
+  expect Finite(valid_to) = validity_range.upper_bound.bound_type
+  let previous = old.control.last_heartbeat_time
+  let timed_old =
+    HostStateDatum {
+      ..old,
+      control: HostStateControl { ..old.control, last_heartbeat_time: valid_to },
+    }
   and {
-    validate_update_only_root(old, new),
     old.control.shutdown |> is_active,
+    previous >= 0,
+    valid_from >= 0,
+    valid_to > valid_from,
+    valid_to - valid_from <= heartbeat_max_validity_ms,
+    previous == 0 || valid_from >= previous + heartbeat_interval_ms,
+    validate_update_only_root(timed_old, new),
     new.state.ibc_state_root == old.state.ibc_state_root,
-    new.state.last_update_time > old.state.last_update_time,
+    new.state.last_update_time == valid_to,
+  }
+}
+
+/// Transfer authority only to the backup fixed in the deployed validator.
+/// The IBC root and every other HostState field remain unchanged.
+pub fn validate_claim_backup(
+  old: HostStateDatum,
+  new: HostStateDatum,
+  backup_operator: VerificationKeyHash,
+) -> Bool {
+  new == HostStateDatum {
+    ..old,
+    state: HostState { ..old.state, version: old.state.version + 1 },
+    deployer: backup_operator,
+  }
+}
+
+pub fn validate_retire_state(
+  old: HostStateDatum,
+  new: HostStateDatum,
+  kind: Int,
+) -> Bool {
+  let old_control = old.control
+  let new_control = new.control
+  and {
+    new == HostStateDatum {
+      ..old,
+      state: HostState { ..old.state, version: old.state.version + 1 },
+      control: new_control,
+    },
+    new_control.port_registry == old_control.port_registry,
+    new_control.shutdown == old_control.shutdown,
+    new_control.last_heartbeat_time == old_control.last_heartbeat_time,
+    when kind is {
+      0 -> and {
+          old_control.live_clients > 0,
+          new_control.live_clients == old_control.live_clients - 1,
+          new_control.live_connections == old_control.live_connections,
+          new_control.live_channels == old_control.live_channels,
+        }
+      1 -> and {
+          old_control.live_connections > 0,
+          new_control.live_clients == old_control.live_clients,
+          new_control.live_connections == old_control.live_connections - 1,
+          new_control.live_channels == old_control.live_channels,
+        }
+      2 -> and {
+          old_control.live_channels > 0,
+          new_control.live_clients == old_control.live_clients,
+          new_control.live_connections == old_control.live_connections,
+          new_control.live_channels == old_control.live_channels - 1,
+        }
+      _ -> False
+    },
   }
 }
 
@@ -355,7 +445,7 @@ pub fn validate_enter_shutdown(
       old.state.next_connection_sequence,
       old.state.next_channel_sequence,
       HostStateControl {
-        port_registry: old.control.port_registry,
+        ..old.control,
         shutdown: ShuttingDown { initiated_at: valid_to, grace_period_end },
       },
     ),
@@ -366,7 +456,7 @@ pub fn validate_enter_shutdown(
   }
 }
 
-pub fn validate_finalize_shutdown(
+pub fn validate_shutdown_authority(
   datum: HostStateDatum,
   valid_from: Int,
 ) -> Bool {
@@ -375,3 +465,41 @@ pub fn validate_finalize_shutdown(
     Active -> False
   }
 }
+
+pub fn validate_authorize_finalization(
+  old: HostStateDatum,
+  new: HostStateDatum,
+) -> Bool {
+  new == HostStateDatum {
+    ..old,
+    state: HostState { ..old.state, version: old.state.version + 1 },
+    control: HostStateControl {
+      ..old.control,
+      port_registry: pairs.delete_first(old.control.port_registry, "transfer"),
+    },
+  }
+}
+
+pub fn validate_finalize_shutdown(
+  datum: HostStateDatum,
+  valid_from: Int,
+) -> Bool {
+  and {
+    validate_shutdown_authority(datum, valid_from),
+    !pairs.has_key(datum.control.port_registry, "transfer"),
+  }
+}
+
+/// Permissionless heartbeats may spend the shared HostState at most every six hours.
+pub const heartbeat_interval_ms = 21_600_000
+
+pub const heartbeat_max_validity_ms = 120_000
+/// Order byte-string map keys for `pairs.insert_by_ascending_key` using the
+/// order required by canonical CBOR.
+///
+/// Canonical CBOR sorts map keys by the length of their encoded form before
+/// comparing the encoded bytes. Since both keys are byte strings, comparing
+/// their payload lengths first and their bytes second produces that same order.
+/// Equal keys return `Greater` because `validate_bind_port` rejects duplicates
+/// and the insertion helper performs its own equality check.
+/// This branch-minimal specialization protects the near-limit HostState reference-script budget.

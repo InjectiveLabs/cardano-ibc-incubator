@@ -3,10 +3,10 @@ import * as path from 'node:path';
 
 import * as Lucid from '@lucid-evolution/lucid';
 
-import { encodeAuthToken } from '@shared/types/auth-token';
+import { readAppliedDeploymentPlan, type AppliedReferenceValidator } from './applied-deployment-plan';
+
 import { encodeMintVoucherRedeemer } from '@shared/types/apps/transfer/mint_voucher_redeemer/mint-voucher-redeemer';
 import { encodeSpendClientRedeemer } from '@shared/types/client-redeemer';
-import { encodeTransferIBCModuleRedeemer } from '@shared/types/apps/transfer/transfer-ibc-module-redeemer';
 import { encodeSpendChannelRedeemer } from '@shared/types/channel/channel-redeemer';
 import {
   encodeMintConnectionRedeemer,
@@ -25,7 +25,11 @@ import {
   formatCapacityReport,
   loadNormalizedCapacityFixture,
 } from './tendermint-update-capacity';
-import { addMaxAlternativeExUnits, checkTransactionBudgets, type ExUnits } from './tx-budget-limits';
+import {
+  addMaxAlternativeExUnits,
+  type ExUnits,
+  subtractBaselineExUnits,
+} from './tx-budget-limits';
 
 type BlueprintValidator = {
   title: string;
@@ -83,6 +87,33 @@ type AikenTestMaxGroup = {
   alternatives: AikenTestAlternative[];
 };
 
+type PairedAikenTest = {
+  name: string;
+  baselineTest: string;
+  measuredTest: string;
+};
+
+type StagedExecutionScenario = {
+  id: string;
+  name: string;
+  pairs: PairedAikenTest[];
+};
+
+type StagedExecutionReport = {
+  id: string;
+  name: string;
+  unsignedBytes: number;
+  signedBytesEstimate: number;
+  exUnits: ExUnits;
+  pairs: Array<
+    PairedAikenTest & {
+      baseline: ExUnits;
+      measured: ExUnits;
+      marginal: ExUnits;
+    }
+  >;
+};
+
 type ScenarioInput = {
   id: string;
   name: string;
@@ -123,18 +154,13 @@ type ScenarioReport = {
 
 const repoRoot = path.resolve(__dirname, '../../../../..');
 const DEFAULT_MAX_TX_SIZE = 16_384;
-const DEFAULT_TX_HEADROOM_BYTES = 750;
 const DEFAULT_SIGNED_WITNESS_ESTIMATE_BYTES = 260;
-const DEFAULT_MAX_TX_EX_MEM = 16_500_000;
-const DEFAULT_MAX_TX_EX_STEPS = 10_000_000_000;
-const DEFAULT_EX_UNIT_HEADROOM_BPS = 500;
 
 const TX_BASE_BYTES = 360;
 const TX_INPUT_BYTES = 44;
 const TX_OUTPUT_BYTES = 80;
 const TX_MINT_POLICY_BYTES = 45;
 const TX_REFERENCE_INPUT_BYTES = 44;
-const REFERENCE_SCRIPT_OUTPUT_OVERHEAD_BYTES = 200;
 
 const CAPACITY_HOST_STATE_AIKEN_TEST = 'host_state_stt.test.host_update_client_capacity_minimum_history_succeeds';
 const CAPACITY_SCENARIOS = [
@@ -151,6 +177,196 @@ const CAPACITY_SCENARIOS = [
     aikenTest: 'spending_client_capacity.test.update_client_capacity_non_adjacent_mixed_45_succeeds',
   },
 ] as const;
+
+const STAGED_TENDERMINT_EXECUTION_SCENARIOS: StagedExecutionScenario[] = [
+  {
+    id: 'tendermint_staged_freeze',
+    name: 'Staged Tendermint two-header freeze with minimum history',
+    pairs: [{
+      name: 'client, history support, two sessions, receipt burns and HostState root transition',
+      baselineTest: 'recover_client.test.staged_atomic_freeze_fixture_setup_baseline',
+      measuredTest: 'recover_client.test.staged_atomic_freeze_all_validators_accept_real_root_transition',
+    }],
+  },
+  {
+    id: 'tendermint_staged_recovery',
+    name: 'Staged Tendermint recovery with minimum history',
+    pairs: [{
+      name: 'client, authorized recovery withdrawal and HostState root transition',
+      baselineTest: 'recover_client.test.staged_atomic_recovery_fixture_setup_baseline',
+      measuredTest: 'recover_client.test.staged_atomic_recovery_all_validators_accept_real_root_transition',
+    }],
+  },
+  {
+    id: 'tendermint_staged_session_initialize',
+    name: 'Staged Tendermint session initialization',
+    pairs: [
+      {
+        name: 'session NFT mint',
+        baselineTest: 'minting_tendermint_update_session.test.session_mint_fixture_setup_baseline',
+        measuredTest: 'minting_tendermint_update_session.test.mints_one_seed_bound_session_with_exact_initial_datum',
+      },
+    ],
+  },
+  {
+    id: 'tendermint_staged_adjacent_six_validator_batch',
+    name: 'Staged Tendermint adjacent six-validator batch',
+    pairs: [
+      {
+        name: 'six target validators and signatures',
+        baselineTest: 'spending_tendermint_update_session.test.real_injective_six_validator_fixture_setup_baseline',
+        measuredTest: 'spending_tendermint_update_session.test.advances_real_injective_six_validator_target_batch',
+      },
+    ],
+  },
+  {
+    id: 'tendermint_staged_non_adjacent_six_validator_batch',
+    name: 'Staged Tendermint skipped-height six-validator batch',
+    pairs: [
+      {
+        name: 'six target validators, signatures, and trusted memberships',
+        baselineTest: 'spending_tendermint_update_session.test.real_non_adjacent_six_membership_fixture_setup_baseline',
+        measuredTest: 'spending_tendermint_update_session.test.advances_real_non_adjacent_six_membership_target_batch',
+      },
+    ],
+  },
+  {
+    id: 'tendermint_staged_depth_eight_six_validator_batch',
+    name: 'Staged Tendermint 256-validator depth-eight six-validator batch',
+    pairs: [
+      {
+        name: 'six target validators, signatures, and depth-eight trusted memberships',
+        baselineTest:
+          'spending_tendermint_update_session.test.depth_eight_non_adjacent_six_membership_fixture_setup_baseline',
+        measuredTest:
+          'spending_tendermint_update_session.test.advances_depth_eight_non_adjacent_six_membership_target_batch',
+      },
+    ],
+  },
+  {
+    id: 'tendermint_staged_finalize',
+    name: 'Staged Tendermint minimum-history finalization',
+    pairs: [
+      {
+        name: 'HostState root transition',
+        baselineTest: 'host_state_stt.test.host_update_client_capacity_fixture_setup_baseline',
+        measuredTest: 'host_state_stt.test.host_update_client_capacity_minimum_history_succeeds',
+      },
+      {
+        name: 'client state transition and history support',
+        baselineTest: 'spending_multitx_client.test.completed_session_update_fixture_setup_baseline',
+        measuredTest: 'spending_multitx_client.test.completed_session_updates_the_client_atomically',
+      },
+      {
+        name: 'session completion authorization',
+        baselineTest: 'spending_tendermint_update_session.test.session_finalize_fixture_setup_baseline',
+        measuredTest:
+          'spending_tendermint_update_session.test.complete_session_requires_client_and_host_threads_and_burn',
+      },
+      {
+        name: 'session NFT burn',
+        baselineTest: 'minting_tendermint_update_session.test.session_burn_fixture_setup_baseline',
+        measuredTest: 'minting_tendermint_update_session.test.burns_only_a_token_carried_by_the_session_script',
+      },
+    ],
+  },
+  {
+    id: 'channel_upgrade_init',
+    name: 'Channel upgrade INIT',
+    pairs: [
+      {
+        // Excludes the verify-proof mint of the steps that prove the counterparty.
+        name: 'upgrade operation, channel and HostState',
+        baselineTest: 'spending_channel/chan_upgrade.test.init_fixture_setup_baseline',
+        measuredTest: 'spending_channel/chan_upgrade.test.init_proposes_a_replacement_connection',
+      },
+    ],
+  },
+  {
+    id: 'channel_upgrade_try',
+    name: 'Channel upgrade crossing TRY',
+    pairs: [
+      {
+        // Excludes the verify-proof mint of the steps that prove the counterparty.
+        name: 'upgrade operation, channel and HostState',
+        baselineTest: 'spending_channel/chan_upgrade.test.try_fixture_setup_baseline',
+        measuredTest: 'spending_channel/chan_upgrade.test.try_answers_a_crossing_proposal_and_starts_flushing',
+      },
+    ],
+  },
+  {
+    id: 'channel_upgrade_ack',
+    name: 'Channel upgrade ACK starting the flush',
+    pairs: [
+      {
+        // Excludes the verify-proof mint of the steps that prove the counterparty.
+        name: 'upgrade operation, channel and HostState',
+        baselineTest: 'spending_channel/chan_upgrade.test.ack_fixture_setup_baseline',
+        measuredTest: 'spending_channel/chan_upgrade.test.ack_starts_flushing_and_records_the_counterparty_upgrade',
+      },
+    ],
+  },
+  {
+    id: 'channel_upgrade_confirm',
+    name: 'Channel upgrade CONFIRM completing the flush',
+    pairs: [
+      {
+        // Excludes the verify-proof mint of the steps that prove the counterparty.
+        name: 'upgrade operation, channel and HostState',
+        baselineTest: 'spending_channel/chan_upgrade.test.confirm_fixture_setup_baseline',
+        measuredTest: 'spending_channel/chan_upgrade.test.confirm_completes_a_certified_flush',
+      },
+    ],
+  },
+  {
+    id: 'channel_upgrade_flush',
+    name: 'Channel upgrade FLUSH of eight lanes',
+    pairs: [
+      {
+        // Excludes the verify-proof mint of the steps that prove the counterparty.
+        name: 'upgrade operation, channel and HostState',
+        baselineTest: 'spending_channel/chan_upgrade.test.flush_fixture_setup_baseline',
+        measuredTest: 'spending_channel/chan_upgrade.test.flush_certifies_eight_lanes_of_a_deployment',
+      },
+    ],
+  },
+  {
+    id: 'channel_upgrade_open',
+    name: 'Channel upgrade OPEN',
+    pairs: [
+      {
+        // Excludes the verify-proof mint of the steps that prove the counterparty.
+        name: 'upgrade operation, channel and HostState',
+        baselineTest: 'spending_channel/chan_upgrade.test.open_fixture_setup_baseline',
+        measuredTest: 'spending_channel/chan_upgrade.test.open_moves_the_channel_to_the_replacement_connection',
+      },
+    ],
+  },
+  {
+    id: 'channel_upgrade_timeout',
+    name: 'Channel upgrade TIMEOUT',
+    pairs: [
+      {
+        // Excludes the verify-proof mint of the steps that prove the counterparty.
+        name: 'upgrade operation, channel and HostState',
+        baselineTest: 'spending_channel/chan_upgrade.test.timeout_fixture_setup_baseline',
+        measuredTest: 'spending_channel/chan_upgrade.test.timeout_restores_the_channel_after_the_counterparty_deadline',
+      },
+    ],
+  },
+  {
+    id: 'channel_upgrade_cancel',
+    name: 'Channel upgrade authority CANCEL',
+    pairs: [
+      {
+        // Excludes the verify-proof mint of the steps that prove the counterparty.
+        name: 'upgrade operation, channel and HostState',
+        baselineTest: 'spending_channel/chan_upgrade.test.cancel_fixture_setup_baseline',
+        measuredTest: 'spending_channel/chan_upgrade.test.authority_cancels_while_flushing',
+      },
+    ],
+  },
+];
 
 function readIntegerEnv(name: string, fallback: number): number {
   const value = process.env[name]?.trim();
@@ -225,6 +441,37 @@ function sumExUnits(aikenTests: Map<string, ExUnits>, testNames: string[]): ExUn
       }),
       { mem: 0, steps: 0 },
     );
+}
+
+function buildStagedExecutionReports(aikenTests: Map<string, ExUnits>): StagedExecutionReport[] {
+  return STAGED_TENDERMINT_EXECUTION_SCENARIOS.map((scenario) => {
+    const pairs = scenario.pairs.map((pair) => {
+      const baseline = requiredAikenTestUnits(aikenTests, pair.baselineTest);
+      const measured = requiredAikenTestUnits(aikenTests, pair.measuredTest);
+      return {
+        ...pair,
+        baseline,
+        measured,
+        marginal: subtractBaselineExUnits(measured, baseline),
+      };
+    });
+    const exUnits = pairs.reduce(
+      (sum, pair) => ({
+        mem: sum.mem + pair.marginal.mem,
+        steps: sum.steps + pair.marginal.steps,
+      }),
+      { mem: 0, steps: 0 },
+    );
+
+    return {
+      id: scenario.id,
+      name: scenario.name,
+      unsignedBytes: 0,
+      signedBytesEstimate: 0,
+      exUnits,
+      pairs,
+    };
+  });
 }
 
 function estimateUnsignedBytes(validators: Map<string, BlueprintValidator>, scenario: ScenarioInput): number {
@@ -413,6 +660,7 @@ function loadMaximumIcs20Packet(): {
 const MAXIMUM_ICS20_PACKET = loadMaximumIcs20Packet();
 
 const CLIENT_STATE = {
+  upgradePath: [],
   chainId: '6f736d6f7369732d31',
   trustLevel: { numerator: 1n, denominator: 3n },
   trustingPeriod: 120n,
@@ -431,15 +679,15 @@ const CONSENSUS_STATE = {
 
 const RECOVERY_SUBJECT_TOKEN = {
   policyId: hexOfBytes(28, '21'),
-  name: hexOfBytes(8, '22'),
+  name: hexOfBytes(32, '22'),
 };
 
 const RECOVERY_SUBSTITUTE_TOKEN = {
   policyId: RECOVERY_SUBJECT_TOKEN.policyId,
-  name: hexOfBytes(8, '23'),
+  name: hexOfBytes(32, '23'),
 };
 
-function verifyProofRedeemer(proofBytes: number, valueBytes = 128): string {
+function verifyProofRedeemer(proofBytes: number, valueBytes = 128, historical = false): string {
   return encodeVerifyProofRedeemer(
     {
       VerifyMembership: {
@@ -456,6 +704,11 @@ function verifyProofRedeemer(proofBytes: number, valueBytes = 128): string {
       },
     },
     Lucid,
+    historical ? { record: {
+      clientToken: RECOVERY_SUBJECT_TOKEN, height: HEIGHT,
+      consensusState: CONSENSUS_STATE, processedTime: 1_234_567_890_000_000_000n,
+      processedHeight: 123_456_789n,
+    }, siblings: Array(64).fill(hexOfBytes(32, '00')) } : null,
   );
 }
 
@@ -493,32 +746,6 @@ function voucherRedeemer(
           },
         },
       },
-    },
-    Lucid,
-  );
-}
-
-async function recvTransferModuleRedeemer(packet: BudgetPacket, data: BudgetFungibleTokenPacketData): Promise<string> {
-  return encodeTransferIBCModuleRedeemer(
-    {
-      Callback: [
-        {
-          OnRecvPacket: {
-            channel_id: packet.destination_channel,
-            packet_data: packet.data,
-            acknowledgement: {
-              response: {
-                AcknowledgementResult: {
-                  result: '01',
-                },
-              },
-            },
-            data: {
-              ModuleDataV1: [data],
-            },
-          },
-        },
-      ],
     },
     Lucid,
   );
@@ -593,138 +820,6 @@ function traceDirectoryDatum(archivedCount: number): string {
   );
 }
 
-async function buildFirstSeenVoucherReceiveAtCapacityScenario(): Promise<ScenarioInput> {
-  return {
-    id: 'first_seen_voucher_receive_at_capacity',
-    name: 'Combined modeled first-seen voucher RecvPacket path at packet and history capacity',
-    // HostState, channel, transfer module, and active trace shard are spent.
-    inputCount: 4,
-    // Connection, client, trace directory, and eight archived trace shards
-    // are read as data-bearing reference inputs in addition to the scripts.
-    nonScriptReferenceInputCount: 3 + TRACE_REGISTRY_LIMITS.maxArchivedShardsPerBucket,
-    // HostState, channel, transfer module, trace shard, voucher payout, and
-    // CIP-68 reference-token metadata are all recreated or paid here.
-    outputCount: 6,
-    mintPolicyCount: 3,
-    referenceScriptTitles: [
-      'host_state_stt.host_state_stt.spend',
-      'spending_channel.spend_channel.spend',
-      'spending_transfer_module.spend_transfer_module.spend',
-      'trace_registry.spend_trace_registry.spend',
-      'minting_voucher.mint_voucher.mint',
-      'spending_channel/recv_packet.recv_packet.mint',
-      'verifying_proof.verify_proof.mint',
-    ],
-    redeemers: [
-      sized(
-        'spend channel RecvPacket with 512-byte packet',
-        await encodeSpendChannelRedeemer(
-          {
-            RecvPacket: {
-              packet: MAXIMUM_ICS20_PACKET.packet as never,
-              proof_commitment: proofPayload(1536) as never,
-              proof_height: HEIGHT,
-            },
-          },
-          Lucid,
-        ),
-      ),
-      sized('verify proof', verifyProofRedeemer(1536, 32)),
-      // RecvPacket updates receipt and acknowledgement paths at capacity.
-      dataBytes('host state HandlePacket redeemer', 4_600),
-      sized(
-        'transfer module OnRecvPacket',
-        await recvTransferModuleRedeemer(MAXIMUM_ICS20_PACKET.packet, MAXIMUM_ICS20_PACKET.data),
-      ),
-      sized(
-        'mint voucher with 512-byte packet fields',
-        voucherRedeemer('MintVoucher', MAXIMUM_ICS20_PACKET.packet, MAXIMUM_ICS20_PACKET.data),
-      ),
-      sized(
-        'trace registry InsertTrace',
-        encodeTraceRegistryRedeemer(
-          {
-            InsertTrace: {
-              voucher_hash: hexOfBytes(28, '44'),
-              full_denom: 'port-99/channel-99/ibc/usdt',
-            },
-          },
-          Lucid,
-        ),
-      ),
-      sized(
-        'recv packet policy auth token',
-        encodeAuthToken(
-          {
-            policyId: hexOfBytes(28, '45'),
-            name: hexOfBytes(32, '46'),
-          },
-          Lucid,
-        ),
-      ),
-    ],
-    datums: [
-      dataBytes('updated host state datum', 1000),
-      dataBytes('updated channel datum at history capacity', 2_800),
-      dataBytes('transfer module datum', 32),
-      dataBytes('max encoded trace shard datum', TRACE_REGISTRY_LIMITS.maxShardDatumBytes),
-      dataBytes('CIP-68 voucher metadata datum', 900),
-    ],
-    largestProofPayloadBytes: 1536,
-    aikenTests: [
-      'spending_channel.test.recv_packet_succeed',
-      'spending_channel/recv_packet.test.succeed_recv_packet_maximum_ics20_packet',
-      'ibc/core/ics_004/channel_datum_test/validate_recv_packet.succeed_at_packet_history_capacity',
-      'host_state_stt.test.host_state_handle_packet_recv_succeeds_at_history_capacity',
-      'host_state_stt.test.host_state_handle_packet_acknowledgement_succeeds_at_history_capacity',
-      'verifying_proof.test.verify_membership_succeed',
-    ],
-    // The v10 late match builds and rejects the ibc-rs struct-order candidate
-    // first, while the v8 late match builds and rejects the Cardano
-    // sorted-order candidate first. Pair both profiles with both bounded
-    // archive shapes without charging mutually exclusive paths in one tx.
-    aikenTestMaxGroups: [
-      {
-        name: 'ICS-20 wire profile and archive shape',
-        alternatives: [
-          {
-            name: 'ibc-go v10 late match, archive entry limit',
-            tests: [
-              'spending_transfer_module.test.on_recv_packet_mint_voucher_maximum_ics20_packet_succeed',
-              'minting_voucher.test.test_mint_voucher_maximum_v10_ics20_packet_with_eight_archives_at_entry_limit',
-              'trace_registry_capacity.test.trace_registry_boundary_append_eight_archives_at_entry_limit',
-            ],
-          },
-          {
-            name: 'ibc-go v10 late match, archive byte limit',
-            tests: [
-              'spending_transfer_module.test.on_recv_packet_mint_voucher_maximum_ics20_packet_succeed',
-              'minting_voucher.test.test_mint_voucher_maximum_v10_ics20_packet_with_eight_archives_near_byte_limit',
-              'trace_registry_capacity.test.trace_registry_boundary_append_eight_archives_near_byte_limit',
-            ],
-          },
-          {
-            name: 'ibc-go v8 late match, archive entry limit',
-            tests: [
-              'spending_transfer_module.test.on_recv_packet_mint_voucher_maximum_v8_ics20_packet_succeed',
-              'minting_voucher.test.test_mint_voucher_maximum_v8_ics20_packet_with_eight_archives_at_entry_limit',
-              'trace_registry_capacity.test.trace_registry_boundary_append_eight_archives_at_entry_limit',
-            ],
-          },
-          {
-            name: 'ibc-go v8 late match, archive byte limit',
-            tests: [
-              'spending_transfer_module.test.on_recv_packet_mint_voucher_maximum_v8_ics20_packet_succeed',
-              'minting_voucher.test.test_mint_voucher_maximum_v8_ics20_packet_with_eight_archives_near_byte_limit',
-              'trace_registry_capacity.test.trace_registry_boundary_append_eight_archives_near_byte_limit',
-            ],
-          },
-        ],
-      },
-    ],
-  };
-}
-
 async function buildMinimumHistoryRecoveryScenario(): Promise<ScenarioInput> {
   return {
     id: 'recover_client_minimum_history',
@@ -746,7 +841,10 @@ async function buildMinimumHistoryRecoveryScenario(): Promise<ScenarioInput> {
       dataBytes('host state UpdateClient redeemer', 4_600),
       sized(
         'spend client RecoverClient',
-        await encodeSpendClientRedeemer({ RecoverClient: { substitute_token: RECOVERY_SUBSTITUTE_TOKEN } }, Lucid),
+        await encodeSpendClientRedeemer({ RecoverClient: {
+          substitute_token: RECOVERY_SUBSTITUTE_TOKEN,
+          history_siblings: Array(64).fill('00'.repeat(32)),
+        } }, Lucid),
       ),
       sized(
         'recover client withdrawal',
@@ -763,7 +861,7 @@ async function buildMinimumHistoryRecoveryScenario(): Promise<ScenarioInput> {
     ],
     datums: [
       dataBytes('updated host state datum', 1_000),
-      dataBytes('recovered client datum with two consensus states', 1_000),
+      dataBytes('recovered client datum with one consensus state and history root', 750),
     ],
     largestProofPayloadBytes: 4_096,
     aikenTests: [
@@ -774,37 +872,45 @@ async function buildMinimumHistoryRecoveryScenario(): Promise<ScenarioInput> {
   };
 }
 
+function buildScenarioReport(
+  validators: Map<string, BlueprintValidator>,
+  aikenTests: Map<string, ExUnits>,
+  scenario: ScenarioInput,
+): ScenarioReport {
+  const unsignedBytes = estimateUnsignedBytes(validators, scenario);
+  const aikenTestMaxGroups = measureAikenTestMaxGroups(aikenTests, scenario.aikenTestMaxGroups ?? []);
+  return {
+    id: scenario.id,
+    name: scenario.name,
+    unsignedBytes,
+    signedBytesEstimate: unsignedBytes + DEFAULT_SIGNED_WITNESS_ESTIMATE_BYTES,
+    redeemers: scenario.redeemers,
+    datums: scenario.datums,
+    largestProofPayloadBytes: scenario.largestProofPayloadBytes,
+    inputCount: scenario.inputCount,
+    nonScriptReferenceInputCount: scenario.nonScriptReferenceInputCount ?? 0,
+    outputCount: scenario.outputCount,
+    mintPolicyCount: scenario.mintPolicyCount,
+    scriptReferenceCount: scenario.referenceScriptTitles.length,
+    inlineScriptCount: scenario.inlineScriptTitles?.length ?? 0,
+    aikenTestMaxGroups,
+    exUnits: sumScenarioExUnits(sumExUnits(aikenTests, scenario.aikenTests), aikenTestMaxGroups),
+  };
+}
+
 async function buildScenarios(
   validators: Map<string, BlueprintValidator>,
   aikenTests: Map<string, ExUnits>,
+  deploymentReferences: AppliedReferenceValidator[],
 ): Promise<ScenarioReport[]> {
-  const largestReferenceScript = [
-    'host_state_stt.host_state_stt.spend',
-    'minting_channel_stt.mint_channel_stt.mint',
-    'minting_client_stt.mint_client_stt.mint',
-    'minting_connection_stt.mint_connection_stt.mint',
-    'minting_transfer_escrow_shard.mint_transfer_escrow_shard.mint',
-    'minting_voucher.mint_voucher.mint',
-    'recover_client.recover_client.withdraw',
-    'spending_channel.spend_channel.spend',
-    'spending_client.spend_client.spend',
-    'spending_connection.spend_connection.spend',
-    'spending_transfer_module.spend_transfer_module.spend',
-    'trace_registry.spend_trace_registry.spend',
-    'spending_channel/acknowledge_packet.acknowledge_packet.mint',
-    'spending_channel/chan_open_ack.chan_open_ack.mint',
-    'spending_channel/prune_packet_history.prune_packet_history.mint',
-    'spending_channel/recv_packet.recv_packet.mint',
-    'spending_channel/send_packet.send_packet.mint',
-    'spending_channel/timeout_packet.timeout_packet.mint',
-  ]
-    .map((title) => ({ title, bytes: scriptBytes(validators, title) }))
-    .sort((left, right) => right.bytes - left.bytes)[0];
+  const largestReferenceScript = [...deploymentReferences].sort(
+    (left, right) => right.estimatedReferenceOutputBytes - left.estimatedReferenceOutputBytes,
+  )[0];
 
   const scenarios: ScenarioInput[] = [
     {
       id: 'reference_script_deployment',
-      name: 'reference script deployment',
+      name: `fully applied reference deployment (${largestReferenceScript.mode}: ${largestReferenceScript.title})`,
       inputCount: 1,
       outputCount: 1,
       mintPolicyCount: 0,
@@ -814,7 +920,7 @@ async function buildScenarios(
       datums: [dataBytes('reference datum', 0)],
       largestProofPayloadBytes: 0,
       aikenTests: [],
-      unsignedBytesOverride: largestReferenceScript.bytes + REFERENCE_SCRIPT_OUTPUT_OVERHEAD_BYTES,
+      unsignedBytesOverride: largestReferenceScript.estimatedReferenceOutputBytes,
     },
     {
       id: 'bind_port_at_global_cap',
@@ -883,6 +989,9 @@ async function buildScenarios(
       id: 'conn_open_ack',
       name: 'ConnOpenAck',
       inputCount: 3,
+      // History is proved inside the existing verify-proof carrier. Only the
+      // live authenticated client datum is referenced; there is no archive UTxO.
+      nonScriptReferenceInputCount: 1,
       outputCount: 3,
       mintPolicyCount: 1,
       referenceScriptTitles: [
@@ -892,12 +1001,12 @@ async function buildScenarios(
       ],
       redeemers: [
         sized('spend connection ConnOpenAck', await encodeSpendConnectionRedeemer('ConnOpenAck', Lucid)),
-        sized('verify proof', verifyProofRedeemer(1536)),
+        sized('verify proof with historical membership witness', verifyProofRedeemer(1536, 128, true)),
         dataBytes('host state redeemer', 512),
       ],
       datums: [dataBytes('updated host state datum', 1000), dataBytes('connection datum', 768)],
-      largestProofPayloadBytes: 1536,
-      aikenTests: ['spending_connection.test.conn_open_ack_succeed'],
+      largestProofPayloadBytes: 1536 + 64 * 32,
+      aikenTests: ['spending_connection.test.conn_open_ack_accepts_authenticated_history_witness'],
     },
     await buildMinimumHistoryRecoveryScenario(),
     {
@@ -1238,7 +1347,9 @@ async function buildScenarios(
       ],
       nonScriptReferenceInputCount: TRACE_REGISTRY_LIMITS.maxArchivedShardsPerBucket - 1,
     },
-    await buildFirstSeenVoucherReceiveAtCapacityScenario(),
+    // First-seen voucher receives are intentionally split into a trace-registry
+    // prelude and a normal receive transaction. The component scenarios below
+    // keep their individual budget ratchets without combining both paths.
     {
       id: 'first_seen_voucher_mint',
       name: 'First-seen voucher mint component at packet capacity',
@@ -1309,32 +1420,14 @@ async function buildScenarios(
     },
   ];
 
-  return scenarios.map((scenario) => {
-    const unsignedBytes = estimateUnsignedBytes(validators, scenario);
-    const aikenTestMaxGroups = measureAikenTestMaxGroups(aikenTests, scenario.aikenTestMaxGroups ?? []);
-    return {
-      id: scenario.id,
-      name: scenario.name,
-      unsignedBytes,
-      signedBytesEstimate: unsignedBytes + DEFAULT_SIGNED_WITNESS_ESTIMATE_BYTES,
-      redeemers: scenario.redeemers,
-      datums: scenario.datums,
-      largestProofPayloadBytes: scenario.largestProofPayloadBytes,
-      inputCount: scenario.inputCount,
-      nonScriptReferenceInputCount: scenario.nonScriptReferenceInputCount ?? 0,
-      outputCount: scenario.outputCount,
-      mintPolicyCount: scenario.mintPolicyCount,
-      scriptReferenceCount: scenario.referenceScriptTitles.length,
-      inlineScriptCount: scenario.inlineScriptTitles?.length ?? 0,
-      aikenTestMaxGroups,
-      exUnits: sumScenarioExUnits(sumExUnits(aikenTests, scenario.aikenTests), aikenTestMaxGroups),
-    };
-  });
+  return scenarios.map((scenario) => buildScenarioReport(validators, aikenTests, scenario));
 }
 
 async function buildCapacityReports(aikenTests: Map<string, ExUnits>) {
   const fixture = loadNormalizedCapacityFixture();
   const hostState = requiredAikenTestUnits(aikenTests, CAPACITY_HOST_STATE_AIKEN_TEST);
+  // Measure the exact capacity fixture's spending and support scripts separately;
+  // combined positive/negative tests must not be double-counted as components.
 
   return Promise.all(
     CAPACITY_SCENARIOS.map(async ({ fixtureName, aikenTest }) => {
@@ -1343,12 +1436,15 @@ async function buildCapacityReports(aikenTests: Map<string, ExUnits>) {
         throw new Error(`Missing normalized Tendermint capacity scenario: ${fixtureName}`);
       }
       const spendClient = requiredAikenTestUnits(aikenTests, aikenTest);
+      const clientSupport = requiredAikenTestUnits(aikenTests,
+        `spending_client_capacity.test.support_capacity_${fixtureName}_45_succeeds`);
       const artifact = await analyzeCapacityScenario(
         fixtureName,
         scenario,
         {
           hostState: { mem: BigInt(hostState.mem), steps: BigInt(hostState.steps) },
           spendClient: { mem: BigInt(spendClient.mem), steps: BigInt(spendClient.steps) },
+          clientSupport: { mem: BigInt(clientSupport.mem), steps: BigInt(clientSupport.steps) },
         },
         'aiken-unit-tests',
       );
@@ -1357,17 +1453,13 @@ async function buildCapacityReports(aikenTests: Map<string, ExUnits>) {
   );
 }
 
-function printReport(reports: ScenarioReport[], maxTxSize: number, txHeadroomBytes: number): void {
-  const safeTxSize = maxTxSize - txHeadroomBytes;
-  console.log(
-    `Cardano transaction budget report (ledger max=${maxTxSize}, CI safe size=${safeTxSize}, reserve=${txHeadroomBytes})`,
-  );
+function printReport(reports: ScenarioReport[], maxTxSize: number): void {
+  console.log(`Cardano transaction cost estimates (diagnostic only, ledger size limit=${maxTxSize})`);
   for (const report of reports) {
     console.log(`\n${report.name}`);
     console.log(`  unsigned bytes: ${report.unsignedBytes}`);
     console.log(`  signed bytes estimate: ${report.signedBytesEstimate}`);
     console.log(`  ledger size margin: ${maxTxSize - report.signedBytesEstimate}`);
-    console.log(`  CI reserve margin: ${safeTxSize - report.signedBytesEstimate}`);
     console.log(`  ex units: mem=${report.exUnits.mem} steps=${report.exUnits.steps}`);
     console.log(`  redeemer sizes: ${formatPayloads(report.redeemers)}`);
     console.log(`  datum sizes: ${formatPayloads(report.datums)}`);
@@ -1386,6 +1478,21 @@ function printReport(reports: ScenarioReport[], maxTxSize: number, txHeadroomByt
   }
 }
 
+function printStagedExecutionReports(reports: StagedExecutionReport[]): void {
+  console.log('\nStaged Tendermint paired execution-unit estimates (diagnostic only)');
+  for (const report of reports) {
+    console.log(`\n${report.name}`);
+    for (const pair of report.pairs) {
+      console.log(
+        `  ${pair.name}: measured mem=${pair.measured.mem} steps=${pair.measured.steps}; ` +
+          `baseline mem=${pair.baseline.mem} steps=${pair.baseline.steps}; ` +
+          `marginal mem=${pair.marginal.mem} steps=${pair.marginal.steps}`,
+      );
+    }
+    console.log(`  total marginal: mem=${report.exUnits.mem} steps=${report.exUnits.steps}`);
+  }
+}
+
 function formatPayloads(payloads: SizedPayload[]): string {
   if (payloads.length === 0) {
     return 'none';
@@ -1395,56 +1502,34 @@ function formatPayloads(payloads: SizedPayload[]): string {
 
 async function main() {
   const maxTxSize = readIntegerEnv('CARDANO_TX_BUDGET_MAX_TX_SIZE', DEFAULT_MAX_TX_SIZE);
-  const txHeadroomBytes = readIntegerEnv('CARDANO_TX_BUDGET_HEADROOM_BYTES', DEFAULT_TX_HEADROOM_BYTES);
-  const maxTxExMem = readIntegerEnv('CARDANO_TX_BUDGET_MAX_TX_EX_MEM', DEFAULT_MAX_TX_EX_MEM);
-  const maxTxExSteps = readIntegerEnv('CARDANO_TX_BUDGET_MAX_TX_EX_STEPS', DEFAULT_MAX_TX_EX_STEPS);
-  const exUnitHeadroomBps = readIntegerEnv('CARDANO_TX_BUDGET_EX_UNIT_HEADROOM_BPS', DEFAULT_EX_UNIT_HEADROOM_BPS);
   const blueprintPath = process.env.CARDANO_TX_BUDGET_BLUEPRINT || path.join(repoRoot, 'cardano/onchain/plutus.json');
   const aikenCheckJsonPath = process.env.CARDANO_TX_BUDGET_AIKEN_CHECK_JSON || path.join(repoRoot, 'aiken-check.json');
+
+  const deploymentPlanPath = process.env.CARDANO_TX_BUDGET_DEPLOYMENT_PLAN || path.join(repoRoot, 'deployment-plan.json');
+  // Dedicated reference funding avoids the conservative 750-byte wallet/change
+  // allowance. Signed production publications enforce a 200-byte reserve too.
+  const deploymentReferences = readAppliedDeploymentPlan(deploymentPlanPath, blueprintPath, maxTxSize, 200);
 
   const blueprint = readJson<Blueprint>(blueprintPath);
   const validators = new Map(blueprint.validators.map((validator) => [validator.title, validator]));
   const aikenCheckReport = readJson<AikenCheckReport>(aikenCheckJsonPath);
   const aikenTests = toAikenTestMap(aikenCheckReport);
-  const reports = await buildScenarios(validators, aikenTests);
+  const reports = await buildScenarios(validators, aikenTests, deploymentReferences);
   const capacityReports = await buildCapacityReports(aikenTests);
-
-  console.log('Execution units are test-derived estimates collected with --trace-level silent, not ledger evaluations.');
-  printReport(reports, maxTxSize, txHeadroomBytes);
-  console.log('\nInjective Tendermint UpdateClient capacity report (report-only; not a budget gate)');
-  console.log(capacityReports.map((report) => formatCapacityReport(report)).join('\n\n'));
-
-  const { failures, knownViolations } = checkTransactionBudgets(reports, {
-    maxTxSize,
-    txHeadroomBytes,
-    maxTxExMem,
-    maxTxExSteps,
-    exUnitHeadroomBps,
-  });
-
-  if (knownViolations.length > 0) {
-    console.log('\nKNOWN TRANSACTION-BUDGET VIOLATIONS (regression-ratcheted):');
-    for (const violation of knownViolations) {
-      console.log(`- ${violation}`);
-    }
-  }
-
-  if (failures.length > 0) {
-    console.error('\nTransaction budget check failed:');
-    for (const failure of failures) {
-      console.error(`- ${failure}`);
-    }
-    process.exit(1);
-  }
+  const stagedExecutionReports = buildStagedExecutionReports(aikenTests);
+  console.log(`Production deployment preflight passed for ${deploymentReferences.length} fully applied references across both modes.`);
+  printStagedExecutionReports(stagedExecutionReports);
 
   console.log(
-    '\nTransaction budget ratchet passed: every overrun matches its recorded ceiling and no scenario regressed.',
+    'These synthetic estimates include Aiken test setup and overlapping validation. They do not measure complete transactions.',
   );
-  if (knownViolations.length > 0) {
-    console.log(`${knownViolations.length} known transaction-limit violations remain and may only decrease.`);
-  } else {
-    console.log(`All scenarios retain ${txHeadroomBytes} bytes and ${exUnitHeadroomBps / 100}% ex-unit headroom.`);
-  }
+  printReport(reports, maxTxSize);
+  console.log('\nInjective Tendermint UpdateClient capacity estimates (diagnostic only)');
+  console.log(capacityReports.map((report) => formatCapacityReport(report)).join('\n\n'));
+  console.log('\nLedger-limit enforcement runs separately through cardano/offchain deno task test:tx-budgets.');
+  console.log(
+    'Complete-transaction coverage does not yet include registry rollover, first-seen voucher minting or Injective capacity profiles.',
+  );
 }
 
 void main().catch((error) => {

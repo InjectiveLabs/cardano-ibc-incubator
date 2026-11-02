@@ -1,17 +1,19 @@
+import { PacketLaneService } from '../packet-lane.service';
 import { Test, TestingModule } from '@nestjs/testing';
 import { TxController } from '../tx.controller';
 import { ClientService } from '../client.service';
 import { ConnectionService } from '../connection.service';
 import { ChannelService } from '../channel.service';
+import { ChannelUpgradeService } from '../channel-upgrade.service';
 import { PacketService } from '../packet.service';
 import { SubmissionService } from '../submission.service';
 import { HostStateHeartbeatService } from '../host-state-heartbeat.service';
 
 describe('TxController - Packet (modern)', () => {
   let controller: TxController;
+  const packetLaneMock = { admit: jest.fn(), settle: jest.fn(), batch: jest.fn() };
   let packetServiceMock: {
     recvPacket: jest.Mock;
-    sendPacket: jest.Mock;
     acknowledgementPacket: jest.Mock;
     timeoutPacket: jest.Mock;
     timeoutOnClosePacket: jest.Mock;
@@ -26,7 +28,6 @@ describe('TxController - Packet (modern)', () => {
     // PacketService for packet flows and ChannelService for channel close init.
     packetServiceMock = {
       recvPacket: jest.fn(),
-      sendPacket: jest.fn(),
       acknowledgementPacket: jest.fn(),
       timeoutPacket: jest.fn(),
       timeoutOnClosePacket: jest.fn(),
@@ -40,9 +41,11 @@ describe('TxController - Packet (modern)', () => {
     const module: TestingModule = await Test.createTestingModule({
       controllers: [TxController],
       providers: [
+        { provide: PacketLaneService, useValue: packetLaneMock },
         { provide: ClientService, useValue: {} },
         { provide: ConnectionService, useValue: {} },
         { provide: ChannelService, useValue: channelServiceMock },
+        { provide: ChannelUpgradeService, useValue: {} },
         { provide: PacketService, useValue: packetServiceMock },
         { provide: SubmissionService, useValue: {} },
         { provide: HostStateHeartbeatService, useValue: {} },
@@ -71,15 +74,33 @@ describe('TxController - Packet (modern)', () => {
     await expect(controller.RecvPacket(request)).rejects.toThrow('Invalid constructed address: Signer is not valid');
   });
 
-  it('delegates Transfer to PacketService', async () => {
+  it('admits Transfer as an independently funded intent', async () => {
     const request = { source_port: 'transfer', source_channel: 'channel-0' } as any;
     const expected = { unsigned_tx: Buffer.from([2]) } as any;
-    packetServiceMock.sendPacket.mockResolvedValue(expected);
+    packetLaneMock.admit.mockResolvedValue(expected);
 
     const response = await controller.Transfer(request);
 
-    expect(packetServiceMock.sendPacket).toHaveBeenCalledWith(request);
+    expect(packetLaneMock.admit).toHaveBeenCalledWith(request);
     expect(response).toBe(expected);
+  });
+
+
+  it.each([
+    ['RecvPacket', 'destination_port', 'receive'],
+    ['Acknowledgement', 'source_port', 'acknowledge'],
+    ['Timeout', 'source_port', 'timeout'],
+    ['TimeoutOnClose', 'source_port', 'timeout'],
+  ] as const)('%s routes ICS-20 packets through packet lanes', async (method, portField, operation) => {
+    const request = { packet: { [portField]: 'transfer' } } as any;
+    const response = { unsigned_tx: Buffer.from([7]) } as any;
+    packetLaneMock.settle.mockReset().mockResolvedValue(response);
+    await expect(controller[method](request)).resolves.toBe(response);
+    expect(packetLaneMock.settle).toHaveBeenCalledWith(request, operation);
+    expect(packetServiceMock.recvPacket).not.toHaveBeenCalled();
+    expect(packetServiceMock.acknowledgementPacket).not.toHaveBeenCalled();
+    expect(packetServiceMock.timeoutPacket).not.toHaveBeenCalled();
+    expect(packetServiceMock.timeoutOnClosePacket).not.toHaveBeenCalled();
   });
 
   it('delegates Acknowledgement to PacketService', async () => {
@@ -118,7 +139,7 @@ describe('TxController - Packet (modern)', () => {
   it('normalizes and delegates CardanoMsg PrunePacketHistory to PacketService', async () => {
     const request = {
       signer: 'addr_test1signer',
-      port_id: 'transfer',
+      port_id: 'mock',
       channel_id: 'channel-7',
       sequence: 9n,
       // MerkleProof containing a recognized BatchProof variant.
@@ -131,12 +152,32 @@ describe('TxController - Packet (modern)', () => {
     await expect(controller.PrunePacketHistory(request)).resolves.toBe(expected);
     expect(packetServiceMock.prunePacketHistory).toHaveBeenCalledWith(
       expect.objectContaining({
-        portId: 'transfer',
+        portId: 'mock',
         channelId: 'channel-7',
         sequence: 9n,
         proofHeight: { revisionNumber: 0n, revisionHeight: 55n },
       }),
     );
+  });
+
+  it('rejects transfer pruning before delegating to the legacy channel builder', async () => {
+    await expect(controller.PrunePacketHistory({
+      signer: 'addr_test1signer', port_id: 'transfer', channel_id: 'channel-7',
+      sequence: 1n, proof_commitment_absence: new Uint8Array(),
+      proof_height: { revision_number: 0n, revision_height: 1n },
+    })).rejects.toThrow('cannot be pruned');
+    expect(packetServiceMock.prunePacketHistory).not.toHaveBeenCalled();
+  });
+
+  it('routes transfer packet settlement through lanes by default', async () => {
+    const request = { packet: { source_port: 'transfer', destination_port: 'transfer' } } as any;
+    await controller.RecvPacket(request);
+    expect(packetLaneMock.settle).toHaveBeenCalledWith(request, 'receive');
+    await controller.Acknowledgement(request);
+    expect(packetLaneMock.settle).toHaveBeenCalledWith(request, 'acknowledge');
+    await controller.Timeout(request);
+    expect(packetLaneMock.settle).toHaveBeenCalledWith(request, 'timeout');
+    expect(packetServiceMock.recvPacket).not.toHaveBeenCalled();
   });
 
   it('delegates ChannelCloseInit to ChannelService', async () => {

@@ -1,3 +1,4 @@
+use aiken/builtin
 use aiken/collection/dict
 use aiken/collection/list
 use aiken/collection/pairs
@@ -9,11 +10,17 @@ use cardano/assets.{
   AssetName, PolicyId, Value, ada_asset_name, ada_policy_id, quantity_of, tokens,
 }
 use cardano/transaction.{
-  InlineDatum, Input, Output, Redeemer, ScriptPurpose, Spend, ValidityRange,
+  InlineDatum, Input, Mint, Output, Redeemer, ScriptPurpose, Spend,
+  ValidityRange,
 }
 use ibc/auth.{AuthToken}
-use ibc/client/ics_007_tendermint_client/client_datum.{ClientDatum}
+use ibc/client/ics_007_tendermint_client/height.{Height}
+use ibc/core/ics_002_client_semantics/client_view.{ClientView as ClientDatum}
+use ibc/core/ics_002_client_semantics/registry
 use ibc/core/ics_002_client_semantics/types/keys as client_keys
+use ibc/core/ics_002_client_semantics/verify_proof_redeemer.{
+  VerifyProofEnvelope, VerifyProofRedeemer,
+}
 use ibc/core/ics_003_connection_semantics/connection_datum.{ConnectionDatum}
 use ibc/core/ics_003_connection_semantics/types/keys as connection_keys
 use ibc/core/ics_004/channel_datum.{ChannelDatum}
@@ -23,13 +30,13 @@ use ibc/core/ics_005/types/keys as port_keys
 use ibc/core/ics_025_handler_interface/host_state.{
   HostStateDatum, ModuleRegistration, host_state_token_name, is_active,
 }
-use ibc/core/ics_025_handler_interface/host_state_redeemer as host_state_redeemer
 
 pub type ExpectedHostStateRedeemer {
   ExpectUpdateClient
   ExpectUpdateConnection
   ExpectUpdateChannel
   ExpectHandlePacket
+  ExpectUpgradeChannel
 }
 
 type PosixTime =
@@ -254,10 +261,10 @@ fn input_redeemer(
 
 fn expected_client_token(
   referrer_token_name: ByteArray,
-  client_minting_policy_id: PolicyId,
+  registration: registry.ClientRegistration,
   client_id: ByteArray,
 ) -> AuthToken {
-  let client_sequence = client_keys.parse_client_id_sequence(client_id)
+  let client_sequence = registry.sequence(registration, client_id)
 
   let client_token_name =
     auth.generate_token_name_from_another(
@@ -265,7 +272,7 @@ fn expected_client_token(
       client_keys.client_prefix,
       client_sequence,
     )
-  AuthToken { policy_id: client_minting_policy_id, name: client_token_name }
+  AuthToken { policy_id: registration.mint_policy, name: client_token_name }
 }
 
 fn expected_connection_token(
@@ -301,20 +308,47 @@ fn find_authenticated_input(
 pub fn validate_referred_client(
   reference_inputs: List<Input>,
   referrer_token_name: ByteArray,
-  client_minting_policy_id: PolicyId,
+  client_registry: Data,
   client_id: ByteArray,
+  current_time: Int,
+  proof_height: Option<Height>,
+  history_witness: Option<Data>,
+) -> ClientDatum {
+  let registration = registry.for_client(client_registry, client_id)
+  validate_registered_client(
+    reference_inputs,
+    referrer_token_name,
+    registration,
+    client_id,
+    current_time,
+    proof_height,
+    history_witness,
+  )
+}
+
+/// Reuse the registration selected for proof routing when authenticating state.
+pub fn validate_registered_client(
+  reference_inputs: List<Input>,
+  referrer_token_name: ByteArray,
+  registration: registry.ClientRegistration,
+  client_id: ByteArray,
+  current_time: Int,
+  proof_height: Option<Height>,
+  history_witness: Option<Data>,
 ) -> ClientDatum {
   let client_token =
-    expected_client_token(
-      referrer_token_name,
-      client_minting_policy_id,
-      client_id,
-    )
+    expected_client_token(referrer_token_name, registration, client_id)
 
   expect Some(client_input) =
     find_authenticated_input(reference_inputs, client_token)
-  expect client_datum: ClientDatum = get_inline_datum(client_input.output)
-  client_datum
+  authenticated_client_view(
+    client_input.output,
+    registration,
+    client_token,
+    current_time,
+    proof_height,
+    history_witness,
+  )
 }
 
 pub fn validate_referred_connection(
@@ -337,19 +371,17 @@ pub fn validate_referred_connection(
   connection_datum
 }
 
-/// Locate a channel's authenticated connection and client references together.
-///
-/// Before the connection datum reveals the client id, the scan records whether
-/// an earlier input could carry the client policy. Once the id is known, the
-/// exact derived client auth token is still required. The normal
-/// connection-before-client layout is traversed once; if references are
-/// reordered, lookup falls back to the complete list to preserve behavior.
+/// Resolve the authenticated connection first, then the registered client it
+/// names. Lookup is independent of reference-input ordering.
 pub fn validate_referred_connection_and_client(
   reference_inputs: List<Input>,
   referrer_token_name: ByteArray,
-  client_minting_policy_id: PolicyId,
+  client_registry: Data,
   connection_minting_policy_id: PolicyId,
   connection_id: ByteArray,
+  current_time: Int,
+  proof_height: Option<Height>,
+  history_witness: Option<Data>,
 ) -> (ConnectionDatum, ClientDatum) {
   let connection_token =
     expected_connection_token(
@@ -357,58 +389,84 @@ pub fn validate_referred_connection_and_client(
       connection_minting_policy_id,
       connection_id,
     )
-  let (connection_input, remaining_inputs, client_may_precede_connection) =
-    find_connection_with_remaining_inputs(
-      reference_inputs,
-      connection_token,
-      client_minting_policy_id,
-      False,
-    )
+  expect Some(connection_input) =
+    find_authenticated_input(reference_inputs, connection_token)
   expect connection_datum: ConnectionDatum =
     get_inline_datum(connection_input.output)
-  let client_token =
-    expected_client_token(
+  (
+    connection_datum,
+    validate_referred_client(
+      reference_inputs,
       referrer_token_name,
-      client_minting_policy_id,
+      client_registry,
       connection_datum.state.client_id,
-    )
-
-  let client_search_inputs =
-    if client_may_precede_connection || !(connection_input.output.value
-      |> tokens(client_minting_policy_id)
-      |> dict.is_empty) {
-      reference_inputs
-    } else {
-      remaining_inputs
-    }
-  expect Some(client_input) =
-    find_authenticated_input(client_search_inputs, client_token)
-  expect client_datum: ClientDatum = get_inline_datum(client_input.output)
-
-  (connection_datum, client_datum)
+      current_time,
+      proof_height,
+      history_witness,
+    ),
+  )
 }
 
-fn find_connection_with_remaining_inputs(
-  inputs: List<Input>,
-  connection_token: AuthToken,
-  client_minting_policy_id: PolicyId,
-  client_may_precede_connection: Bool,
-) -> (Input, List<Input>, Bool) {
-  when inputs is {
-    [] -> fail @"Missing authenticated connection reference input"
-    [input, ..remaining_inputs] ->
-      if auth.contain_auth_token(input.output, connection_token) {
-        (input, remaining_inputs, client_may_precede_connection)
-      } else {
-        find_connection_with_remaining_inputs(
-          remaining_inputs,
-          connection_token,
-          client_minting_policy_id,
-          client_may_precede_connection || !(input.output.value
-            |> tokens(client_minting_policy_id)
-            |> dict.is_empty),
-        )
-      }
+pub fn verify_proof_envelope(
+  redeemers: Pairs<ScriptPurpose, Redeemer>,
+  verify_proof_policy_id: PolicyId,
+) -> VerifyProofEnvelope {
+  expect Some(raw) = pairs.get_first(redeemers, Mint(verify_proof_policy_id))
+  expect envelope: VerifyProofEnvelope = raw
+  envelope
+}
+
+/// Comparing the whole request binds every client payload, delay and IBC path
+/// without decoding the implementation's proof in core.
+pub fn proof_matches(actual: Data, expected: VerifyProofRedeemer) -> Bool {
+  let payload: Data = expected
+  actual == payload
+}
+
+fn authenticated_client_view(
+  output: Output,
+  registration: registry.ClientRegistration,
+  token: AuthToken,
+  current_time: Int,
+  proof_height: Option<Height>,
+  witness: Option<Data>,
+) -> ClientDatum {
+  // Legacy byte parameters authenticate the original policy-only deployment.
+  expect
+    registration.spend_validator == "" || output.address.payment_credential == Script(
+      registration.spend_validator,
+    )
+  let view =
+    registry.view(
+      registration,
+      get_inline_datum(output),
+      current_time,
+      proof_height,
+      witness,
+    )
+  expect view.token == token
+  view
+}
+
+/// Select the verifier from the same immutable registration used to authenticate
+/// the client reference. The fallback is only for legacy byte-valued parameters.
+pub fn client_proof_policy(
+  clients: Data,
+  client_id: ByteArray,
+  fallback: PolicyId,
+) -> PolicyId {
+  let registration = registry.for_client(clients, client_id)
+  registered_proof_policy(registration, fallback)
+}
+
+pub fn registered_proof_policy(
+  registration: registry.ClientRegistration,
+  fallback: PolicyId,
+) -> PolicyId {
+  if registration.proof_policy == "" {
+    fallback
+  } else {
+    registration.proof_policy
   }
 }
 
@@ -443,8 +501,17 @@ pub fn require_exact_marker_mint(
   )
 }
 
+/// Continuing state owns its existing value. ADA may be added to fund a larger
+/// datum, but no reserve may be swept and the non-ADA inventory must stay exact.
+pub fn preserves_state_value(spent_value: Value, updated_value: Value) -> Bool {
+  and {
+    assets.lovelace_of(updated_value) >= assets.lovelace_of(spent_value),
+    assets.expect_match_assets(updated_value, spent_value),
+  }
+}
+
 /// Finds the single updated state output for a spent state UTxO.
-/// The output must stay at the same validator address and carry the same auth token.
+/// It must retain its address, auth token, and value (allowing ADA top-ups).
 pub fn find_unique_continuation_output(
   spent_output: Output,
   outputs: List<Output>,
@@ -452,8 +519,8 @@ pub fn find_unique_continuation_output(
 ) -> Output {
   // The updated state output is identified by both its validator address and auth token.
   // This allows unrelated state UTxOs to share the same script address safely.
-  expect auth.contain_auth_token(spent_output, token)?
-
+  // The output token check plus exact inventory preservation authenticates
+  // the input token too; checking it again would duplicate work.
   expect [updated_output] =
     list.filter(
       outputs,
@@ -464,6 +531,7 @@ pub fn find_unique_continuation_output(
         )
       },
     )
+  expect preserves_state_value(spent_output.value, updated_output.value)
   updated_output
 }
 
@@ -575,31 +643,15 @@ pub fn require_host_state_thread(
   (host_input, host_output)
 }
 
-fn host_state_redeemer_matches(
-  redeemer: host_state_redeemer.HostStateRedeemer,
-  expected: ExpectedHostStateRedeemer,
-) -> Bool {
+// HostStateRedeemer constructor indices. The HostState validator decodes and
+// checks its whole redeemer, so a co-spending validator only selects the branch.
+fn host_state_redeemer_index(expected: ExpectedHostStateRedeemer) -> Int {
   when expected is {
-    ExpectUpdateClient ->
-      when redeemer is {
-        host_state_redeemer.UpdateClient { .. } -> True
-        _ -> False
-      }
-    ExpectUpdateConnection ->
-      when redeemer is {
-        host_state_redeemer.UpdateConnection { .. } -> True
-        _ -> False
-      }
-    ExpectUpdateChannel ->
-      when redeemer is {
-        host_state_redeemer.UpdateChannel { .. } -> True
-        _ -> False
-      }
-    ExpectHandlePacket ->
-      when redeemer is {
-        host_state_redeemer.HandlePacket { .. } -> True
-        _ -> False
-      }
+    ExpectUpdateClient -> 4
+    ExpectUpdateConnection -> 5
+    ExpectUpdateChannel -> 6
+    ExpectHandlePacket -> 7
+    ExpectUpgradeChannel -> 14
   }
 }
 
@@ -616,9 +668,10 @@ pub fn require_host_state_redeemer(
 
   expect Some(spent_host_state_redeemer) =
     pairs.get_first(redeemers, Spend(host_input.output_reference))
-  expect host_redeemer: host_state_redeemer.HostStateRedeemer =
-    spent_host_state_redeemer
-  expect host_state_redeemer_matches(host_redeemer, expected)?
+  expect
+    builtin.fst_pair(builtin.un_constr_data(spent_host_state_redeemer)) == host_state_redeemer_index(
+      expected,
+    )
 
   (host_input, host_output)
 }

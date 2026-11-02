@@ -1,8 +1,14 @@
-import { Injectable, OnModuleInit, Logger } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { HistoryConfigurationError, verifyHistoryCoverage } from '../../config/history-coverage';
+import type { BridgeManifest } from '../../config/bridge-manifest';
+import { Injectable, OnModuleInit, Logger, Optional } from '@nestjs/common';
 import { LucidService } from '../modules/lucid/lucid.service';
 import { IbcTreeStateStore } from '../helpers/ibc-state-root';
 import { CURRENT_IBC_TREE_CACHE_ID, IbcTreeCacheService, ibcTreeCacheIdForRoot } from './ibc-tree-cache.service';
 import { HostStateDatum } from '../types/host-state-datum';
+import { historicalReadOnly } from '../../security/historical-read-only.guard';
+import { YaciRestClient } from '../helpers/yaci-rest';
+import { YaciRestHistory } from '../helpers/yaci-rest-history';
 
 /**
  * TreeInitService - Initializes the IBC state tree on Gateway startup
@@ -25,12 +31,56 @@ export class TreeInitService implements OnModuleInit {
     private readonly lucidService: LucidService,
     private readonly ibcTreeCacheService: IbcTreeCacheService,
     private readonly ibcTreeStore: IbcTreeStateStore,
+    @Optional() private readonly config?: ConfigService,
   ) {}
 
   async onModuleInit() {
+    const manifest = this.config?.get<BridgeManifest>('bridgeManifest');
+    if (historicalReadOnly()) {
+      if (!manifest?.history) {
+        throw new HistoryConfigurationError(
+          'Historical read-only startup requires an explicit manifest with retained history and Yaci REST',
+        );
+      }
+      await verifyHistoryCoverage(
+        new YaciRestHistory(new YaciRestClient(this.config?.get<string>('yaciStoreEndpoint'))),
+        manifest,
+      );
+      await this.ibcTreeCacheService.ensureSchema();
+      this.logger.log(
+        'Historical read-only startup: bootstrap authenticated; each query must verify its canonical historical root. Transaction RPCs are disabled.',
+      );
+      return;
+    }
+    const seconds = Number(this.config?.get('BRIDGE_HISTORY_SYNC_TIMEOUT_SECONDS') ?? 7200);
+    if (!Number.isSafeInteger(seconds) || seconds <= 0 || seconds > 86400)
+      throw new Error('BRIDGE_HISTORY_SYNC_TIMEOUT_SECONDS must be between 1 and 86400');
+    const deadline = Date.now() + seconds * 1000;
+    for (;;) {
+      try {
+        await this.initializeTree();
+        return;
+      } catch (error) {
+        if (error instanceof HistoryConfigurationError || !manifest?.history || Date.now() >= deadline) throw error;
+        this.logger.warn(`Waiting for bridge history/providers and verified tree state: ${error.message}`);
+        await new Promise((resolve) => setTimeout(resolve, Math.min(10000, deadline - Date.now())));
+      }
+    }
+  }
+
+  private async initializeTree() {
     this.logger.log('Initializing IBC state tree from on-chain UTXOs...');
 
     try {
+      const manifest = this.config?.get<BridgeManifest>('bridgeManifest');
+      if (manifest && (manifest.history || [1, 2, 764824073].includes(manifest.cardano.network_magic))) {
+        const liveHost = await this.lucidService.findUtxoAtHostStateNFT(0n);
+        await verifyHistoryCoverage(
+          new YaciRestHistory(new YaciRestClient(this.config?.get<string>('yaciStoreEndpoint'))),
+          manifest,
+          liveHost,
+        );
+      }
       const cacheEnabled = process.env.IBC_TREE_CACHE_ENABLED !== 'false';
       if (cacheEnabled) {
         await this.ibcTreeCacheService.ensureSchema();
@@ -38,7 +88,7 @@ export class TreeInitService implements OnModuleInit {
         const cached = await this.ibcTreeCacheService.load(CURRENT_IBC_TREE_CACHE_ID);
         if (cached) {
           // Verify cached root against the authoritative on-chain HostState commitment.
-          const hostStateUtxo = await this.lucidService.findUtxoAtHostStateNFT();
+          const hostStateUtxo = await this.lucidService.findUtxoAtHostStateNFT(0n);
           if (!hostStateUtxo?.datum) {
             throw new Error('HostState UTXO has no datum - cannot verify cached tree');
           }
@@ -64,7 +114,11 @@ export class TreeInitService implements OnModuleInit {
 
       if (process.env.IBC_TREE_CACHE_ENABLED !== 'false') {
         try {
-          await this.ibcTreeCacheService.saveAliases(tree, [CURRENT_IBC_TREE_CACHE_ID, ibcTreeCacheIdForRoot(root)], hostState);
+          await this.ibcTreeCacheService.saveAliases(
+            tree,
+            [CURRENT_IBC_TREE_CACHE_ID, ibcTreeCacheIdForRoot(root)],
+            hostState,
+          );
           this.logger.log(`Persisted IBC state tree cache, root: ${root.substring(0, 16)}...`);
         } catch (error) {
           this.logger.warn(`Failed to persist IBC state tree cache: ${error?.message ?? error}`);
@@ -79,7 +133,9 @@ export class TreeInitService implements OnModuleInit {
       this.logger.error(`   - Kupo has indexed from the HostState deployment block`);
 
       // Throw error to prevent Gateway from starting with invalid state
-      throw new Error(`Tree initialization failed: ${error.message}`);
+      throw error instanceof HistoryConfigurationError
+        ? error
+        : new Error(`Tree initialization failed: ${error.message}`);
     }
   }
 }

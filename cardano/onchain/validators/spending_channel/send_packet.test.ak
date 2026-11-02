@@ -15,8 +15,9 @@ use ibc/apps/transfer/types/transfer_module_datum.{
 }
 use ibc/auth.{AuthToken}
 use ibc/client/ics_007_tendermint_client/height.{Height} as height_mod
-use ibc/core/ics_004/channel_datum.{ChannelDatum,
-  ChannelDatumState} as channel_datum_mod
+use ibc/core/ics_004/channel_datum.{
+  ChannelDatum, ChannelDatumState, initial_upgrade_state,
+} as channel_datum_mod
 use ibc/core/ics_004/channel_redeemer.{SendPacket}
 use ibc/core/ics_004/types/channel.{Channel}
 use ibc/core/ics_004/types/counterparty.{ChannelCounterparty}
@@ -105,6 +106,7 @@ fn check_send_packet_with_data(
       },
       connection_hops: [mock_data.connection_id],
       version: "mock-version",
+      upgrade_sequence: 0,
     }
 
   let input_channel_datum =
@@ -119,6 +121,7 @@ fn check_send_packet_with_data(
         packet_commitment: [],
         packet_receipt: [],
         packet_acknowledgement: [],
+        upgrade: initial_upgrade_state,
       },
       port_id: mock_data.port_id,
       token: mock_data.channel_token,
@@ -150,6 +153,7 @@ fn check_send_packet_with_data(
       datum: InlineDatum(
         TransferModuleDatum {
           escrow_shard_registry_root: updated_registry_root,
+          outstanding_voucher_obligation: 0,
         },
       ),
     }
@@ -221,7 +225,8 @@ fn check_send_packet_with_data(
       mock_data.channel_token,
     )
 
-  let transfer_escrow_shard_policy_id = "mock transfer escrow shard policy"
+  let transfer_escrow_shard_policy_id =
+    #"1fc07b7285ebac989308e56367ac72f2e1dd8087615a8417b68aefb2"
   let shard_token_name =
     transfer_escrow_shard.shard_token_name("channel-0", transfer_data.denom)
   let escrow_output =
@@ -233,6 +238,7 @@ fn check_send_packet_with_data(
         TransferEscrowDatum {
           channel_id: "channel-0",
           denom: transfer_data.denom,
+          escrowed_amount: 1000,
         },
       ),
       reference_script: None,
@@ -388,6 +394,7 @@ fn check_send_packet_with_data(
             mock_data.channel_minting_policy_id,
             "mock voucher policy",
             mock_data.host_state_nft_policy_id,
+            #"00000000000000000000000000000000000000000000000000000000",
             None,
             typed_module_redeemer,
             registered_module_input.output_reference,
@@ -395,6 +402,7 @@ fn check_send_packet_with_data(
           )?,
           minting_transfer_escrow_shard.mint_transfer_escrow_shard.mint(
             port_token,
+            #"00000000000000000000000000000000000000000000000000000000",
             shard_mint_redeemer,
             transfer_escrow_shard_policy_id,
             transaction,
@@ -413,6 +421,7 @@ fn check_send_packet_with_data(
       transaction,
     )?,
     spending_channel.spend_channel.spend(
+      #"",
       mock_data.chan_open_ack_policy_id,
       mock_data.chan_open_confirm_policy_id,
       mock_data.chan_close_init_policy_id,
@@ -422,6 +431,9 @@ fn check_send_packet_with_data(
       mock_data.timeout_packet_policy_id,
       mock_data.acknowledge_packet_policy_id,
       mock_data.prune_packet_history_policy_id,
+      mock_data.chan_upgrade_policy_id,
+      mock_data.chan_upgrade_handshake_policy_id,
+      mock_data.chan_upgrade_finish_policy_id,
       mock_data.host_state_nft_policy_id,
       Some(input_channel_datum),
       SendPacket { packet },

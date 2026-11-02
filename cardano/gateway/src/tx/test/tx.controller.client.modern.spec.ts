@@ -1,8 +1,10 @@
+import { PacketLaneService } from '../packet-lane.service';
 import { Test, TestingModule } from '@nestjs/testing';
 import { TxController } from '../tx.controller';
 import { ClientService } from '../client.service';
 import { ConnectionService } from '../connection.service';
 import { ChannelService } from '../channel.service';
+import { ChannelUpgradeService } from '../channel-upgrade.service';
 import { PacketService } from '../packet.service';
 import { SubmissionService } from '../submission.service';
 import { HostStateHeartbeatService } from '../host-state-heartbeat.service';
@@ -27,9 +29,11 @@ describe('TxController - Client (modern)', () => {
     const module: TestingModule = await Test.createTestingModule({
       controllers: [TxController],
       providers: [
+        { provide: PacketLaneService, useValue: {} },
         { provide: ClientService, useValue: clientServiceMock },
         { provide: ConnectionService, useValue: {} },
         { provide: ChannelService, useValue: {} },
+        { provide: ChannelUpgradeService, useValue: {} },
         { provide: PacketService, useValue: {} },
         { provide: SubmissionService, useValue: {} },
         { provide: HostStateHeartbeatService, useValue: {} },
@@ -55,9 +59,7 @@ describe('TxController - Client (modern)', () => {
     const request = { signer: '' } as any;
     clientServiceMock.createClient.mockRejectedValue(new Error('Invalid constructed address: Signer is not valid'));
 
-    await expect(controller.CreateClient(request)).rejects.toThrow(
-      'Invalid constructed address: Signer is not valid',
-    );
+    await expect(controller.CreateClient(request)).rejects.toThrow('Invalid constructed address: Signer is not valid');
   });
 
   it('delegates UpdateClient to ClientService and returns its response', async () => {

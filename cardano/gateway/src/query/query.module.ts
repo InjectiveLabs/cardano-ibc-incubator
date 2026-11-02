@@ -7,9 +7,9 @@ import { KupoModule } from '../shared/modules/kupo/kupo.module';
 import { HISTORY_SERVICE } from './services/history.service';
 import { ConnectionService } from './services/connection.service';
 import { ChannelService } from './services/channel.service';
+import { PacketStateService } from './services/packet-state.service';
 import { PacketService } from './services/packet.service';
 import { MiniProtocalsService } from '../shared/modules/mini-protocals/mini-protocals.service';
-import { MithrilModule } from '../shared/modules/mithril/mithril.module';
 import { DenomTraceService } from './services/denom-trace.service';
 import { HealthModule } from '../health/health.module';
 import { BridgeManifestService } from './services/bridge-manifest.service';
@@ -17,9 +17,10 @@ import { GatewayReadinessService } from './services/gateway-readiness.service';
 import { YaciHistoryService } from './services/yaci-history.service';
 import { IbcTreeCacheService } from '../shared/services/ibc-tree-cache.service';
 import { IbcTreeModule } from '../shared/modules/ibc-tree/ibc-tree.module';
+import { MithrilModule } from '../shared/modules/mithril/mithril.module';
 
 @Module({
-  imports: [LucidModule, KupoModule, MithrilModule, HealthModule, IbcTreeModule],
+  imports: [LucidModule, KupoModule, HealthModule, IbcTreeModule, MithrilModule],
   controllers: [QueryController, GatewayReadinessController],
   providers: [
     QueryService,
@@ -34,6 +35,7 @@ import { IbcTreeModule } from '../shared/modules/ibc-tree/ibc-tree.module';
     ConnectionService,
     ChannelService,
     PacketService,
+    PacketStateService,
     DenomTraceService,
     BridgeManifestService,
     IbcTreeCacheService,
@@ -45,6 +47,7 @@ import { IbcTreeModule } from '../shared/modules/ibc-tree/ibc-tree.module';
     ConnectionService,
     ChannelService,
     PacketService,
+    PacketStateService,
     DenomTraceService,
     BridgeManifestService,
     IbcTreeCacheService,

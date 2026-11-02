@@ -20,4 +20,6 @@ pub type MintVoucherRedeemer {
     data: FungibleTokenPacketData,
     acknowledgement: Option<Acknowledgement>,
   }
+  ReclaimMetadata
+  PacketBatch
 }

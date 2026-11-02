@@ -7,18 +7,34 @@ import {
 } from './managed-cardano-endpoints';
 
 type OgmiosPoint = { slot: number; id: string };
-type SlotConfig = { zeroTime: number; zeroSlot: number; slotLength: number };
+export type SlotConfig = { zeroTime: number; zeroSlot: number; slotLength: number };
+
+/**
+ * Lucid converts a POSIX validity bound to its enclosing slot. Plutus observes
+ * the beginning of that slot as the finite upper bound, not the original
+ * millisecond value passed to `validTo`.
+ */
+const ledgerVisibleValidityUpperBoundMs = (validToTimeMs: number, slotConfig: SlotConfig): number => {
+  if (
+    !Number.isSafeInteger(validToTimeMs) ||
+    !Number.isSafeInteger(slotConfig.zeroTime) ||
+    !Number.isSafeInteger(slotConfig.zeroSlot) ||
+    !Number.isSafeInteger(slotConfig.slotLength) ||
+    slotConfig.slotLength <= 0
+  ) {
+    throw new Error('Invalid Cardano validity upper bound or slot configuration');
+  }
+  const enclosingSlot = Math.floor((validToTimeMs - slotConfig.zeroTime) / slotConfig.slotLength) + slotConfig.zeroSlot;
+  return slotConfig.zeroTime + (enclosingSlot - slotConfig.zeroSlot) * slotConfig.slotLength;
+};
 
 const querySystemStart = async (ogmiosUrl: string) => {
-  const resolvedUrl =
-    resolveManagedOgmiosHttpEndpoint(ogmiosUrl, process.env.OGMIOS_API_KEY) ?? ogmiosUrl;
+  const resolvedUrl = resolveManagedOgmiosHttpEndpoint(ogmiosUrl, process.env.OGMIOS_API_KEY) ?? ogmiosUrl;
   const response = await fetch(resolvedUrl, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
-      ...(process.env.OGMIOS_API_KEY
-        ? { 'dmtr-api-key': process.env.OGMIOS_API_KEY }
-        : {}),
+      ...(process.env.OGMIOS_API_KEY ? { 'dmtr-api-key': process.env.OGMIOS_API_KEY } : {}),
     },
     body: JSON.stringify({
       jsonrpc: '2.0',
@@ -44,6 +60,21 @@ const querySystemStart = async (ogmiosUrl: string) => {
   const parsedSystemTime = Date.parse(systemStart);
 
   return parsedSystemTime;
+};
+
+// Custom networks can use sub-second slots. Read their timing from the node.
+const queryLocalSlotConfig = async (ogmiosUrl: string): Promise<SlotConfig> => {
+  const [zeroTime, genesis] = await Promise.all([
+    querySystemStart(ogmiosUrl),
+    ogmiosRequest<{ slotLength: { milliseconds: number | bigint } }>(
+      ogmiosUrl, 'queryNetwork/genesisConfiguration', { era: 'shelley' },
+    ),
+  ]);
+  const slotLength = Number(genesis?.slotLength?.milliseconds);
+  if (!Number.isSafeInteger(zeroTime) || !Number.isSafeInteger(slotLength) || slotLength <= 0) {
+    throw new Error('Ogmios returned invalid local slot timing');
+  }
+  return { zeroTime, zeroSlot: 0, slotLength };
 };
 
 const queryNetworkTipPoint = async (ogmiosUrl: string): Promise<OgmiosPoint | 'origin'> => {
@@ -73,6 +104,7 @@ const computeLedgerAnchoredValidityWindow = async (
   validFromTime: number;
   validToSlot: number;
   validToTime: number;
+  slotConfig: SlotConfig;
 }> => {
   if (!Number.isFinite(slotConfig.zeroTime) || !Number.isFinite(slotConfig.slotLength) || slotConfig.slotLength <= 0) {
     throw new Error('Invalid Cardano slot configuration');
@@ -86,10 +118,23 @@ const computeLedgerAnchoredValidityWindow = async (
   // beyond Ogmios' era forecast horizon (`PastHorizon`).
   const currentLedgerTime =
     slotConfig.zeroTime + (currentSlot - slotConfig.zeroSlot) * slotConfig.slotLength;
-  const ttlSlots = Math.max(1, Math.ceil(ttlMs / slotConfig.slotLength));
+  let ttlSlots = Math.max(1, Math.ceil(ttlMs / slotConfig.slotLength));
+  if (slotConfig.slotLength < 1000) {
+    const eras = await ogmiosRequest<Array<{ parameters: { safeZone: number | null } }>>(
+      ogmiosUrl, 'queryLedgerState/eraSummaries', {},
+    );
+    const safeZone = eras.at(-1)?.parameters?.safeZone;
+    if (typeof safeZone !== 'number' || !Number.isSafeInteger(safeZone) || safeZone < 2) {
+      throw new Error('Ogmios returned no forecast safe zone for sub-second slots');
+    }
+    // Leave time for transaction construction and submission inside the forecast.
+    ttlSlots = Math.min(ttlSlots, Math.floor(safeZone / 2));
+  }
   const validToSlot = currentSlot + ttlSlots;
-  const validToTime =
-    slotConfig.zeroTime + (validToSlot + 1 - slotConfig.zeroSlot) * slotConfig.slotLength - 1;
+  // Lucid floors POSIX bounds to their enclosing slot, and Plutus observes
+  // the beginning of that slot. Return that exact ledger-visible time rather
+  // than the end of the same slot.
+  const validToTime = slotConfig.zeroTime + (validToSlot - slotConfig.zeroSlot) * slotConfig.slotLength;
   const backdateMs = Math.max(0, options?.backdateMs ?? 0);
   const validFromTime = Math.max(slotConfig.zeroTime, currentLedgerTime - backdateMs);
 
@@ -99,6 +144,7 @@ const computeLedgerAnchoredValidityWindow = async (
     validFromTime,
     validToSlot,
     validToTime,
+    slotConfig,
   };
 };
 
@@ -108,12 +154,8 @@ const queryTransactionInclusionBlockHeight = async (
   fromPoint: OgmiosPoint | 'origin',
   timeoutMs: number = 60000,
 ): Promise<number> => {
-  const resolvedUrl =
-    resolveManagedOgmiosWsEndpoint(ogmiosUrl, process.env.OGMIOS_API_KEY) ?? ogmiosUrl;
-  const client = new WebSocket(
-    resolvedUrl,
-    resolveManagedOgmiosWsOptions(ogmiosUrl, process.env.OGMIOS_API_KEY),
-  );
+  const resolvedUrl = resolveManagedOgmiosWsEndpoint(ogmiosUrl, process.env.OGMIOS_API_KEY) ?? ogmiosUrl;
+  const client = new WebSocket(resolvedUrl, resolveManagedOgmiosWsOptions(ogmiosUrl, process.env.OGMIOS_API_KEY));
   const txHashLower = txHash.toLowerCase();
   // Start from the pre-submit point when available so the inclusion scan only watches
   // the block window that could actually contain the submitted transaction.
@@ -226,8 +268,10 @@ const getNanoseconds = (date: string): number => {
 
 export {
   querySystemStart,
+  queryLocalSlotConfig,
   queryTransactionInclusionBlockHeight,
   computeLedgerAnchoredValidityWindow,
+  ledgerVisibleValidityUpperBoundMs,
   sleep,
   getNanoseconds,
 };

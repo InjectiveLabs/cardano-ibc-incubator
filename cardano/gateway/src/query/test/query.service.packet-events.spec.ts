@@ -1,3 +1,4 @@
+import { createPacketStateMock } from '../../shared/testing/packet-state-test-mock';
 import { createTestTreeStore } from '../../shared/testing/ibc-tree-test-store';
 import { Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
@@ -6,7 +7,6 @@ import { ATTRIBUTE_KEY_PACKET, CHANNEL_TOKEN_PREFIX, EVENT_TYPE_PACKET } from '.
 import { KupoService } from '../../shared/modules/kupo/kupo.service';
 import { LucidService } from '../../shared/modules/lucid/lucid.service';
 import { MiniProtocalsService } from '../../shared/modules/mini-protocals/mini-protocals.service';
-import { MithrilService } from '../../shared/modules/mithril/mithril.service';
 import { IbcTreeCacheService } from '../../shared/services/ibc-tree-cache.service';
 import { DenomTraceService } from '../services/denom-trace.service';
 import { HistoryService } from '../services/history.service';
@@ -63,6 +63,7 @@ describe('QueryService packet event queries', () => {
         if (key !== 'deployment') return undefined;
         return {
           hostStateNFT,
+          packetState: { state: { scriptHash: 'lane-policy' }, laneCount: 16 },
           validators: {
             mintChannelStt: {
               scriptHash: mintChannelScriptHash,
@@ -75,7 +76,7 @@ describe('QueryService packet event queries', () => {
     historyServiceMock = {
       findTxByHash: jest.fn(),
       findUtxosByBlockNo: jest.fn(),
-      findUtxosByPolicyIdAndPrefixTokenName: jest.fn(),
+      findUtxosByPolicyIdAndPrefixTokenName: jest.fn().mockResolvedValue([]),
     };
 
     lucidServiceMock = {
@@ -89,10 +90,10 @@ describe('QueryService packet event queries', () => {
       {} as KupoService,
       historyServiceMock as unknown as HistoryService,
       {} as MiniProtocalsService,
-      {} as MithrilService,
       {} as DenomTraceService,
       {} as IbcTreeCacheService,
       createTestTreeStore(),
+      createPacketStateMock() as any,
     );
   });
 

@@ -26,7 +26,7 @@ The implementation adheres to the [inter-blockchain communication protocol](http
 - [Getting Started](#getting-started)
 - [Testing Against Cosmos Chains](#testing-against-cosmos-chains)
 - [Demo: Direct Cosmos Routes](#demo-direct-cosmos-routes)
-- [Demo: Cross-chain Token Swap](#demo-cross-chain-token-swap)
+- [Demo: Cross-chain Token Transfer](#demo-cross-chain-token-transfer)
 - [Additional Resources](#additional-resources)
 - [Contributing](#contributing)
 
@@ -34,12 +34,12 @@ The implementation adheres to the [inter-blockchain communication protocol](http
 
 | Area | Status | Notes |
 | --- | --- | --- |
-| Local devnet stack | Active | Managed through `caribic` with Cardano, Hermes, Kupo, Ogmios, and Yaci-backed history services |
+| Local devnet stack | Active | `caribic` provisions five Cardano producers through Yaci DevKit |
 | Core IBC semantics | Active | Implements clients, connections, channels, packets, acknowledgements, and timeouts |
-| ICS-20 transfer path | Active for local direct routes | Local Cardano-to-Osmosis, Cardano-to-Injective, and pinned ibc-go v8/v10 Classic profiles use direct channels; IBC v2 route testing is deferred |
+| ICS-20 transfer path | Local: `v8-classic` | Other local profiles need shared clock integration |
 | Historical query backend | Active | Uses `Yaci Store + Bridge Projection` rather than a generic `db-sync` query surface |
 | Public network integrations | Pre-production | Select paths exist for public testnets and external Cardano services, but the operating model is still evolving |
-| Mithril light client and local setup | Deprecated / disabled | Not maintained for new deployments; source is retained only for historical reference and type compatibility |
+| Local Mithril | Active | The local network runs a Mithril aggregator and two signers, which certify the stake that local clients bootstrap from |
 | Production deployment | Not recommended | This repository should be treated as pre-production software |
 
 ## Trust Model & Security Considerations
@@ -47,17 +47,29 @@ The implementation adheres to the [inter-blockchain communication protocol](http
 
 There are currently protocol-level constraints that prevent IBC-style state proofs of Cardano, for example UTxO inclusion proofs. A valuable conversation on that topic can be found here: [CIP-0165 (Canonical Ledger State)](https://github.com/cardano-foundation/CIPs/pull/1083).
 
-The maintained Cardano-native approach uses a proprietary STT architecture plus the experimental `08-cardano-probabilistic` light client to attain an analogous IBC state machine in Cardano semantics. The STT architecture over the IBC host state keyspace functions as an authenticated mutex for IBC host state mutation, while the probabilistic light client authenticates accepted Cardano history through configured settlement heuristics. This model is documented in [Probabilistic Light Client Design](docs/probabilistic-light-client.md).
+The Cardano-native approach uses a bespoke Single Token Thread (STT) architecture alongside the `08-cardano-probabilistic` light client to attain an analogous IBC state machine in Cardano semantics. The STT architecture over the IBC host state keyspace functions as an authenticated mutex for IBC host state mutation, where each authenticated mutation is tied to a corresponding merkle root of IBC state, while the probabilistic light client authenticates accepted Cardano history through configured settlement heuristics. This model is documented more deeply at [Probabilistic Light Client Design](docs/probabilistic-light-client.md).
+
+A Cardano state root is only accepted once enough independent stake has built blocks on top of the block that carries it. The client needs at least 24 descendant blocks, at least 5 qualifying pools, and at least 5.11% of stake from those pools, and pools registered too recently do not count toward the last two.
+
+![Blocks stacking on an anchor block while depth, pool, and stake thresholds fill](docs/assets/mechanics/finality-thresholds.gif)
+
+24 blocks is a minimum, not a guarantee. If most blocks come from a few large pools, or from pools registered too recently to count, depth can reach 24 before enough independent pools and stake have taken part. In this run the root is only accepted at block 30.
+
+![The same thresholds taking 30 blocks to fill because most blocks come from a few large pools and newly registered pools](docs/assets/mechanics/finality-thresholds-slow.gif)
 
 The verifier checks the structure and internal consistency of submitted block witnesses, but canonical block history and epoch context currently come from configured observer data. Safety therefore depends on those data sources, tuned acceptance parameters, and an honest observer or relayer surfacing conflicting context; this is an explicit trust assumption of the current pre-production design.
 
-The older Mithril light client and local Mithril setup are deprecated, disabled, and not maintained. They remain in the repository only for historical design reference and protobuf/type compatibility.
+The light client itself never makes a network call. The Gateway gathers everything it needs from named sources, Hermes carries it inside `MsgUpdateClient`, and the Go module verifies block hashes, pool signatures, VRF proofs, and leader eligibility from the submitted bytes alone. The epoch context (stake distribution and epoch nonce) is the part it takes on trust. The animation shows exactly what the Gateway and Hermes ask each service for, first to build a light-client header and then to build, check, and submit a Cardano transaction.
+
+![Hermes, the Gateway, and the Cardano data services, showing the exact call made to each service and the header or transaction field it fills](docs/assets/mechanics/gateway-data-sources.gif)
+
+The older Mithril light client, `08-cardano-mithril`, has been removed. Mithril now certifies the stake distributions of the probabilistic client.
 
 ## Overview
 The repository is organized around these main areas:
 
 - `cardano`: Cardano on-chain validators, off-chain deployment code, and the Gateway.
-- `cosmos`: The [standalone async-ICQ host](cosmos/async-icq-v10/README.md), [dormant VesselOracle module](cosmos/vesseloracle-v10/README.md), shared Cardano light-client core, ibc-go v8 and v10 adapters, and preserved deprecated Mithril module. The v8 adapter targets Cosmos SDK 0.50; the async-ICQ host, VesselOracle, v10 adapters, and Mithril module target Cosmos SDK 0.53.
+- `cosmos`: The [standalone async-ICQ host](cosmos/async-icq-v10/README.md), [dormant VesselOracle module](cosmos/vesseloracle-v10/README.md), shared Cardano light-client core, and ibc-go v8 and v10 adapters. The v8 adapter targets Cosmos SDK 0.50; the async-ICQ host, VesselOracle, and v10 adapters target Cosmos SDK 0.53.
 - `proto-types`: Shared protobuf contracts and generated TypeScript bindings, including the [dormant VesselOracle integration contract](docs/vesseloracle.md).
 - `relayer`: A [Hermes](https://hermes.informal.systems/) fork with a native Cardano `ChainEndpoint` implementation.
 - `caribic`: The CLI for configuring, starting, stopping, and testing the local bridge stack.
@@ -68,86 +80,25 @@ The repository is organized around these main areas:
 
 ## Architecture
 
-```mermaid
-flowchart LR
-  subgraph Client["Client Layer"]
-    UI["Frontend UI"]
-    UW["User Wallet"]
-  end
+![Architecture: users, Hermes and the Cosmos chain on top, the Cardano Gateway and Cardano data services in the middle, and the Cardano chain with its on-chain validators at the bottom](docs/assets/mechanics/architecture.png)
 
-  subgraph Gateway["Cardano Gateway"]
-    TX["Tx Service"]
-    QUERY["Query Service"]
-    LUCID["Lucid Service"]
-    TRACE["Denom Trace Service"]
-  end
+Gateway reads chain history directly through Yaci Store's native REST API. Yaci follows a Cardano node and keeps its database private. Indexed asset and address history locate the transactions needed for proofs. Gateway reads their raw blocks on demand to check validity and reconstruct historical state. It rechecks the requested block before returning a proof. Gateway keeps application and proof caches but does not copy Yaci's chain tables. On public networks Blockfrost supplies older epoch and pool history. See the [REST history contract](docs/yaci-rest-history.md) for provider requirements.
 
-  subgraph OnChain["On-Chain Validators"]
-    HOST["host_state_stt.ak"]
-    CH_SEND["spending_channel/<br/>send_packet.ak"]
-    CH_RECV["spending_channel/<br/>recv_packet.ak"]
-    CH_ACK["spending_channel/<br/>acknowledge_packet.ak"]
-    CH_TIMEOUT["spending_channel/<br/>timeout_packet.ak"]
-    TRANSFER["spending_transfer_module.ak"]
-    VOUCHER["minting_voucher.ak"]
-    TRACE_REGISTRY["trace_registry.ak"]
-  end
+![Yaci Store exposing REST while its database stays private, with Gateway reading history directly through REST](docs/assets/mechanics/yaci-store.gif)
 
-  subgraph CardanoInfra["Cardano Infrastructure"]
-    NODE["cardano-node"]
-    KUPO["Kupo"]
-    HISTORY["Yaci / DB History<br/>+ Probabilistic Witnesses"]
-  end
+All of the bridge's IBC state lives in one Merkle tree whose root sits in the HostState datum. Cardano validators check every update to that root, the light client carries it to Cosmos in an authenticated header, and each record is then proven against it with an ICS-23 membership proof. No step relies on trusting the Gateway or Hermes.
 
-  subgraph Relay["Relay and Counterparty"]
-    HERMES["Hermes Relayer"]
-    COSMOS["Counterparty Chain"]
-  end
+The tree still uses a 64-bit route from `sha256(key)`. Distinct keys with the same route share a collision bucket containing their full key hashes and value hashes in sorted order. An update proves the complete old bucket and changes only its own record. Membership and absence proofs carry the same bucket. Empty positions and positions with one record retain their previous hashes and ordinary 64-step proofs.
 
-  UI -->|"build unsigned transfer request"| TX
-  UW -->|"sign unsigned tx"| UI
-  TX -->|"assemble tx body"| LUCID
-  LUCID -->|"uses validators in tx scripts"| HOST
-  LUCID -->|"send-packet validation"| CH_SEND
-  LUCID -->|"recv-packet validation"| CH_RECV
-  LUCID -->|"ack-packet validation"| CH_ACK
-  LUCID -->|"timeout-packet validation"| CH_TIMEOUT
-  LUCID -->|"uses validators in tx scripts"| TRANSFER
-  LUCID -->|"uses validators in tx scripts"| VOUCHER
-  LUCID -->|"trace-registry updates"| TRACE_REGISTRY
+A bucket witness adds `1 + 64m` bytes for `m` records before the usual 64 siblings. There is no fixed record-count limit in the bucket format. Cardano transaction and execution limits still bound an individual update. Route collisions no longer prevent records from coexisting. For `n` uniformly hashed keys the expected number of colliding route pairs is `n(n-1) / 2^65`. That is about `2.7e-8` at one million keys and `0.027` at one billion keys. These route collisions are handled by buckets. Distinguishing keys still assumes that SHA-256 full key hashes do not collide. Collision witnesses require both the Cardano validators and the Cosmos proof verifiers to support this format before they are used.
 
-  HERMES -->|"submit signed tx"| NODE
-  HERMES -->|"recv/ack/timeout calls"| TX
-  HERMES <-->|"IBC packets and proofs"| COSMOS
-
-  QUERY -->|"UTxO and datum reads"| KUPO
-  QUERY -->|"history and witness queries"| HISTORY
-  TX -->|"denom trace planning"| TRACE
-  TRACE -->|"read registry UTxOs"| KUPO
-  TRACE -->|"build on-chain updates"| LUCID
-
-  NODE -->|"chain indexing feed"| KUPO
-  NODE -->|"chain history feed"| HISTORY
-
-  classDef client fill:#e8f1ff,stroke:#2b5cab,color:#0f172a
-  classDef gateway fill:#e9f8ee,stroke:#2f7d4a,color:#0b1f14
-  classDef onchain fill:#fff4e5,stroke:#a05a00,color:#2b1a00
-  classDef infra fill:#f2f4f7,stroke:#4a5568,color:#111827
-  classDef relay fill:#fdecef,stroke:#b4233d,color:#3a0f16
-
-  class UI,UW client
-  class TX,QUERY,LUCID,TRACE gateway
-  class HOST,CH_SEND,CH_RECV,CH_ACK,CH_TIMEOUT,TRANSFER,VOUCHER,TRACE_REGISTRY onchain
-  class NODE,KUPO,HISTORY infra
-  class HERMES,COSMOS relay
-```
+![A root update enforced by the HostState validator, authenticated by the light client, and used to prove a single record](docs/assets/mechanics/ibc-state-root.gif)
 
 Additional architecture diagrams:
 
 - Gateway escrow flow: `cardano/gateway/README.md#sendpacket-escrow-flow`
 - Denom trace lifecycle: `docs/denom-trace-mapping.md`
 - Probabilistic light client: `docs/probabilistic-light-client.md`
-- Deprecated Mithril proof flow: `docs/mithril-light-client.md#mithril-proof-flow-for-relaying`
 - Diagram index: `docs/architecture-overview.md`
 
 ### Relayer Implementation (Hermes)
@@ -234,14 +185,14 @@ The following components are required to run the project:
 
 - [Docker](https://docs.docker.com/get-docker/)
 - [Aiken](https://aiken-lang.org/installation-instructions)
-- [Node.js](https://nodejs.org/en/download/) `>= v20.0.0`
-- [deno](https://docs.deno.com/runtime/manual/getting_started/installation)
+- [Node.js](https://nodejs.org/en/download/) `>= v22.13.0`
+- [deno](https://docs.deno.com/runtime/manual/getting_started/installation) 2.7 or newer, required for the offchain evaluator dependency override
 - [golang](https://golang.org/doc/install)
 - [Rust & Cargo](https://www.rust-lang.org/tools/install)
 
 #### Verify Prerequisites
 
-To check Docker, Aiken, Deno, Go, and the Linux-native Hermes build toolchain when applicable:
+To check Docker, Docker Compose, Python, Aiken, Deno, Go, and the Linux-native Hermes build toolchain when applicable:
 
 ```sh
 cd caribic
@@ -259,14 +210,13 @@ This project uses Docker containers that require platform-specific images depend
 - **ARM64 (Apple Silicon, M1/M2/M3 Macs)**: Ensure images specify `platform: linux/arm64`
 - **AMD64/x86_64 (Intel/AMD processors)**: Use `platform: linux/amd64` or omit the platform (defaults to AMD64)
 
-The `chains/cardano/docker-compose.yaml` file includes platform specifications where needed. If you're running on a different architecture or encounter compatibility issues, you may need to adjust these platform settings accordingly.
+Local Cardano images are pinned in `chains/cardano/devkit/Dockerfile` and `chains/cardano/devkit/compose.yaml`.
 
 ### Running a local Cardano network
 
-To start the Cardano node, Ogmios, Kupo, and Yaci-backed history services locally, run the maintained default stack.
+Local Cardano uses Yaci DevKit. See the [Caribic guide](caribic/README.md#local-cardano-network) for migration, startup timing and current limitations.
 
-> [!WARNING]
-> Mithril setup is deprecated, disabled, and not maintained. Do not use `caribic start --with-mithril` or `caribic start mithril` for new deployments. The Mithril sources and compose files remain only for historical reference and compatibility with old types.
+The local network includes a Mithril aggregator and two signers, which certify the Cardano stake distributions that probabilistic clients bootstrap from. Public networks use the public Mithril aggregators instead.
 
 Before using the CLI, build and install `caribic` locally:
 
@@ -300,7 +250,7 @@ adapter:
 | Profile | Chain ID | Semantics | Current compatibility testing |
 | --- | --- | --- | --- |
 | `v8-classic` | `v8-classic-1` | IBC Classic | Enabled |
-| `v10-classic` | `v10-classic-1` | IBC Classic | Enabled |
+| `v10-classic` | `v10-classic-1` | IBC Classic | Waiting for local clock integration |
 | `v10-v2` | `v10-v2-1` | IBC v2 | Deferred |
 
 Here, Classic identifies the IBC v1 and ICS-20 v1 workflow, not identical packet
@@ -340,83 +290,28 @@ Direct routes require explicit target-chain support:
 - Operators must create direct Cardano clients, connections, and channels for each target chain.
 - ICQ flows require the target chain to enable the relevant ICQ host/query module.
 
-The reusable transfer route setup command targets the selected chain directly:
+The migrated local network currently pairs with Cosmos `v8-classic`:
 
 ```sh
-caribic setup route --from cardano --to osmosis --to-network local
-caribic setup route --from cardano --to injective --to-network local
 caribic setup route --from cardano --to cosmos --to-network v8-classic
-caribic setup route --from cardano --to cosmos --to-network v10-classic
 ```
 
-## Demo: Cross-chain token swap
+## Demo: Cross-chain token transfer
 
-`caribic demo token-swap` now uses direct Cardano-to-target channels. The local Osmosis demo provisions the swap pool/contracts and executes a direct Cardano-to-Osmosis wasm-hook swap with a direct return leg. The local Injective demo exercises the direct token-transfer legs used by the swap path.
-
-For local Osmosis:
+Local demos currently use Cosmos `v8-classic`.
 
 ```sh
-caribic start --clean
-caribic chain start --chain osmosis --network local
-caribic setup route --from cardano --to osmosis --to-network local
-caribic demo token-swap --chain osmosis --network local
-```
-
-For local Injective:
-
-```sh
-caribic start --clean
-caribic chain start --chain injective --network local
-caribic setup route --from cardano --to injective --to-network local
-caribic demo token-swap --chain injective --network local
-```
-
-For either pinned Classic compatibility profile:
-
-```sh
-caribic start --clean
+caribic start
 caribic chain start --chain cosmos --network v8-classic
 caribic setup route --from cardano --to cosmos --to-network v8-classic
-caribic demo token-swap --chain cosmos --network v8-classic
+caribic demo token-transfer --chain cosmos --network v8-classic
 ```
-
-Replace `v8-classic` with `v10-classic` throughout to test v10 Classic.
-`v10-v2` is selectable for chain lifecycle commands, while its route and
-token-swap compatibility tests deliberately fail fast with a deferred-testing
-message until the IBC v2 phase begins.
-
-If client creation fails with an unsupported client type, the selected target chain still needs the Cardano light client registered and allowed before direct routing can work.
 
 ## Useful commands for local networks
 
 #### Local account configuration
 
-`caribic` generates the local Cardano account material in `config.json` the first time it runs. By default, it can be found at `<USER_HOME>/.caribic/config.json`.
-
-
-#### Register a new stake pool on the local Cardano blockchain
-```sh
-cd chains/cardano && ./regis-spo.sh <name>
-```
-
-Example:
-
-```sh
-cd chains/cardano && ./regis-spo.sh alice
-```
-
-#### Retire a stake pool on the local Cardano blockchain
-This sends a transaction to retire the pool in the next epoch:
-
-```sh
-cd chains/cardano && ./deregis-spo.sh <name>
-```
-
-Example:
-
-```sh
-cd chains/cardano && ./deregis-spo.sh alice
-```
+Configure funding addresses in `cardano.bootstrap_addresses`.
 
 #### Test IBC primitives and lifecycles
 

@@ -1,3 +1,5 @@
+import { PacketLaneService } from '../tx/packet-lane.service';
+import { HistoricalReadOnlyGuard } from '../security/historical-read-only.guard';
 import {
   BadRequestException,
   Body,
@@ -10,13 +12,9 @@ import {
   Post,
   Query,
   UseFilters,
+  UseGuards,
 } from '@nestjs/common';
-import {
-  EstimateLocalOsmosisSwapDto,
-  MsgtransferDto,
-  PlanTransferRouteDto,
-  PrunePacketHistoryDto,
-} from './api.dto';
+import { EstimateLocalOsmosisSwapDto, MsgtransferDto, PlanTransferRouteDto, PrunePacketHistoryDto } from './api.dto';
 import {
   CheqdDidDocIcqRequestDto,
   CheqdDidDocVersionIcqRequestDto,
@@ -82,6 +80,7 @@ export class ApiController {
     private readonly bridgeManifestService: BridgeManifestService,
     private readonly queryService: QueryService,
     private readonly cheqdIcqService: CheqdIcqService,
+    private readonly packetLaneService: PacketLaneService,
   ) {}
 
   @Get('channels')
@@ -154,34 +153,36 @@ export class ApiController {
   }
 
   @Post('transfer')
+  @UseGuards(HistoricalReadOnlyGuard)
   @HttpCode(200)
   async buildTransferMsg(@Body() msgtransferDto: MsgtransferDto) {
     const request = MsgTransfer.fromJSON(msgtransferDto);
-    const response = await this.packetService.sendPacket(request);
+    const response = await this.packetLaneService.admit(request);
 
     return this.serializeUnsignedTxResponse(response);
   }
 
   @Post('packet-history/prune')
+  @UseGuards(HistoricalReadOnlyGuard)
   @HttpCode(200)
   async buildPrunePacketHistory(@Body() dto: PrunePacketHistoryDto) {
-    const response = await this.packetService.prunePacketHistory(
-      validateAndFormatPrunePacketHistoryParams({
-        signer: dto.signer,
-        port_id: dto.port_id,
-        channel_id: dto.channel_id,
-        sequence: BigInt(dto.sequence),
-        proof_commitment_absence: Buffer.from(dto.proof_commitment_absence, 'base64'),
-        proof_height: {
-          revision_number: BigInt(dto.proof_height.revision_number),
-          revision_height: BigInt(dto.proof_height.revision_height),
-        },
-      }),
-    );
+    const request = {
+      signer: dto.signer,
+      port_id: dto.port_id,
+      channel_id: dto.channel_id,
+      sequence: BigInt(dto.sequence),
+      proof_commitment_absence: Buffer.from(dto.proof_commitment_absence, 'base64'),
+      proof_height: {
+        revision_number: BigInt(dto.proof_height.revision_number),
+        revision_height: BigInt(dto.proof_height.revision_height),
+      },
+    };
+    const response = await this.packetService.prunePacketHistory(validateAndFormatPrunePacketHistoryParams(request));
     return this.serializeUnsignedTxResponse(response);
   }
 
   @Post('icq/cheqd/did-doc')
+  @UseGuards(HistoricalReadOnlyGuard)
   @HttpCode(200)
   async buildCheqdDidDocIcq(@Body() requestDto: CheqdDidDocIcqRequestDto) {
     const response = await this.cheqdIcqService.buildDidDocQuery(requestDto);
@@ -202,6 +203,7 @@ export class ApiController {
   }
 
   @Post('icq/cheqd/did-doc-version')
+  @UseGuards(HistoricalReadOnlyGuard)
   @HttpCode(200)
   async buildCheqdDidDocVersionIcq(@Body() requestDto: CheqdDidDocVersionIcqRequestDto) {
     const response = await this.cheqdIcqService.buildDidDocVersionQuery(requestDto);
@@ -222,6 +224,7 @@ export class ApiController {
   }
 
   @Post('icq/cheqd/did-doc-versions-metadata')
+  @UseGuards(HistoricalReadOnlyGuard)
   @HttpCode(200)
   async buildCheqdDidDocVersionsMetadataIcq(@Body() requestDto: CheqdDidDocIcqRequestDto) {
     const response = await this.cheqdIcqService.buildAllDidDocVersionsMetadataQuery(requestDto);
@@ -242,6 +245,7 @@ export class ApiController {
   }
 
   @Post('icq/cheqd/resource')
+  @UseGuards(HistoricalReadOnlyGuard)
   @HttpCode(200)
   async buildCheqdResourceIcq(@Body() requestDto: CheqdResourceIcqRequestDto) {
     const response = await this.cheqdIcqService.buildResourceQuery(requestDto);
@@ -262,6 +266,7 @@ export class ApiController {
   }
 
   @Post('icq/cheqd/resource-metadata')
+  @UseGuards(HistoricalReadOnlyGuard)
   @HttpCode(200)
   async buildCheqdResourceMetadataIcq(@Body() requestDto: CheqdResourceIcqRequestDto) {
     const response = await this.cheqdIcqService.buildResourceMetadataQuery(requestDto);
@@ -282,6 +287,7 @@ export class ApiController {
   }
 
   @Post('icq/cheqd/latest-resource-version')
+  @UseGuards(HistoricalReadOnlyGuard)
   @HttpCode(200)
   async buildCheqdLatestResourceVersionIcq(@Body() requestDto: CheqdLatestResourceVersionIcqRequestDto) {
     const response = await this.cheqdIcqService.buildLatestResourceVersionQuery(requestDto);
@@ -302,6 +308,7 @@ export class ApiController {
   }
 
   @Post('icq/cheqd/latest-resource-version-metadata')
+  @UseGuards(HistoricalReadOnlyGuard)
   @HttpCode(200)
   async buildCheqdLatestResourceVersionMetadataIcq(@Body() requestDto: CheqdLatestResourceVersionIcqRequestDto) {
     const response = await this.cheqdIcqService.buildLatestResourceVersionMetadataQuery(requestDto);
@@ -383,10 +390,7 @@ export class ApiController {
   }
 
   @Get('cardano/channels/:channelId/health')
-  async getCardanoChannelHealth(
-    @Param('channelId') channelId: string,
-    @Query('port_id') portId = 'transfer',
-  ) {
+  async getCardanoChannelHealth(@Param('channelId') channelId: string, @Query('port_id') portId = 'transfer') {
     return this.channelService.getChannelHealth(channelId, portId);
   }
 

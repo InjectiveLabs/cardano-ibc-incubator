@@ -61,6 +61,9 @@ const deploymentConfig = {
     hostStateStt: buildValidator('host-state', 22),
   },
   modules: {
+    transfer: {
+      address: 'addr_test1_transfer',
+    },
     mock: {
       address: 'addr_test1_mock',
     },
@@ -83,6 +86,9 @@ const createService = (txBuilder: ChainableTxBuilder): any => {
   const service: any = Object.create(LucidService.prototype);
 
   service.configService = {
+    getOrThrow(name: string) {
+      return this.get(name);
+    },
     get: jest.fn().mockReturnValue(deploymentConfig),
   };
   service.lucid = {
@@ -91,6 +97,7 @@ const createService = (txBuilder: ChainableTxBuilder): any => {
   service.referenceScripts = {
     spendChannel: buildRefUtxo('ref-spend-channel', 0),
     spendMockModule: buildRefUtxo('ref-spend-mock-module', 1),
+    spendTransferModule: buildRefUtxo('ref-spend-transfer-module', 6),
     channelOpenConfirm: buildRefUtxo('ref-channel-open-confirm', 2),
     verifyProof: buildRefUtxo('ref-verify-proof', 3),
     hostStateStt: buildRefUtxo('ref-host-state', 4),
@@ -107,8 +114,11 @@ const createService = (txBuilder: ChainableTxBuilder): any => {
 };
 
 describe('LucidService channel open confirm wiring', () => {
-  it('loads confirm and packet-history-prune reference script out-refs from deployment config', () => {
+  it('loads confirm and packet-history-prune reference script out-refs from deployment config', async () => {
     const configService = {
+      getOrThrow(name: string) {
+        return this.get(name);
+      },
       get: jest.fn().mockReturnValue(deploymentConfig),
     };
 
@@ -126,11 +136,11 @@ describe('LucidService channel open confirm wiring', () => {
     );
   });
 
-  it('uses the confirm and verify-proof refs when building ChannelOpenConfirm transactions', () => {
+  it('uses the confirm and verify-proof refs when building ChannelOpenConfirm transactions', async () => {
     const txBuilder = createChainedTxBuilder();
     const service = createService(txBuilder);
 
-    service.createUnsignedChannelOpenConfirmTransaction({
+    await service.createUnsignedChannelOpenConfirmTransaction({
       hostStateUtxo: { txHash: 'host-state-utxo', outputIndex: 0, assets: {}, datum: 'host-datum' } as any,
       encodedHostStateRedeemer: 'encoded-host-redeemer',
       encodedUpdatedHostStateDatum: 'encoded-host-datum',
@@ -174,53 +184,70 @@ describe('LucidService channel open confirm wiring', () => {
     );
   });
 
-  it('uses the close-confirm and verify-proof refs when building ChannelCloseConfirm transactions', () => {
-    const txBuilder = createChainedTxBuilder();
-    const service = createService(txBuilder);
+  it.each(['mock', 'transfer'] as const)(
+    'preserves the %s module when building ChannelCloseConfirm transactions',
+    async (moduleKey) => {
+      const txBuilder = createChainedTxBuilder();
+      const service = createService(txBuilder);
+      const moduleUtxo = {
+        txHash: 'module-utxo',
+        outputIndex: 0,
+        assets: { lovelace: 5_000_000n, 'port-token': 1n, 'module-token': 1n, 'locked-token': 10n },
+        datum: 'original-module-datum',
+      };
 
-    service.referenceScripts.channelCloseConfirm = buildRefUtxo('ref-channel-close-confirm', 5);
+      service.referenceScripts.channelCloseConfirm = buildRefUtxo('ref-channel-close-confirm', 5);
 
-    service.createUnsignedChannelCloseConfirmTransaction({
-      hostStateUtxo: { txHash: 'host-state-utxo', outputIndex: 0, assets: {}, datum: 'host-datum' } as any,
-      encodedHostStateRedeemer: 'encoded-host-redeemer',
-      encodedUpdatedHostStateDatum: 'encoded-host-datum',
-      channelUtxo: { txHash: 'channel-utxo', outputIndex: 0, assets: {} } as any,
-      connectionUtxo: { txHash: 'connection-utxo', outputIndex: 0, assets: {} } as any,
-      clientUtxo: { txHash: 'client-utxo', outputIndex: 0, assets: {} } as any,
-      moduleKey: 'mock',
-      moduleUtxo: { txHash: 'mock-utxo', outputIndex: 0, assets: { lovelace: 2_000_000n } } as any,
-      encodedSpendChannelRedeemer: 'encoded-channel-redeemer',
-      encodedSpendModuleRedeemer: 'encoded-mock-redeemer',
-      channelTokenUnit: 'channel-token-unit',
-      channelToken: { policyId: 'channel-policy-id', name: 'channel-token-name' },
-      encodedUpdatedChannelDatum: 'encoded-channel-datum',
-      encodedNewMockModuleDatum: 'encoded-mock-datum',
-      constructedAddress: 'addr_test1operator',
-      channelCloseConfirmPolicyId: 'chan-close-confirm-policy-id',
-      verifyProofPolicyId: 'verify-proof-policy-id',
-      encodedVerifyProofRedeemer: 'encoded-verify-proof-redeemer',
-    });
+      await service.createUnsignedChannelCloseConfirmTransaction({
+        hostStateUtxo: { txHash: 'host-state-utxo', outputIndex: 0, assets: {}, datum: 'host-datum' } as any,
+        encodedHostStateRedeemer: 'encoded-host-redeemer',
+        encodedUpdatedHostStateDatum: 'encoded-host-datum',
+        channelUtxo: { txHash: 'channel-utxo', outputIndex: 0, assets: {} } as any,
+        connectionUtxo: { txHash: 'connection-utxo', outputIndex: 0, assets: {} } as any,
+        clientUtxo: { txHash: 'client-utxo', outputIndex: 0, assets: {} } as any,
+        moduleKey,
+        moduleUtxo,
+        encodedSpendChannelRedeemer: 'encoded-channel-redeemer',
+        encodedSpendModuleRedeemer: 'encoded-mock-redeemer',
+        channelTokenUnit: 'channel-token-unit',
+        channelToken: { policyId: 'channel-policy-id', name: 'channel-token-name' },
+        encodedUpdatedChannelDatum: 'encoded-channel-datum',
+        encodedNewMockModuleDatum: 'encoded-mock-datum',
+        constructedAddress: 'addr_test1operator',
+        channelCloseConfirmPolicyId: 'chan-close-confirm-policy-id',
+        verifyProofPolicyId: 'verify-proof-policy-id',
+        encodedVerifyProofRedeemer: 'encoded-verify-proof-redeemer',
+      });
 
-    expect(txBuilder.readFrom).toHaveBeenCalledWith([
-      service.referenceScripts.spendChannel,
-      service.referenceScripts.spendMockModule,
-      service.referenceScripts.channelCloseConfirm,
-      service.referenceScripts.verifyProof,
-      service.referenceScripts.hostStateStt,
-    ]);
-    expect(txBuilder.mintAssets).toHaveBeenNthCalledWith(
-      1,
-      {
-        'chan-close-confirm-policy-id': 1n,
-      },
-      'encoded-auth-token',
-    );
-    expect(txBuilder.mintAssets).toHaveBeenNthCalledWith(
-      2,
-      {
-        'verify-proof-policy-id': 1n,
-      },
-      'encoded-verify-proof-redeemer',
-    );
-  });
+      expect(txBuilder.readFrom).toHaveBeenCalledWith([
+        service.referenceScripts.spendChannel,
+        moduleKey === 'transfer'
+          ? service.referenceScripts.spendTransferModule
+          : service.referenceScripts.spendMockModule,
+        service.referenceScripts.channelCloseConfirm,
+        service.referenceScripts.verifyProof,
+        service.referenceScripts.hostStateStt,
+      ]);
+      expect(txBuilder.collectFrom).toHaveBeenCalledWith([moduleUtxo], 'encoded-mock-redeemer');
+      expect(txBuilder.pay.ToContract).toHaveBeenCalledWith(
+        deploymentConfig.modules[moduleKey].address,
+        { kind: 'inline', value: moduleUtxo.datum },
+        moduleUtxo.assets,
+      );
+      expect(txBuilder.mintAssets).toHaveBeenNthCalledWith(
+        1,
+        {
+          'chan-close-confirm-policy-id': 1n,
+        },
+        'encoded-auth-token',
+      );
+      expect(txBuilder.mintAssets).toHaveBeenNthCalledWith(
+        2,
+        {
+          'verify-proof-policy-id': 1n,
+        },
+        'encoded-verify-proof-redeemer',
+      );
+    },
+  );
 });

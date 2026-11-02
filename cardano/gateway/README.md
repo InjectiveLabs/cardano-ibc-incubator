@@ -1,48 +1,32 @@
-<p align="center">
-  <a href="http://nestjs.com/" target="blank"><img src="https://nestjs.com/img/logo-small.svg" width="200" alt="Nest Logo" /></a>
-</p>
+# Cardano Gateway
 
-[circleci-image]: https://img.shields.io/circleci/build/github/nestjs/nest/master?token=abc123def456
-[circleci-url]: https://circleci.com/gh/nestjs/nest
+The Gateway is a NestJS/TypeScript service that exposes IBC query and transaction
+building APIs for Cardano. It queries chain data, prepares proofs and unsigned
+transactions with Lucid Evolution, and tracks confirmed IBC state updates. Hermes
+validates and signs relayer transactions before submitting them to Ogmios.
 
-  <p align="center">A progressive <a href="http://nodejs.org" target="_blank">Node.js</a> framework for building efficient and scalable server-side applications.</p>
-    <p align="center">
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/v/@nestjs/core.svg" alt="NPM Version" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/l/@nestjs/core.svg" alt="Package License" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/dm/@nestjs/common.svg" alt="NPM Downloads" /></a>
-<a href="https://circleci.com/gh/nestjs/nest" target="_blank"><img src="https://img.shields.io/circleci/build/github/nestjs/nest/master" alt="CircleCI" /></a>
-<a href="https://coveralls.io/github/nestjs/nest?branch=master" target="_blank"><img src="https://coveralls.io/repos/github/nestjs/nest/badge.svg?branch=master#9" alt="Coverage" /></a>
-<a href="https://discord.gg/G7Qnnhy" target="_blank"><img src="https://img.shields.io/badge/discord-online-brightgreen.svg" alt="Discord"/></a>
-<a href="https://opencollective.com/nest#backer" target="_blank"><img src="https://opencollective.com/nest/backers/badge.svg" alt="Backers on Open Collective" /></a>
-<a href="https://opencollective.com/nest#sponsor" target="_blank"><img src="https://opencollective.com/nest/sponsors/badge.svg" alt="Sponsors on Open Collective" /></a>
-  <a href="https://paypal.me/kamilmysliwiec" target="_blank"><img src="https://img.shields.io/badge/Donate-PayPal-ff3f59.svg"/></a>
-    <a href="https://opencollective.com/nest#sponsor"  target="_blank"><img src="https://img.shields.io/badge/Support%20us-Open%20Collective-41B883.svg" alt="Support us"></a>
-  <a href="https://twitter.com/nestframework" target="_blank"><img src="https://img.shields.io/twitter/follow/nestframework.svg?style=social&label=Follow"></a>
-</p>
-  <!--[![Backers on Open Collective](https://opencollective.com/nest/backers/badge.svg)](https://opencollective.com/nest#backer)
-  [![Sponsors on Open Collective](https://opencollective.com/nest/sponsors/badge.svg)](https://opencollective.com/nest#sponsor)-->
+Packet deployments retain `packet-lanes-v1` and require `receipt_storage: "merkle-history-v1"` in their manifest. Receipts and acknowledgement hashes remain in the lane's Merkle tree while their datum fields stay empty. The Gateway rebuilds proofs from canonical raw transactions retained by Yaci and checks every continuation root. Keep that history available when restarting or moving the Gateway. This requires fresh Cardano scripts and deployment artifacts. Changing a manifest marker does not migrate existing contracts. The Go light-client modules and packet proof format are unchanged. ICS-20 lanes retain receipts and acknowledgements permanently and cannot be pruned. The separate legacy channel format still supports authenticated cleanup for other application ports.
 
-## Description
+Packet trees adapt the existing incremental SQLite tree to share immutable nodes between lane versions. Clones copy root pointers. A changed leaf updates its 64 ancestors and a separate numeric sequence index. Historical queries preserve the latest checkpoint and concurrent requests for the same version share reconstruction. Packet lists paginate through the sequence index. Snapshot queries read canonical lane metadata without building Merkle trees.
 
-[Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
+The cache defaults to in-memory SQLite. Set `PACKET_LANE_HISTORY_DB` to a file in an existing writable directory to retain nodes and checkpoints across restarts. Use a local cache file per Gateway. Saved checkpoints are checked against canonical blocks and their original lane outputs before reuse. The cache is disposable and can be rebuilt from Yaci history. Retained versions consume disk space as history grows.
 
 ## Published Container Image
 
-The Cardano Gateway image is published to GitHub Container Registry after Gateway-relevant changes are merged to `main`.
+The shared [image workflow](../../.github/workflows/publish.yaml) publishes same-repository PR images to the configured private registry. Fork and Dependabot PRs build without publishing or registry credentials. Ordinary merges to `main` do not publish images.
 
-```bash
-docker pull ghcr.io/cardano-foundation/cardano-ibc-incubator/cardano-gateway:main
-```
+Public Gateway releases use Git tags such as `gateway/v2.0.2`, matching the version in `package.json`. The tag must point to a commit already on `main`. The published image is named `cardano-ibc-gateway` and its Docker tag omits the `gateway/` prefix, for example `v2.0.2`. The GitHub Release lists the published public image references, digests and pull commands.
 
-Published tags:
+The exact tagged commit must have a successful `main` CI run. Every built image is smoke-tested before publishing, including PR images and builds without publishing. Gateway startup uses isolated test databases and a synthetic devnet fixture. Hermes runs its version and offline configuration checks. The swap client serves its runtime configuration, page and static assets. For example, repeat the gateway check locally with `node scripts/ci/image-smoke.mjs gateway cardano-ibc-gateway:latest` and Docker running.
 
-- `main`: latest image built from the `main` branch
-- `sha-<commit>`: immutable image for a specific commit
-- `v*`: release tag image when a matching Git tag is pushed
+Release publishing refuses to overwrite an existing version in any registry. Deploy using the `image@sha256:...` reference from the release, and keep the previous digest for rollback. If only GitHub Release creation fails, rerun that failed job. A partially published image release needs recovery from the existing digest, not another build over the same version.
+
+A repository administrator must import [the release tag ruleset](../../.github/release-tag-ruleset.json) in Settings → Rules → Rulesets to prevent component tags from being moved or deleted. The file alone does not activate protection. Registry administrators should also enable immutable release tags where supported and restrict public image writers. The workflow's preflight checks do not prevent another publisher racing a push.
 
 Published images include tracked bridge manifests at `/usr/src/app/manifests`.
-For example, set `BRIDGE_MANIFEST_PATH=/usr/src/app/manifests/preprod/cardano-preprod-bridge-manifest.json`
-to start the Gateway against the shared Cardano preprod bridge deployment.
+For example, set `BRIDGE_MANIFEST_PATH=/usr/src/app/manifests/preview/cardano-preview-bridge-manifest.json`
+to start the Gateway against the shared Cardano Preview bridge deployment.
+Preview is the only bundled bridge deployment; Preprod requires an operator-supplied compatible manifest or a fresh deployment.
 Tagged GitHub releases also attach a `cardano-gateway-manifests-<tag>.tar.gz`
 archive containing the same tracked manifest files.
 
@@ -86,9 +70,8 @@ sequenceDiagram
 
 Related diagrams:
 
-- System architecture: `../../README.md#architecture-at-a-glance`
+- [System architecture](../../README.md#architecture)
 - Denom trace lifecycle: `../../docs/denom-trace-mapping.md`
-- Mithril proof flow: `../../docs/mithril-light-client.md#mithril-proof-flow-for-relaying`
 
 ## Bridge Discovery Manifest
 
@@ -100,47 +83,62 @@ The strict ICS-20 Classic JSON codec also changes the transfer-module and vouche
 
 ## Historical Backend
 
-The Gateway's historical Cardano reads now go through the Yaci-backed bridge history service.
+The Gateway reads historical Cardano data directly through Yaci REST. Historical proof reconstruction uses indexed asset and address transaction history and raw block CBOR on demand. It does not copy chain tables into PostgreSQL or run a history import worker. Gateway's existing database continues to hold application state and derived caches.
 
-`HISTORY_DB_*` is the Gateway's database config surface for the historical backend.
+`YACI_STORE_ENDPOINT` selects the native REST base URL. `GATEWAY_DB_*` configures application storage. The provider must retain the manifest checkpoint and subsequent historical outputs, spends and raw blocks. [Provider requirements and query mapping](../../docs/yaci-rest-history.md) describe the API contract.
+
+Proof-backed consensus history requires Node.js 22.13 or newer and retained Yaci REST history and raw block CBOR. `CONSENSUS_HISTORY_CACHE_DIR` selects the writable, disposable per-client SQLite cache directory (default `.consensus-history`); deleting it triggers authenticated chain replay, not loss of on-chain history. `CONSENSUS_HISTORY_MAX_OPEN_INDEXES` bounds open caches (default `64`), and `CONSENSUS_HISTORY_TIMEOUT_MS` bounds bootstrap discovery and live-provider waits (default `30000`).
+
+The Docker image sets `CONSENSUS_HISTORY_CACHE_DIR` to `/var/lib/cardano-ibc/consensus-history` and creates that directory for the unprivileged `node` user. Docker Compose mounts the `consensus-history` named volume there, so the SQLite indexes survive Gateway container replacement. SQLite runs inside the Gateway; it does not need a separate service.
+
+For deployments outside this Compose file, mount a persistent volume at the same path. A new Docker named volume inherits the directory's ownership from the image. An existing volume or host bind mount must be writable by the image's `node` user (UID/GID `1000:1000`). Removing the volume, including with `docker compose down --volumes`, discards the caches and requires replay from retained Yaci REST history.
+
+The public IBC tree has a separate cache: in-memory trees and compressed snapshots in the Gateway PostgreSQL table `ibc_state_tree_cache`. If a proof query requests a past height whose snapshot is missing or invalid, the Gateway reconstructs the tree from retained Yaci outputs and spends at that block. It includes historical client consensus leaves, connections, channels, packet state and port registrations, then verifies the result against the historical HostState root before serving the proof. The verified snapshot is cached by root and HostState output reference; rebuilding it does not replace the live transaction-building tree. This uses the existing databases and needs no additional container or volume.
+
+Historical public-tree reconstruction discovers NFT outputs and their consumers through indexed Yaci REST queries from deployment creation through the requested block. The bridge projection or a current UTxO snapshot alone is insufficient. Reconstruction pins and rechecks a REST block anchor, excludes failed/orphaned transactions and future outputs/spends, and checks for a rollback before returning. Incomplete history or a root mismatch stops the proof request; restore the provider's retained history before retrying. Concurrent requests for the same height and HostState share a rebuild, with at most four different rebuilds in progress and a 30-second timeout per REST request. The first request after cache loss takes longer as history grows.
+
+Public manifests and public handler startup require `history.format: "cardano-history-v1"`, an explicit replay checkpoint and the original HostState creation output. Startup verifies retained deployment history before restoring/rebuilding the tree, and waits for providers and verified tree state before serving requests.
 
 ## Cardano Data Plane
 
 The Gateway now uses two Cardano data planes with different responsibilities:
 
-- Live data plane: `Ogmios + Kupo + Mithril`
-- Historical data plane: `Yaci Store + bridge-specific projection`
+- Live data plane: `Ogmios + Kupo`
+- Historical data plane: `Yaci REST`
 
-The Yaci-backed projection is the Gateway's authoritative history backend. It stores the bridge-specific evidence the Gateway needs instead of querying a generic historical Cardano schema directly.
-
-Current bridge history tables include:
-
-- `bridge_tx_history`: light tx summary by block/slot
-- `bridge_tx_evidence`: tx CBOR, tx body CBOR, decoded redeemers, HostState evidence
-- `bridge_utxo_history`: historical bridge-relevant UTxOs by asset and block
-- `bridge_spo_event_history`: historical SPO register/unregister markers
-- `bridge_pool_registration_cache`: first-registration slots for stake pools used by stability scoring
+Historical queries use Yaci's native block, transaction, asset and address endpoints. Raw blocks authenticate transaction bodies and validity. Historical public roots and private consensus roots must match their on-chain commitments before a proof is returned. PostgreSQL holds application state and the external pool-registration cache. No chain table mirror or bridge projection is required.
 
 So the runtime split is:
 
 - use `Ogmios` for live chain progression and exact inclusion tracking
 - use `Kupo` for current live UTxO state
-- use `Mithril` for certified Cardano state roots / heights
 - use `Yaci` for historical bridge state and tx evidence
 
 Stake-weighted stability also needs a pool-age lookup because active pools can have registered long before a bridge
-deployment checkpoint. The Gateway first uses `bridge_pool_registration_cache`, then local Yaci registration tables, then
-the optional `CARDANO_POOL_REGISTRATION_HISTORY_ENDPOINT` for cache misses. Preprod and preview default that endpoint to
-Koios so a checkpointed stack can resolve old pool registrations without replaying the full chain history.
-
-Stake-weighted stability uses Koios via `CARDANO_EPOCH_PARAMS_ENDPOINT` for epoch nonces because Demeter Ogmios
-endpoints consistently time out after 20 seconds on `queryLedgerState/nonces`. If Koios rate limits the public tier, set
-`CARDANO_KOIOS_API_KEY` (or `KOIOS_API_KEY`) and Gateway will send it as `Authorization: Bearer <token>` on Koios calls.
+deployment checkpoint. The Gateway first uses `gateway_pool_registration_cache`, then Yaci REST pool registration history checked against raw block certificates, then
+Blockfrost pool updates for cache misses. Public-network epoch nonces, stake snapshots and historical pool registrations
+also come from Blockfrost. Set `CARDANO_BLOCKFROST_PROJECT_ID` for the hosted API. The local devnet instead uses its
+own Ogmios data and the HTTP epoch provider configured by `CARDANO_EPOCH_PARAMS_ENDPOINT`. Direct nonce reads from Yaci PostgreSQL are no longer supported.
 
 ## Installation
 
+From the repository root, build the local packages before installing the Gateway. Their compiled output is generated locally.
+
 ```bash
-$ npm install
+npm ci --prefix proto-types
+npm run --prefix proto-types build
+for package in cardano-ibc-planner cardano-ibc-tx-builder cardano-ibc-trace-registry cardano-ibc-tx-builder-runtime
+do
+  npm ci --prefix "packages/$package"
+  npm run --prefix "packages/$package" build
+done
+rm -rf packages/cardano-ibc-planner/node_modules
+for package in cardano-ibc-tx-builder cardano-ibc-trace-registry cardano-ibc-tx-builder-runtime
+do
+  npm ci --prefix "packages/$package" --omit=dev
+done
+cd cardano/gateway
+npm ci
 ```
 
 ## Running the app
@@ -197,6 +195,20 @@ recomputes the confirmed transaction-body hash, verifies its HostState root agai
 pending update created while building that transaction, and only then commits the update and
 returns the inclusion height and events. Signed CBOR is not part of this RPC contract.
 
+### API request limits
+
+HTTP and RPC handlers share a per-process limit of `100` requests per second and `8`
+simultaneous requests. Set `GATEWAY_API_RATE_LIMIT` and `GATEWAY_API_MAX_CONCURRENT` to
+positive integers to tune these limits. The rate limit allows a burst of one second's budget
+and refills continuously. Excess requests receive HTTP `429` or gRPC `RESOURCE_EXHAUSTED`
+without starting the handler. There is no waiting queue. A disconnected request keeps its
+concurrency slot until its handler finishes.
+
+Query RPCs and REST remain accessible without a token. These limits do not bound the cost of
+a single proof or reserve capacity for Hermes. Keep the Gateway on a trusted network or put
+public endpoints behind a proxy with authentication and per-client limits. The optional
+`GRPC_AUTH_TOKEN_FILE` still protects only transaction-building and submission RPCs.
+
 ## Test
 
 ```bash
@@ -210,16 +222,14 @@ $ npm run test:e2e
 $ npm run test:cov
 ```
 
-## Support
+## Support and contributing
 
-Nest is an MIT-licensed open source project. It can grow thanks to the sponsors and support by the amazing backers. If you'd like to join them, please [read more here](https://docs.nestjs.com/support).
-
-## Stay in touch
-
-- Author - [Kamil Myśliwiec](https://kamilmysliwiec.com)
-- Website - [https://nestjs.com](https://nestjs.com/)
-- Twitter - [@nestframework](https://twitter.com/nestframework)
+Report bugs and request features through the repository's
+[issue tracker](https://github.com/cardano-foundation/cardano-ibc-incubator/issues).
+See the [contribution guidelines](../../CONTRIBUTING.md) for development guidance
+and the [security policy](../../SECURITY.md) for private vulnerability reports.
 
 ## License
 
-Nest is [MIT licensed](LICENSE).
+The Cardano Gateway is part of the Cardano IBC Incubator and is licensed under
+[Apache-2.0](../../LICENSE).

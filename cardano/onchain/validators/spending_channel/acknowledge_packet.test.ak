@@ -10,14 +10,15 @@ use ibc/client/ics_007_tendermint_client/client_datum.{
 use ibc/client/ics_007_tendermint_client/consensus_state.{ConsensusState}
 use ibc/client/ics_007_tendermint_client/height.{Height} as height_mod
 use ibc/client/ics_007_tendermint_client/types/verify_proof_redeemer.{
-  VerifyMembership,
+  VerifyMembership, VerifyProofEnvelope,
 }
 use ibc/core/ics_003_connection_semantics/connection_datum.{ConnectionDatum}
 use ibc/core/ics_003_connection_semantics/types/connection_end.{ConnectionEnd}
 use ibc/core/ics_003_connection_semantics/types/counterparty.{Counterparty} as conn_counterparty_mod
 use ibc/core/ics_003_connection_semantics/verify as verify_mod
-use ibc/core/ics_004/channel_datum.{ChannelDatum,
-  ChannelDatumState} as channel_datum_mod
+use ibc/core/ics_004/channel_datum.{
+  ChannelDatum, ChannelDatumState, initial_upgrade_state,
+} as channel_datum_mod
 use ibc/core/ics_004/channel_redeemer.{AcknowledgePacket}
 use ibc/core/ics_004/types/acknowledgement as acknowledgement_mod
 use ibc/core/ics_004/types/channel.{Channel}
@@ -80,6 +81,7 @@ fn check_acknowledge_packet(
       },
       connection_hops: [mock_data.connection_id],
       version: "mock-version",
+      upgrade_sequence: 0,
     }
 
   let input_channel_datum =
@@ -94,6 +96,7 @@ fn check_acknowledge_packet(
         packet_commitment: [],
         packet_receipt: [],
         packet_acknowledgement: [],
+        upgrade: initial_upgrade_state,
       },
       port_id: mock_data.port_id,
       token: mock_data.channel_token,
@@ -324,17 +327,20 @@ fn check_acknowledge_packet(
   let commit_ack = acknowledgement_mod.commit_acknowledgement(acknowledgement)
 
   let verify_proof_redeemer: Redeemer =
-    VerifyMembership {
-      cs: client_datum_state.client_state,
-      cons_state: consensus_state,
-      height: proof_height,
-      processed_time: 0,
-      processed_height: 0,
-      delay_time_period: time_delay,
-      delay_block_period: block_delay,
-      proof: proof_acked,
-      path: merkle_path,
-      value: commit_ack,
+    VerifyProofEnvelope {
+      history_witness: None,
+      proof: VerifyMembership {
+        cs: client_datum_state.client_state,
+        cons_state: consensus_state,
+        height: proof_height,
+        processed_time: 0,
+        processed_height: 0,
+        delay_time_period: time_delay,
+        delay_block_period: block_delay,
+        proof: proof_acked,
+        path: merkle_path,
+        value: commit_ack,
+      },
     }
 
   let acknowledge_packet_redeemer: Redeemer = mock_data.channel_token

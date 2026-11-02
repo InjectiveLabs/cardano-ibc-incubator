@@ -1,6 +1,7 @@
 import { ConfigService } from '@nestjs/config';
-import { querySystemStart, queryTransactionInclusionBlockHeight } from '../../helpers/time';
+import { queryLocalSlotConfig, queryTransactionInclusionBlockHeight } from '../../helpers/time';
 import { Network } from '@lucid-evolution/lucid';
+import { createScalusEvaluator } from '@lucid-evolution/scalus-uplc';
 import { applyDoubleCborEncoding } from '@lucid-evolution/utils';
 import { gatewayDiagnostics } from '../../helpers/gateway-diagnostics';
 import {
@@ -72,6 +73,7 @@ const NON_RETRYABLE_RUNTIME_PROVIDER_ERROR_MARKERS = [
   'validationerror',
   'validator returned false',
 ];
+const OGMIOS_PLUTUS_SCRIPT_DECODE_ERROR_MARKER = "couldn't decode plutus script";
 
 function requireConfigString(configService: ConfigService, key: string): string {
   const value = configService.get<unknown>(key);
@@ -167,10 +169,8 @@ function mapOgmiosCostModels(plutusCostModels: unknown): Record<string, number[]
     mappedModels[lucidName] = toCostModelArray(rawModel as unknown[] | Record<string, unknown>);
   }
 
-  for (const [ogmiosName, lucidName] of modelNames.slice(0, 2)) {
-    if (mappedModels[lucidName].length === 0) {
-      throw new Error(`Ogmios protocol parameters response is missing a non-empty ${ogmiosName} cost model`);
-    }
+  if (Object.values(mappedModels).every((model) => model.length === 0)) {
+    throw new Error('Ogmios protocol parameters response is missing a non-empty Plutus cost model');
   }
 
   return mappedModels;
@@ -259,6 +259,9 @@ export function mapOgmiosProtocolParameters(result: any): any {
     throw new Error('Ogmios protocol parameters response is missing result');
   }
 
+  if (result.version?.major !== 11) {
+    throw new Error('Cardano protocol version 11 is required');
+  }
   const coinsPerUtxoByte = result.utxoCostPerByte ?? result.minUtxoDepositCoefficient;
   if (coinsPerUtxoByte === undefined || coinsPerUtxoByte === null) {
     throw new Error('Ogmios protocol parameters response is missing utxoCostPerByte/minUtxoDepositCoefficient');
@@ -438,6 +441,39 @@ function summarizeError(error: unknown): string {
     return 'Unknown error';
   }
   return uniqueSignals.slice(0, 4).join(' | ');
+}
+
+function isOgmiosPlutusScriptDecodeError(error: unknown): boolean {
+  const signals = collectErrorSignals(error).map((signal) => signal.toLowerCase());
+  return signals.some((signal) => signal.includes(OGMIOS_PLUTUS_SCRIPT_DECODE_ERROR_MARKER)) ||
+    // Ogmios 7 can collapse a rejected Plutus reference-script decoder to this
+    // JSON-RPC error. The caller only retries when script references were supplied;
+    // the node must still resolve them and successfully evaluate the transaction.
+    (signals.some((signal) => signal.includes('-32600')) &&
+      signals.some((signal) => signal.includes('invalid request: empty.')));
+}
+
+export async function evaluateTxWithOgmiosScriptRefFallback<T>(
+  evaluateTx: (additionalUTxOs?: any[]) => Promise<T>,
+  additionalUTxOs?: any[],
+): Promise<T> {
+  try {
+    return await evaluateTx(additionalUTxOs);
+  } catch (error) {
+    const scriptRefUtxos = additionalUTxOs?.filter((utxo) => Boolean(utxo?.scriptRef)) ?? [];
+    if (!isOgmiosPlutusScriptDecodeError(error) || scriptRefUtxos.length === 0) {
+      throw error;
+    }
+
+    // Ogmios can reject newer builtins while decoding explicitly supplied scripts even though
+    // the current ledger protocol accepts the same scripts. Keep ordinary additional UTxOs, but
+    // let the node resolve confirmed reference scripts from its canonical ledger view.
+    const ledgerResolvedUtxos = additionalUTxOs?.filter((utxo) => !utxo?.scriptRef) ?? [];
+    console.warn(
+      `[Kupmios.evaluateTx] Ogmios could not decode ${scriptRefUtxos.length} explicitly supplied Plutus script-reference UTxO(s); retrying with those references resolved from the ledger`,
+    );
+    return await evaluateTx(ledgerResolvedUtxos);
+  }
 }
 
 function hasTransientHttpStatus(normalizedSignals: string[]): boolean {
@@ -920,10 +956,16 @@ export const LucidClient = {
       provider.evaluateTx = async (tx: string, additionalUTxOs?: any[]) => {
         try {
           return await retryRuntimeProviderOperation(
-            () => originalEvaluateTx(tx, additionalUTxOs),
+            // Staged transactions consume outputs of earlier, not-yet-submitted
+            // links. Preserve these inputs when asking the node to evaluate them.
+            () => evaluateTxWithOgmiosScriptRefFallback(
+              (inputs) => originalEvaluateTx(tx, inputs),
+              additionalUTxOs,
+            ),
             'Kupmios.evaluateTx',
           );
         } catch (error) {
+          gatewayDiagnostics.record('evaluateTx-body', () => ({ txCbor: tx }));
           gatewayDiagnostics.record('evaluateTx-failure', () => ({
             txCbor: tx,
             additionalUTxOs: additionalUTxOs ?? [],
@@ -970,21 +1012,21 @@ export const LucidClient = {
     );
     console.log('[startup] Ogmios protocol parameters loaded');
     console.log(`[startup] Constructing Lucid for network=${network}`);
+    const isDevnetWithRuntimeSlotConfig = network === 'Custom';
+    const slotConfig = isDevnetWithRuntimeSlotConfig
+      ? await retryWithBackoff(() => queryLocalSlotConfig(rawOgmiosEndpoint), 'Ogmios slot timing query')
+      : undefined;
     const lucid = await Lucid.Lucid(provider, network, {
       presetProtocolParameters: protocolParameters,
+      // Lucid Evolution's maintainer advised us to move to Scalus while reviewing our evaluator update.
+      // https://github.com/Anastasia-Labs/lucid-evolution/pull/734
+      evaluator: createScalusEvaluator({ protocolMajorVersion: 11 }),
+      slotConfig,
     } as any);
     console.log('[startup] Lucid constructed successfully');
 
-    const isDevnetWithRuntimeSlotConfig = network === 'Custom';
     if (isDevnetWithRuntimeSlotConfig) {
-      console.log('[startup] Querying Ogmios system start');
-      const devnetZeroTime = await retryWithBackoff(
-        () => querySystemStart(rawOgmiosEndpoint),
-        'Ogmios system start query',
-      );
-      console.log('[startup] Ogmios system start loaded');
-      Lucid.SLOT_CONFIG_NETWORK[network].zeroTime = devnetZeroTime;
-      Lucid.SLOT_CONFIG_NETWORK[network].slotLength = 1000;
+      Object.assign(Lucid.SLOT_CONFIG_NETWORK[network], slotConfig);
     }
     // const lucid = await Lucid.Lucid.new(
     //   new Lucid.Blockfrost('https://cardano-preview.blockfrost.io/api/v0', 'preview2fjKEg2Zh687WPUwB8eljT2Mz2q045GC'),

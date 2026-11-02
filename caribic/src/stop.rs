@@ -3,7 +3,6 @@ use std::thread;
 use std::time::Duration;
 
 use crate::{
-    config,
     logger::{error, log},
     process::{docker::DockerCli, system::SystemChecks},
     start,
@@ -89,34 +88,66 @@ fn remove_named_containers(names: &[String], label: &str) {
     }
 }
 
+pub(crate) fn gateway_project(root: &Path) -> String {
+    crate::setup::read_gateway_env_value(
+        &root.join("cardano/gateway/.env"),
+        "GATEWAY_COMPOSE_PROJECT",
+    )
+    .ok()
+    .flatten()
+    .filter(|project| !project.is_empty())
+    .unwrap_or_else(|| "gateway".to_string())
+}
+
+fn dapp_project(root: &Path) -> String {
+    if crate::local_network::is_local(root) {
+        if let Ok(mut env) = crate::local_network::environment(root, true) {
+            if let Some(project) = env.remove("DAPP_COMPOSE_PROJECT") {
+                return project;
+            }
+        }
+    }
+    "dapps".to_string()
+}
+
 pub(crate) fn gateway_is_running(project_root_path: &Path) -> bool {
     !compose_project_container_names(
         project_root_path.join("cardano/gateway").as_path(),
-        "gateway",
+        &gateway_project(project_root_path),
         None,
         false,
     )
     .is_empty()
 }
 
-pub(crate) fn dapp_is_running(project_root_path: &Path) -> bool {
-    !compose_project_container_names(
+pub(crate) fn dapp_container_name(project_root_path: &Path) -> Option<String> {
+    compose_project_container_names(
         project_root_path.join("dapps").as_path(),
-        "dapps",
+        &dapp_project(project_root_path),
         Some("ibc-swap-client"),
         false,
     )
-    .is_empty()
+    .into_iter()
+    .next()
 }
 
-pub(crate) fn cardano_runtime_is_running(project_root_path: &Path) -> bool {
-    !compose_project_container_names(
+pub(crate) fn dapp_is_running(project_root_path: &Path) -> bool {
+    dapp_container_name(project_root_path).is_some()
+}
+
+pub(crate) fn cardano_runtime_is_running(project_root_path: &Path) -> Result<bool, String> {
+    if crate::local_network::is_local(project_root_path)
+        && crate::local_network::containers_running(project_root_path)?
+    {
+        return Ok(true);
+    }
+    Ok(!compose_project_container_names(
         project_root_path.join("chains/cardano").as_path(),
         "cardano",
         None,
         false,
     )
-    .is_empty()
+    .is_empty())
 }
 
 pub(crate) fn relayer_is_running(project_root_path: &Path) -> bool {
@@ -138,7 +169,12 @@ pub(crate) fn relayer_is_running(project_root_path: &Path) -> bool {
 // using the same project name can be selected even when its working directory differs.
 pub fn stop_gateway(project_root_path: &Path) {
     let gateway_path = project_root_path.join("cardano/gateway");
-    let containers = compose_project_container_names(gateway_path.as_path(), "gateway", None, true);
+    let containers = compose_project_container_names(
+        gateway_path.as_path(),
+        &gateway_project(project_root_path),
+        None,
+        true,
+    );
     remove_named_containers(containers.as_slice(), "Gateway");
 }
 
@@ -147,17 +183,33 @@ pub fn stop_dapp(project_root_path: &Path) {
     let dapps_path = project_root_path.join("dapps");
     let containers = compose_project_container_names(
         dapps_path.as_path(),
-        "dapps",
+        &dapp_project(project_root_path),
         Some(IBC_SWAP_DAPP_SERVICE),
         true,
     );
     remove_named_containers(containers.as_slice(), "IBC Swap dapp");
 }
 
-pub fn stop_cardano_network(project_root_path: &Path) {
+pub fn stop_cardano_network(project_root_path: &Path) -> Result<(), String> {
+    if crate::local_network::is_local(project_root_path) {
+        crate::local_network::run(project_root_path, "stop", &[])?;
+    }
+    // Also retire containers from this checkout's pre-migration local stack.
+    // Public networks still use this project for their history services.
     let cardano_path = project_root_path.join("chains/cardano");
     let containers = compose_project_container_names(cardano_path.as_path(), "cardano", None, true);
     remove_named_containers(containers.as_slice(), "Cardano network");
+    Ok(())
+}
+
+pub(crate) fn previous_local_network_is_running(project_root_path: &Path) -> bool {
+    !compose_project_container_names(
+        &project_root_path.join("chains/cardano"),
+        "cardano",
+        None,
+        false,
+    )
+    .is_empty()
 }
 
 pub fn stop_relayer(relayer_path: &Path) {
@@ -258,66 +310,6 @@ fn parse_pid_and_command(line: &str) -> Option<(u32, String)> {
     let pid = pid_str.parse::<u32>().ok()?;
 
     Some((pid, command))
-}
-
-pub fn stop_mithril(mithril_path: &Path) {
-    let mithril_script_path = mithril_path.join("scripts");
-
-    if !mithril_script_path.exists() {
-        log("Mithril was not configured");
-        return;
-    }
-
-    let mithril_data_dir = mithril_path.join("data");
-    let mithril_data_dir = mithril_data_dir.to_string_lossy().to_string();
-    let mithril_config = config::get_config().mithril;
-    let mithril_result = execute_script(
-        &mithril_script_path,
-        "docker",
-        Vec::from([
-            "compose",
-            "-f",
-            "docker-compose.yaml",
-            "--profile",
-            "mithril",
-            "down",
-        ]),
-        Some(vec![
-            (
-                "MITHRIL_AGGREGATOR_IMAGE",
-                mithril_config.aggregator_image.as_str(),
-            ),
-            ("MITHRIL_CLIENT_IMAGE", mithril_config.client_image.as_str()),
-            ("MITHRIL_SIGNER_IMAGE", mithril_config.signer_image.as_str()),
-            (
-                "CARDANO_NODE_VERSION",
-                mithril_config.cardano_node_version.as_str(),
-            ),
-            (
-                "CHAIN_OBSERVER_TYPE",
-                mithril_config.chain_observer_type.as_str(),
-            ),
-            ("CARDANO_NODE_DIR", mithril_config.cardano_node_dir.as_str()),
-            ("MITHRIL_DATA_DIR", mithril_data_dir.as_str()),
-            (
-                "GENESIS_VERIFICATION_KEY",
-                mithril_config.genesis_verification_key.as_str(),
-            ),
-            (
-                "GENESIS_SECRET_KEY",
-                mithril_config.genesis_secret_key.as_str(),
-            ),
-            ("MITHRIL_SIGNER_IMAGE", mithril_config.signer_image.as_str()),
-        ]),
-    );
-    match mithril_result {
-        Ok(_) => {
-            log("Mithril stopped successfully (mithril-aggregator, mithril-signer-1, mithril-signer-2)");
-        }
-        Err(e) => {
-            error(&format!("ERROR: Failed to stop Mithril: {}", e));
-        }
-    }
 }
 
 #[cfg(test)]

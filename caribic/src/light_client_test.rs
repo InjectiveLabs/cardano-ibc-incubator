@@ -25,6 +25,13 @@ pub(crate) async fn run(
     network: Option<&str>,
 ) -> Result<(), String> {
     let options = LightClientTestOptions::resolve(scenario, chain, network)?;
+    if matches!(
+        scenario,
+        LightClientTest::ChallengeRecovery | LightClientTest::DeadlineOrdering
+    ) {
+        return run_native_acceptance(project_root_path, &options);
+    }
+
     let relayer_path = project_root_path.join("relayer");
     let relayer_was_running = matches!(
         start::check_health_target(project_root_path, HealthTarget::Core(CoreServiceId::Hermes)),
@@ -91,6 +98,15 @@ impl LightClientTestOptions {
         }
 
         let network = network.unwrap_or("v8-classic");
+        if matches!(
+            scenario,
+            LightClientTest::ChallengeRecovery | LightClientTest::DeadlineOrdering
+        ) && network != "v8-classic"
+        {
+            return Err(
+                "This acceptance scenario requires the local v8-classic destination profile".into(),
+            );
+        }
         if cosmos_profiles::semantics(network)? != IbcSemantics::Classic {
             return Err(format!(
                 "Profile '{network}' uses IBC v2 semantics; recover-client testing currently requires v8-classic or v10-classic"
@@ -111,6 +127,9 @@ fn run_recover_client(
 ) -> Result<(), String> {
     match options.scenario {
         LightClientTest::RecoverClient => {}
+        LightClientTest::ChallengeRecovery | LightClientTest::DeadlineOrdering => {
+            unreachable!("dispatched before live route setup")
+        }
     }
 
     logger::log(&format!(
@@ -187,8 +206,69 @@ fn run_recover_client(
     Ok(())
 }
 
+// These tests use isolated SDK applications and signed staged observations.
+fn run_native_acceptance(
+    project_root: &Path,
+    options: &LightClientTestOptions,
+) -> Result<(), String> {
+    let deadlines = options.scenario == LightClientTest::DeadlineOrdering;
+    let scenario = if deadlines {
+        "deadline-ordering"
+    } else {
+        "challenge-recovery"
+    };
+    let artifacts = project_root.join(".caribic/test-artifacts").join(format!(
+        "{scenario}-{}-{}",
+        Utc::now().format("%Y%m%dT%H%M%S%.3fZ"),
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&artifacts)
+        .map_err(|error| format!("Could not create acceptance artifacts: {error}"))?;
+    logger::log(&format!(
+        "Running {} {scenario} tests with signed transactions and a controlled host clock.",
+        options.network
+    ));
+    logger::log(&format!("Test output directory: {}", artifacts.display()));
+    let status = Command::new("go")
+        .args([
+            "test",
+            ".",
+            "-run",
+            if deadlines {
+                "^TestAppFollowingEpochActivationRequiresCommittedCutoffBlock$"
+            } else {
+                "TestAppAdmitsSnapshotChallenge|TestSignedPartialStakeUpload|TestSignedMaximumObservation|TestAppFailedStagedRecovery|TestStakeOmission"
+            },
+            "-v",
+            "-count=1",
+            "-timeout=20m",
+        ])
+        .current_dir(project_root.join("cosmos/cardano-probabilistic-light-client-v8"))
+        .arg(if deadlines {
+            "-parallel=5"
+        } else {
+            "-parallel=1"
+        })
+        .stdin(Stdio::null())
+        .stdout(std::fs::File::create(artifacts.join("stdout.log")).map_err(|error| format!("Could not create test output: {error}"))?)
+        .stderr(std::fs::File::create(artifacts.join("stderr.log")).map_err(|error| format!("Could not create test errors: {error}"))?)
+        .status()
+        .map_err(|error| format!("Could not run local v8 acceptance: {error}"))?;
+    if !status.success() {
+        return Err(format!(
+            "{scenario} acceptance failed ({status}). Evidence: {}",
+            artifacts.display()
+        ));
+    }
+    logger::log(&format!(
+        "PASS: {scenario} acceptance. Evidence: {}",
+        artifacts.display()
+    ));
+    Ok(())
+}
+
 fn local_subject_trusting_period(project_root_path: &Path) -> Result<u64, String> {
-    let genesis_path = project_root_path.join("chains/cardano/devnet/genesis-shelley.json");
+    let genesis_path = project_root_path.join(".caribic/devkit/genesis.json");
     let genesis_text = std::fs::read_to_string(&genesis_path).map_err(|error| {
         format!(
             "Could not read local Cardano genesis at {}: {error}",
@@ -197,6 +277,7 @@ fn local_subject_trusting_period(project_root_path: &Path) -> Result<u64, String
     })?;
     let genesis: serde_json::Value = serde_json::from_str(&genesis_text)
         .map_err(|error| format!("Could not parse {}: {error}", genesis_path.display()))?;
+    let genesis = &genesis["shelley"];
     let system_start = genesis
         .get("systemStart")
         .and_then(serde_json::Value::as_str)
@@ -220,7 +301,14 @@ fn local_subject_trusting_period(project_root_path: &Path) -> Result<u64, String
         .ok_or_else(|| "Local Cardano tip has no numeric slot".to_string())?;
 
     let cardano_tip_ms = system_start_ms + tip_slot as f64 * slot_length_seconds * 1_000.0;
-    let clock_offset_ms = (Utc::now().timestamp_millis() as f64 - cardano_tip_ms).max(0.0);
+    let offset = crate::local_network::endpoint(project_root_path, "CARDANO_LOCAL_CLOCK_OFFSET")?;
+    let offset_seconds = offset
+        .strip_suffix('s')
+        .and_then(|value| value.parse::<i64>().ok())
+        .ok_or("Invalid local network clock offset")?;
+    // The paired Cosmos fixture shares Cardano's saved clock offset.
+    let cosmos_now_ms = Utc::now().timestamp_millis() as f64 + offset_seconds as f64 * 1_000.0;
+    let clock_offset_ms = (cosmos_now_ms - cardano_tip_ms).max(0.0);
 
     subject_trusting_period_for_clock_offset_ms(clock_offset_ms)
 }
@@ -342,6 +430,36 @@ mod tests {
     use std::process::Command;
 
     #[test]
+    fn challenge_recovery_accepts_only_the_measured_v8_profile() {
+        assert!(
+            LightClientTestOptions::resolve(LightClientTest::ChallengeRecovery, None, None).is_ok()
+        );
+        for profile in ["v10-classic", "v10-v2", "unknown"] {
+            assert!(LightClientTestOptions::resolve(
+                LightClientTest::ChallengeRecovery,
+                None,
+                Some(profile)
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn deadline_ordering_accepts_only_the_local_v8_profile() {
+        assert!(
+            LightClientTestOptions::resolve(LightClientTest::DeadlineOrdering, None, None).is_ok()
+        );
+        for profile in ["v10-classic", "v10-v2", "unknown"] {
+            assert!(LightClientTestOptions::resolve(
+                LightClientTest::DeadlineOrdering,
+                None,
+                Some(profile)
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
     fn recover_client_defaults_to_v8_classic() {
         let options = LightClientTestOptions::resolve(LightClientTest::RecoverClient, None, None)
             .expect("default focused test options should resolve");
@@ -402,7 +520,9 @@ mod tests {
     fn local_default_trusting_period_is_longer_than_the_subject_fixture() {
         let local_setup = include_str!("setup.rs");
 
-        assert!(local_setup.contains("CARDANO_CLIENT_TRUSTING_PERIOD_SECONDS\", \"315360000"));
+        assert!(local_setup.contains(
+            "\"CARDANO_CLIENT_TRUSTING_PERIOD_SECONDS\",\n                \"315360000\""
+        ));
     }
 
     #[test]

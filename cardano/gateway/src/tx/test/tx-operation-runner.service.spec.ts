@@ -1,6 +1,6 @@
-import { TRANSACTION_SET_COLLATERAL } from '~@/config/constant.config';
-
+import { TRANSACTION_SET_COLLATERAL } from '../../config/constant.config';
 import { TxOperationRunnerService } from '../tx-operation-runner.service';
+import * as CML from '@dcspark/cardano-multiplatform-lib-nodejs';
 
 describe('TxOperationRunnerService', () => {
   const makeService = () => {
@@ -10,6 +10,7 @@ describe('TxOperationRunnerService', () => {
       explicitSelectionScopeId: null as number | null,
     };
     const lucidService = {
+      lucid: { wallet: jest.fn(() => ({ address: 'selected-wallet' })) },
       beginWalletSelectionScope: jest.fn(() => {
         const scopeId = ++walletSelectionState.nextScopeId;
         walletSelectionState.activeScopeId = scopeId;
@@ -62,6 +63,46 @@ describe('TxOperationRunnerService', () => {
     };
   };
 
+  it('rejects direct runner entrypoints before constructing or completing in historical mode', async () => {
+    const original = process.env.GATEWAY_HISTORICAL_READ_ONLY;
+    try {
+      process.env.GATEWAY_HISTORICAL_READ_ONLY = 'true';
+      const { service, lucidService } = makeService();
+      delete process.env.GATEWAY_HISTORICAL_READ_ONLY;
+      const build = jest.fn();
+      await expect(service.run({ unsignedTx: build } as never)).rejects.toThrow('historical read-only mode');
+      await expect(service.runChain({ build } as never)).rejects.toThrow('historical read-only mode');
+      expect(build).not.toHaveBeenCalled();
+      expect(lucidService.beginWalletSelectionScope).not.toHaveBeenCalled();
+    } finally {
+      if (original === undefined) delete process.env.GATEWAY_HISTORICAL_READ_ONLY;
+      else process.env.GATEWAY_HISTORICAL_READ_ONLY = original;
+    }
+  });
+
+  it('constructs a lazy builder after fresh wallet selection so it cannot capture the previous transaction inputs', async () => {
+    const { service, lucidService, walletContextService } = makeService();
+    let selectedInput = 'spent-previous-operation-input';
+    walletContextService.selectWalletFromAddressWithRetry.mockImplementation(async () => {
+      selectedInput = 'canonical-unspent-input';
+      lucidService.selectWalletFromAddress();
+    });
+    const factory = jest.fn(() => {
+      const capturedInput = selectedInput;
+      return { lucidConfig: () => ({}), complete: async () => {
+        if (capturedInput !== 'canonical-unspent-input') throw new Error('Builder captured stale wallet');
+        return { toCBOR: () => '00', toHash: () => 'heartbeat-hash' };
+      } } as never;
+    });
+    const result = await service.run({
+      operationName: 'hostStateHeartbeat', unsignedTx: factory,
+      wallet: { mode: 'refresh_from_address', address: 'authority', context: 'heartbeat' },
+      validity: { apply: (tx) => tx },
+    });
+    expect(result.unsignedTxHash).toBe('heartbeat-hash');
+    expect(factory).toHaveBeenCalledTimes(1);
+  });
+
   it('completes tx and registers pending update/events for refresh wallet mode', async () => {
     const {
       service,
@@ -77,7 +118,8 @@ describe('TxOperationRunnerService', () => {
     };
 
     const complete = jest.fn().mockResolvedValue(completedTx);
-    const txBuilder = { complete } as any;
+    const builderConfig = { wallet: { address: 'old-wallet' } };
+    const txBuilder = { complete, lucidConfig: () => builderConfig } as any;
 
     const pendingTreeUpdate = {
       expectedNewRoot: 'abc123',
@@ -112,8 +154,10 @@ describe('TxOperationRunnerService', () => {
     expect(lucidService.beginWalletSelectionScope).toHaveBeenCalledTimes(1);
     expect(lucidService.assertWalletSelectionScopeSatisfied).toHaveBeenCalledTimes(1);
     expect(lucidService.endWalletSelectionScope).toHaveBeenCalledTimes(1);
+    expect(builderConfig.wallet).toEqual({ address: 'selected-wallet' });
     expect(complete).toHaveBeenCalledWith({
       localUPLCEval: false,
+      // Keep normal completion below Hermes's default 10 ADA collateral cap.
       setCollateral: TRANSACTION_SET_COLLATERAL,
     });
     expect(ibcTreePendingUpdatesService.register).toHaveBeenCalledWith(
@@ -143,6 +187,7 @@ describe('TxOperationRunnerService', () => {
       lucidService.selectWalletFromAddress();
     });
     const txBuilder = {
+      lucidConfig: () => ({}),
       complete: jest.fn().mockResolvedValue({
         toCBOR: () => 'deadbeef',
         toHash: () => 'txhash-send-packet',
@@ -177,6 +222,7 @@ describe('TxOperationRunnerService', () => {
     const { service } = makeService();
 
     const txBuilder = {
+      lucidConfig: () => ({}),
       complete: jest.fn(),
     } as any;
 
@@ -201,6 +247,7 @@ describe('TxOperationRunnerService', () => {
 
     const expectedError = new Error('completion failed');
     const txBuilder = {
+      lucidConfig: () => ({}),
       complete: jest.fn().mockRejectedValue(expectedError),
     } as any;
 
@@ -231,9 +278,11 @@ describe('TxOperationRunnerService', () => {
     };
 
     const txBuilderFirst = {
+      lucidConfig: () => ({}),
       complete: jest.fn().mockRejectedValue(transientError),
     } as any;
     const txBuilderSecond = {
+      lucidConfig: () => ({}),
       complete: jest.fn().mockResolvedValue(completedTx),
     } as any;
     const rebuildUnsignedTx = jest.fn().mockResolvedValue(txBuilderSecond);
@@ -272,6 +321,7 @@ describe('TxOperationRunnerService', () => {
 
     const retryableError = new Error('completion timeout');
     const txBuilder = {
+      lucidConfig: () => ({}),
       complete: jest.fn().mockRejectedValue(retryableError),
     } as any;
     const onRetry = jest.fn();
@@ -320,9 +370,11 @@ describe('TxOperationRunnerService', () => {
       toHash: jest.fn().mockReturnValue('txhash-timeout-packet'),
     };
     const txBuilderFirst = {
+      lucidConfig: () => ({}),
       complete: jest.fn().mockRejectedValue(transientError),
     } as any;
     const txBuilderSecond = {
+      lucidConfig: () => ({}),
       complete: jest.fn().mockResolvedValue(completedTx),
     } as any;
     const rebuildUnsignedTx = jest.fn().mockImplementation(async () => {
@@ -356,5 +408,213 @@ describe('TxOperationRunnerService', () => {
       'txhash-timeout-packet',
       pendingTreeUpdateSecond,
     );
+  });
+
+  it('offers unreserved script inputs inside the completion lock', async () => {
+    const { service, lucidService } = makeService();
+    const busy = { txHash: 'busy', outputIndex: 0 } as any;
+    const free = { txHash: 'free', outputIndex: 0 } as any;
+    (service as any).inputReservations.reserve('outstanding', [busy], 1000);
+    lucidService.lucid = { utxosByOutRef: jest.fn(async (inputs) => inputs) } as any;
+    await service.runChain({
+      operationName: 'selection',
+      wallet: { mode: 'custom_before_complete', run: async () => lucidService.selectWalletFromAddress() },
+      build: async ({ availableInputs }) => {
+        expect(availableInputs([busy, free])).toEqual([free]);
+      },
+    });
+  });
+
+  it.each([true, false])('checks a shared spending and collateral output once, unspent=%s', async (unspent) => {
+    const { service, lucidService } = makeService();
+    const hash = '11'.repeat(32);
+    // Decode both input roles with the native Cardano library. Kupo returns a
+    // unique output even when the request contains the same reference twice.
+    const cbor = `84a40081825820${hash}000180021a000f42400d81825820${hash}00a0f5f6`;
+    const transaction = CML.Transaction.from_cbor_hex(cbor);
+    const funding = { txHash: hash, outputIndex: 0, address: 'signer', assets: { lovelace: 30_000_000n } };
+    const lookup = jest.fn().mockResolvedValue(unspent ? [funding] : []);
+    lucidService.LucidImporter = { CML };
+    lucidService.lucid = { utxosByOutRef: lookup };
+    const builder = {
+      chain: jest.fn().mockResolvedValue([[], [], {
+        toCBOR: () => cbor,
+        toHash: () => CML.hash_transaction(transaction.body()).to_hex(),
+      }]),
+    } as any;
+    const plan: Parameters<TxOperationRunnerService['runChain']>[0] = {
+      operationName: 'packetBatch',
+      wallet: { mode: 'custom_before_complete' as const, run: async () => lucidService.selectWalletFromAddress() },
+      reservation: { now: 100, expiresAt: 1000 },
+      build: ({ complete }) => complete({
+        operationName: 'packetBatch', unsignedTx: builder, spendingInputs: [funding],
+        validity: { apply: (tx) => tx },
+      }),
+    };
+    if (unspent) {
+      await expect(service.runChain(plan)).resolves.toBeDefined();
+      expect(lookup).toHaveBeenCalledWith([{ txHash: hash, outputIndex: 0 }]);
+      await expect(service.runChain({ ...plan, reservation: { now: 200, expiresAt: 1000 } }))
+        .rejects.toThrow('Packet inputs are reserved');
+      expect(builder.chain).toHaveBeenCalledTimes(1);
+    } else {
+      await expect(service.runChain(plan)).rejects.toThrow('Packet inputs changed during construction');
+    }
+  });
+
+  it('holds one completion lock while threading wallet inputs through a transaction chain', async () => {
+    const {
+      service,
+      lucidService,
+      walletContextService,
+      txEventsService,
+      ibcTreePendingUpdatesService,
+    } = makeService();
+    const firstWalletInputs = [{ txHash: 'wallet-change-1', outputIndex: 0 }];
+    const secondWalletInputs = [{ txHash: 'wallet-change-2', outputIndex: 0 }];
+    const firstDerived = [{ txHash: 'first', outputIndex: 0 }];
+    const secondDerived = [{ txHash: 'second', outputIndex: 0 }];
+    const firstCompleted = { toCBOR: () => '01', toHash: () => 'first-hash' };
+    const secondCompleted = { toCBOR: () => '02', toHash: () => 'second-hash' };
+    const firstBuilder = {
+      chain: jest.fn().mockResolvedValue([firstWalletInputs, firstDerived, firstCompleted]),
+    } as any;
+    const secondBuilder = {
+      chain: jest.fn().mockResolvedValue([secondWalletInputs, secondDerived, secondCompleted]),
+    } as any;
+    const firstPending = { kind: 'tree_neutral' as const, expectedNewRoot: '', commit: jest.fn() };
+    const finalPending = { expectedNewRoot: 'final-root', commit: jest.fn() };
+    const finalEvents = [{ type: 'update_client', attributes: [] }];
+
+    const result = await service.runChain({
+      operationName: 'updateClientChain',
+      wallet: {
+        mode: 'refresh_from_address',
+        address: 'addr_test1chain',
+        context: 'updateClientChain',
+      },
+      build: async ({ complete }) => {
+        const first = await complete({
+          operationName: 'first',
+          unsignedTx: firstBuilder,
+          validity: { apply: (builder) => builder },
+          pendingTreeUpdate: firstPending,
+        });
+        expect(first.derivedOutputs).toBe(firstDerived);
+        await complete({
+          operationName: 'second',
+          unsignedTx: secondBuilder,
+          validity: { apply: (builder) => builder },
+          pendingTreeUpdate: finalPending,
+          syntheticEvents: finalEvents,
+        });
+        return 'built';
+      },
+    });
+
+    expect(result.value).toBe('built');
+    expect(result.links.map((link) => link.unsignedTxHash)).toEqual(['first-hash', 'second-hash']);
+    expect(firstBuilder.chain).toHaveBeenCalledWith({
+      localUPLCEval: false,
+      setCollateral: TRANSACTION_SET_COLLATERAL,
+    });
+    expect(secondBuilder.chain).toHaveBeenCalledWith({
+      localUPLCEval: false,
+      setCollateral: TRANSACTION_SET_COLLATERAL,
+      presetWalletInputs: firstWalletInputs,
+    });
+    expect(walletContextService.selectWalletFromAddressWithRetry).toHaveBeenCalledTimes(1);
+    expect(lucidService.beginWalletSelectionScope).toHaveBeenCalledTimes(1);
+    expect(lucidService.endWalletSelectionScope).toHaveBeenCalledTimes(1);
+    expect(lucidService.selectWalletFromAddress).toHaveBeenCalledWith('addr_test1chain', firstWalletInputs);
+    expect(ibcTreePendingUpdatesService.register.mock.calls).toEqual([
+      ['first-hash', firstPending],
+      ['second-hash', finalPending],
+    ]);
+    expect(txEventsService.register).toHaveBeenCalledWith('second-hash', finalEvents, 'final-root');
+  });
+
+  it('collects signer funding for self-funded stages from the current dependency wallet', async () => {
+    const { service, lucidService } = makeService();
+    const tokenInput = { txHash: 'token', outputIndex: 0, assets: { lovelace: 20_000_000n, token: 1n } };
+    const funding = { txHash: 'funding', outputIndex: 0, assets: { lovelace: 20_000_000n } };
+    const change = { txHash: 'stage-one', outputIndex: 1, assets: { lovelace: 19_000_000n } };
+    const getUtxos = jest.fn().mockResolvedValue([tokenInput, funding]);
+    lucidService.lucid = { wallet: () => ({ getUtxos }) };
+    const first = {
+      collectFrom: jest.fn(),
+      chain: jest.fn().mockResolvedValue([[change], [], { toCBOR: () => '01', toHash: () => 'stage-one' }]),
+    } as any;
+    const second = {
+      collectFrom: jest.fn(),
+      chain: jest.fn().mockResolvedValue([[], [], { toCBOR: () => '02', toHash: () => 'stage-two' }]),
+    } as any;
+    await service.runChain({
+      operationName: 'selfFundedSessions',
+      wallet: { mode: 'refresh_from_address', address: 'signer', context: 'test' },
+      build: async ({ complete }) => {
+        for (const unsignedTx of [first, second]) {
+          await complete({ operationName: 'stage', requireWalletInput: true, unsignedTx,
+            validity: { apply: (builder) => builder } });
+        }
+      },
+    });
+    expect(first.collectFrom).toHaveBeenCalledWith([funding]);
+    expect(second.collectFrom).toHaveBeenCalledWith([change]);
+    expect(getUtxos).toHaveBeenCalledTimes(1);
+    expect(second.chain).toHaveBeenCalledWith(expect.objectContaining({ presetWalletInputs: [change] }));
+  });
+
+  it('refuses a self-funded stage when the signer has no ordinary input', async () => {
+    const { service, lucidService, ibcTreePendingUpdatesService } = makeService();
+    lucidService.lucid = { wallet: () => ({ getUtxos: async () => [] }) };
+    const builder = { collectFrom: jest.fn(), chain: jest.fn() } as any;
+    await expect(service.runChain({
+      operationName: 'selfFundedSession',
+      wallet: { mode: 'refresh_from_address', address: 'signer', context: 'test' },
+      build: async ({ complete }) => complete({ operationName: 'finalize', requireWalletInput: true,
+        unsignedTx: builder, validity: { apply: (tx) => tx } }),
+    })).rejects.toThrow('requires an ordinary signer wallet input');
+    expect(builder.chain).not.toHaveBeenCalled();
+    expect(ibcTreePendingUpdatesService.register).not.toHaveBeenCalled();
+  });
+
+  it('does not register partial chain metadata when a later link fails', async () => {
+    const { service, lucidService, ibcTreePendingUpdatesService } = makeService();
+    const firstBuilder = {
+      chain: jest.fn().mockResolvedValue([
+        [],
+        [],
+        { toCBOR: () => '01', toHash: () => 'first-hash' },
+      ]),
+    } as any;
+    const failure = new Error('second chain link failed');
+    const secondBuilder = { chain: jest.fn().mockRejectedValue(failure) } as any;
+
+    await expect(
+      service.runChain({
+        operationName: 'failedChain',
+        wallet: {
+          mode: 'custom_before_complete',
+          run: async () => lucidService.selectWalletFromAddress(),
+        },
+        build: async ({ complete }) => {
+          await complete({
+            operationName: 'first',
+            unsignedTx: firstBuilder,
+            validity: { apply: (builder) => builder },
+            pendingTreeUpdate: { kind: 'tree_neutral', expectedNewRoot: '', commit: jest.fn() },
+          });
+          await complete({
+            operationName: 'second',
+            unsignedTx: secondBuilder,
+            validity: { apply: (builder) => builder },
+          });
+        },
+      }),
+    ).rejects.toBe(failure);
+
+    expect(ibcTreePendingUpdatesService.register).not.toHaveBeenCalled();
+    expect(lucidService.endWalletSelectionScope).toHaveBeenCalledTimes(1);
   });
 });

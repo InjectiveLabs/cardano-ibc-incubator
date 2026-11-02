@@ -1,17 +1,26 @@
 {
   "name": "gateway",
-  "version": "0.0.1",
+  "version": "2.0.2",
   "description": "",
   "author": "",
   "private": true,
   "license": "UNLICENSED",
   "scripts": {
+    "postinstall": "node scripts/patch-lucid-ogmios.cjs",
+    "test:lucid-wallet": "node --test scripts/lucid-wallet.test.mjs",
+    "test:lucid-ogmios": "node --test scripts/lucid-ogmios.test.mjs",
+    "prebuild": "node scripts/build-client-preparer.cjs",
+    "pretest": "node scripts/build-client-preparer.cjs",
+    "prestart": "node scripts/build-client-preparer.cjs",
+    "prestart:debug": "node scripts/build-client-preparer.cjs",
+    "prestart:dev": "node scripts/build-client-preparer.cjs",
     "build": "nest build",
     "benchmark:denom-registry": "ts-node -r tsconfig-paths/register src/scripts/test/denom-registry-benchmark.ts",
     "check:tendermint-update-capacity-fixture": "ts-node -r tsconfig-paths/register src/scripts/test/generate-injective-tendermint-capacity-fixture.ts --check",
     "check:tendermint-update-capacity": "ts-node -r tsconfig-paths/register src/scripts/ci/tendermint-update-capacity.ts",
     "check:tendermint-update-capacity-aiken": "ts-node -r tsconfig-paths/register src/scripts/test/generate-tendermint-update-capacity-aiken.ts --check",
-    "check:tx-budgets": "ts-node -r tsconfig-paths/register src/scripts/ci/check-tx-budgets.ts",
+    "report:tx-budget-models": "ts-node -r tsconfig-paths/register src/scripts/ci/check-tx-budgets.ts",
+    "upgrade:bridge-history": "ts-node -r tsconfig-paths/register src/scripts/upgrade-bridge-history.ts",
     "export:bridge-manifest": "ts-node -r tsconfig-paths/register src/scripts/export-bridge-manifest.ts",
     "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",
     "start": "nest start",
@@ -25,7 +34,8 @@
     "test:cov": "jest --coverage",
     "test:cov:ci": "jest --coverage --detectOpenHandles --runInBand",
     "test:debug": "node --inspect-brk -r tsconfig-paths/register -r ts-node/register node_modules/.bin/jest --runInBand",
-    "test:e2e": "jest --config ./test/jest-e2e.json"
+    "test:e2e": "jest --config ./test/jest-e2e.json",
+    "export:migration-witness": "ts-node -r tsconfig-paths/register src/scripts/export-migration-witness.ts"
   },
   "dependencies": {
     "@cardano-ibc/planner": "file:../../packages/cardano-ibc-planner",
@@ -35,18 +45,17 @@
     "@cardano-ibc/tx-builder-runtime": "file:../../packages/cardano-ibc-tx-builder-runtime",
     "@cardano-ogmios/client": "6.13.0",
     "@cardano-ogmios/schema": "6.13.0",
-    "@cuonglv0297/mithril-client-wasm": "^0.3.1",
     "@dcspark/cardano-multiplatform-lib-nodejs": "6.2.0",
     "@grpc/grpc-js": "^1.13.4",
     "@grpc/proto-loader": "^0.7.15",
     "@harmoniclabs/bytestring": "^1.0.0",
     "@harmoniclabs/cbor": "^1.6.6",
     "@harmoniclabs/crypto": "^0.3.0",
-    "@harmoniclabs/ouroboros-miniprotocols-ts": "0.0.4",
     "@harmoniclabs/pair": "^1.0.0",
     "@harmoniclabs/plutus-data": "^1.2.4",
     "@harmoniclabs/uint8array-utils": "1.0.4",
-    "@lucid-evolution/lucid": "^0.4.29",
+    "@lucid-evolution/lucid": "0.6.5",
+    "@lucid-evolution/scalus-uplc": "0.1.4",
     "@nestjs/axios": "^4.0.0",
     "@nestjs/common": "^11.1.29",
     "@nestjs/config": "^4.0.2",
@@ -89,8 +98,8 @@
     "@types/pg": "^8.23.1",
     "@types/supertest": "^6.0.3",
     "@types/ws": "^8.18.1",
-    "@typescript-eslint/eslint-plugin": "^8.34.0",
-    "@typescript-eslint/parser": "^8.34.0",
+    "@typescript-eslint/eslint-plugin": "8.39.0",
+    "@typescript-eslint/parser": "8.39.0",
     "eslint": "^9.29.0",
     "eslint-config-prettier": "^10.1.5",
     "eslint-plugin-prettier": "^5.4.1",
@@ -142,6 +151,7 @@
     "collectCoverageFrom": [
       "**/*.controller.ts",
       "**/client.service.ts",
+      "**/tendermint-client.service.ts",
       "**/connection.service.ts",
       "**/channel.service.ts",
       "**/packet.service.ts",
@@ -168,7 +178,7 @@
     "@nestjs/swagger": {
       "js-yaml": "5.2.2"
     },
-    "multer": "^2.3.0",
+    "multer": "^2.5.0",
     "protobufjs": "^8.7.2"
   }
 }

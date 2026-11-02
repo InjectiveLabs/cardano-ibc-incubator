@@ -23,6 +23,8 @@ describe('QueryController (modern)', () => {
       queryClientState: jest.fn(),
       queryClientStates: jest.fn(),
       queryConsensusState: jest.fn(),
+      queryConsensusStates: jest.fn(),
+      queryConsensusStateHeights: jest.fn(),
       latestHeight: jest.fn(),
       queryNewClient: jest.fn(),
       queryBlockResults: jest.fn(),
@@ -120,6 +122,23 @@ describe('QueryController (modern)', () => {
     );
   });
 
+  it('delegates consensus-state list queries to QueryService', async () => {
+    await expectDelegation(
+      'queryConsensusStates',
+      queryServiceMock,
+      'queryConsensusStates',
+      { client_id: 'c0' },
+      { consensus_states: [] },
+    );
+    await expectDelegation(
+      'queryConsensusStateHeights',
+      queryServiceMock,
+      'queryConsensusStateHeights',
+      { client_id: 'c0' },
+      { consensus_state_heights: [] },
+    );
+  });
+
   it('delegates LatestHeight to QueryService', async () => {
     await expectDelegation('LatestHeight', queryServiceMock, 'latestHeight', {}, { height: 777n });
   });
@@ -127,8 +146,11 @@ describe('QueryController (modern)', () => {
   it('delegates NewClient to QueryService and returns its response', async () => {
     const request = { height: 123n } as any;
     const expected = {
-      client_state: { type_url: '/ibc.lightclients.mithril.v1.ClientState', value: Buffer.from('01', 'hex') },
-      consensus_state: { type_url: '/ibc.lightclients.mithril.v1.ConsensusState', value: Buffer.from('02', 'hex') },
+      client_state: { type_url: '/ibc.lightclients.probabilistic.v1.ClientState', value: Buffer.from('01', 'hex') },
+      consensus_state: {
+        type_url: '/ibc.lightclients.probabilistic.v1.ConsensusState',
+        value: Buffer.from('02', 'hex'),
+      },
     } as any;
     queryServiceMock.queryNewClient.mockResolvedValue(expected);
 
@@ -318,7 +340,7 @@ describe('QueryController (modern)', () => {
       queryServiceMock,
       'queryIBCHeader',
       { height: 500n },
-      { header: { type_url: '/ibc.lightclients.mithril.v1.MithrilHeader', value: Buffer.from([1]) } },
+      { header: { type_url: '/ibc.lightclients.probabilistic.v1.ProbabilisticHeader', value: Buffer.from([1]) } },
     );
   });
 

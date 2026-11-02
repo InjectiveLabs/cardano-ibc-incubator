@@ -1,3 +1,4 @@
+use aiken/collection/list
 use aiken/collection/pairs
 use aiken/crypto.{Blake2b_224, Hash, Script}
 use aiken/interval
@@ -13,11 +14,14 @@ use ibc/client/ics_007_tendermint_client/client_datum.{
 }
 use ibc/client/ics_007_tendermint_client/client_state.{ClientState}
 use ibc/client/ics_007_tendermint_client/cometbft/protos/connection_pb
+use ibc/client/ics_007_tendermint_client/consensus_history.{
+  ConsensusStateDatum, Witness,
+}
 use ibc/client/ics_007_tendermint_client/consensus_state.{ConsensusState}
 use ibc/client/ics_007_tendermint_client/height.{Height} as height_mod
 use ibc/client/ics_007_tendermint_client/types/unchecked_rational
 use ibc/client/ics_007_tendermint_client/types/verify_proof_redeemer.{
-  VerifyMembership,
+  VerifyMembership, VerifyProofEnvelope,
 }
 use ibc/core/ics_002_client_semantics/types/keys as client_keys_mod
 use ibc/core/ics_003_connection_semantics/connection_datum.{ConnectionDatum}
@@ -37,6 +41,7 @@ use ibc/core/ics_023_vector_commitments/merkle.{MerkleProof, MerkleRoot}
 use ibc/core/ics_023_vector_commitments/merkle_prefix.{MerklePrefix}
 use ibc/core/ics_024_host_requirements/connection_keys.{default_merkle_prefix}
 use ibc/core/ics_025_handler_interface/host_state_redeemer as host_state_redeemer
+use ibc/core/ics_025_handler_interface/ibc_state_commitment as tree
 use ibc/utils/test_utils
 use ibc/utils/validator_utils
 use spending_connection
@@ -140,6 +145,7 @@ fn setup() -> MockData {
 
   let client_state =
     ClientState {
+      upgrade_path: [],
       chain_id: "testchain1-1",
       trust_level: unchecked_rational.from_int(1),
       trusting_period: 1209600000000000,
@@ -170,6 +176,7 @@ fn setup() -> MockData {
 
   let client_datum =
     ClientDatum {
+      history_root: #"0000000000000000000000000000000000000000000000000000000000000000",
       state: ClientDatumState {
         client_state,
         consensus_states: [Pair(proof_height, cons_state)],
@@ -263,7 +270,7 @@ fn host_state_update_connection_redeemer() -> Redeemer {
   redeemer
 }
 
-test conn_open_ack_succeed() {
+test conn_open_ack_accepts_authenticated_history_witness() {
   let mock = setup()
 
   //========================arrange inputs=======================
@@ -299,8 +306,34 @@ test conn_open_ack_succeed() {
       },
     }
 
+  let latest_height = Height { revision_number: 0, revision_height: 188486 }
+  let latest_cons_state =
+    ConsensusState { ..cons_state, timestamp: cons_state.timestamp + 1 }
   let client_input =
-    test_utils.update_client(proof_height, cons_state, mock.client_input)
+    test_utils.update_client(
+      latest_height,
+      latest_cons_state,
+      mock.client_input,
+    )
+  expect client_datum: ClientDatum =
+    validator_utils.get_inline_datum(client_input.output)
+  let record =
+    ConsensusStateDatum {
+      client_token: client_datum.token,
+      height: proof_height,
+      consensus_state: cons_state,
+      processed_time: 0,
+      processed_height: 0,
+    }
+  let history_siblings = list.repeat(tree.empty_hash, tree.merkle_depth_bits)
+  let history_root =
+    consensus_history.insert(tree.empty_hash, record, history_siblings)
+  let client_datum = ClientDatum { ..client_datum, history_root }
+  let client_input =
+    Input {
+      ..client_input,
+      output: Output { ..client_input.output, datum: InlineDatum(client_datum) },
+    }
 
   let reference_inputs = [client_input]
 
@@ -329,9 +362,6 @@ test conn_open_ack_succeed() {
   let proof_try = MerkleProof { proofs: [] }
 
   let connection_redeemer: Redeemer = ConnOpenAck
-
-  expect client_datum: ClientDatum =
-    validator_utils.get_inline_datum(client_input.output)
 
   let client_datum_state = client_datum.state
   let connection = output_conn_datum.state
@@ -368,21 +398,21 @@ test conn_open_ack_succeed() {
       connection_end.convert_to_connection_end_proto(expected_connection),
     )
 
-  expect Some(consensus_state) =
-    pairs.get_first(client_datum_state.consensus_states, proof_height)
-
   let verify_proof_redeemer: Redeemer =
-    VerifyMembership {
-      cs: client_datum_state.client_state,
-      cons_state: consensus_state,
-      height: proof_height,
-      processed_time: 0,
-      processed_height: 0,
-      delay_time_period: time_delay,
-      delay_block_period: block_delay,
-      proof: proof_try,
-      path: conn_merkle_path,
-      value: expected_connection_bz,
+    VerifyProofEnvelope {
+      history_witness: Some(Witness { record, siblings: history_siblings }),
+      proof: VerifyMembership {
+        cs: client_datum_state.client_state,
+        cons_state,
+        height: proof_height,
+        processed_time: 0,
+        processed_height: 0,
+        delay_time_period: time_delay,
+        delay_block_period: block_delay,
+        proof: proof_try,
+        path: conn_merkle_path,
+        value: expected_connection_bz,
+      },
     }
 
   let redeemers: Pairs<ScriptPurpose, Redeemer> =
@@ -496,18 +526,22 @@ fn run_conn_open_confirm(client_is_active: Bool) -> Bool {
   let connection_redeemer: Redeemer =
     ConnOpenConfirm { proof_ack, proof_height }
   let verify_proof_redeemer: Redeemer =
-    VerifyMembership {
-      cs: client_datum_state.client_state,
-      cons_state: consensus_state,
-      height: proof_height,
-      processed_time: 0,
-      processed_height: 0,
-      delay_time_period: connection.delay_period,
-      delay_block_period: verify_mod.get_block_delay(connection),
-      proof: proof_ack,
-      path: conn_merkle_path,
-      value: expected_connection_bz,
+    VerifyProofEnvelope {
+      history_witness: None,
+      proof: VerifyMembership {
+        cs: client_datum_state.client_state,
+        cons_state: consensus_state,
+        height: proof_height,
+        processed_time: 0,
+        processed_height: 0,
+        delay_time_period: connection.delay_period,
+        delay_block_period: verify_mod.get_block_delay(connection),
+        proof: proof_ack,
+        path: conn_merkle_path,
+        value: expected_connection_bz,
+      },
     }
+
   let redeemers: Pairs<ScriptPurpose, Redeemer> =
     [
       Pair(Spend(conn_input.output_reference), connection_redeemer),
@@ -659,17 +693,20 @@ test conn_open_ack_fails_without_host_state_co_spend() fail {
     pairs.get_first(client_datum_state.consensus_states, proof_height)
 
   let verify_proof_redeemer: Redeemer =
-    VerifyMembership {
-      cs: client_datum_state.client_state,
-      cons_state: consensus_state,
-      height: proof_height,
-      processed_time: 0,
-      processed_height: 0,
-      delay_time_period: time_delay,
-      delay_block_period: block_delay,
-      proof: proof_try,
-      path: conn_merkle_path,
-      value: expected_connection_bz,
+    VerifyProofEnvelope {
+      history_witness: None,
+      proof: VerifyMembership {
+        cs: client_datum_state.client_state,
+        cons_state: consensus_state,
+        height: proof_height,
+        processed_time: 0,
+        processed_height: 0,
+        delay_time_period: time_delay,
+        delay_block_period: block_delay,
+        proof: proof_try,
+        path: conn_merkle_path,
+        value: expected_connection_bz,
+      },
     }
 
   let redeemers: Pairs<ScriptPurpose, Redeemer> =
@@ -700,359 +737,3 @@ test conn_open_ack_fails_without_host_state_co_spend() fail {
     transaction,
   )
 }
-// test try_non_mock_data() {
-//   let client_minting_policy_id =
-//     #"9e2e296e2989fee464a1356f8c26fc5531e8f02befb529b5fb5a60d5"
-//   let verify_proof_policy_id =
-//     #"f94ca68702f061f67713298edda2dd59eaab7b9de711e4728bfe6e03"
-
-//   let connection_auth_token = AuthToken {
-//         policyId: #"38fd1b4dfe85a69ad60ca3f73096f90857b053e733ba508c667a1c04",
-//         name: #"9ea42feedfd26becd19073df38f4604bd2e64b0119dd9b3031",
-//       }
-
-//   let input_datum =
-//     ConnectionDatum {
-//       state: ConnectionEnd {
-//         client_id: "07-tendermint-1",
-//         versions: [
-//           Version {
-//             identifier: "1",
-//             features: ["ORDER_ORDERED", "ORDER_UNORDERED"],
-//           },
-//         ],
-//         state: connection_state.Open,
-//         counterparty: Counterparty {
-//           client_id: "08-cardano-probabilistic-2",
-//           connection_id: "",
-//           prefix: MerklePrefix { key_prefix: "ibc" },
-//         },
-//         delay_period: 0,
-//       },
-//       token: connection_auth_token,
-//     }
-
-//   let updated_datum =
-//     ConnectionDatum {
-//       state: ConnectionEnd {
-//         client_id: "07-tendermint-1",
-//         versions: [
-//           Version {
-//             identifier: "1",
-//             features: ["ORDER_ORDERED", "ORDER_UNORDERED"],
-//           },
-//         ],
-//         state: connection_state.Open,
-//         counterparty: Counterparty {
-//           client_id: "08-cardano-probabilistic-2",
-//           connection_id: "connection-2",
-//           prefix: MerklePrefix { key_prefix: "ibc" },
-//         },
-//         delay_period: 0,
-//       },
-//       token: connection_auth_token,
-//     }
-
-//   let proof_height = CardanoHeight {
-//       revision_number: 0,
-//       revision_height: 4307,
-//     }
-
-//   let connection_redeemer = ConnOpenAck {
-//     counterparty_client_state: MithrilClientState {
-//       chain_id: "3432",
-//       latest_height: CardanoHeight {
-//         revision_number: 0,
-//         revision_height: 1424,
-//       },
-//       frozen_height: CardanoHeight {
-//         revision_number: 0,
-//         revision_height: 0,
-//       },
-//       current_epoch: 38,
-//       trusting_period: 129600000000000,
-//       protocol_parameters: MithrilProtocolParameters {
-//         k: 5,
-//         m: 100,
-//         phi_f: Fraction {
-//           numerator: 17,
-//           denominator: 20,
-//         },
-//       },
-//       upgrade_path: [],
-//     },
-//     proof_try: MerkleProof {
-//       proofs: [
-//         CommitmentProof {
-//           proof: CommitmentProof_Exist {
-//             exist: {
-//               key: "636f6e6e656374696f6e732f636f6e6e656374696f6e2d32",
-//               value: "0a16323030302d63617264616e6f2d6d69746872696c2d3212230a0131120d4f524445525f4f524445524544120f4f524445525f554e4f524445524544180222230a0c6962635f636c69656e742d31120c636f6e6e656374696f6e2d311a050a03696263",
-//               leaf: LeafOp {
-//                 hash: 1,
-//                 prehash_key: 0,
-//                 prehash_value: 1,
-//                 length: 1,
-//                 prefix: "0002e23d",
-//               },
-//               path: [
-//                 InnerOp {
-//                   hash: 1,
-//                   prefix: "0204e23d20231ec0769ed635e280fd1d5aa64096b53f4826302ebe3c9e6ee959df46c4e4e720",
-//                   suffix: "",
-//                 },
-//                 InnerOp {
-//                   hash: 1,
-//                   prefix: "0408e23d20",
-//                   suffix: "20c3f9efc9a3716b7fbf5f0efd845bab965659e0d4963f1789b2ff43c192c296d9",
-//                 },
-//                 InnerOp {
-//                   hash: 1,
-//                   prefix: "060ce23d204a2ddb1636e8cdee4726f58eb9c97146e96da9cfa89cb256b59fd9f417c5cc2620",
-//                   suffix: "",
-//                 },
-//                 InnerOp {
-//                   hash: 1,
-//                   prefix: "0818e23d20",
-//                   suffix: "20a6f0c217966fb88a03191236554ec4414d7743444aca423607e97072f78e0308",
-//                 },
-//                 InnerOp {
-//                   hash: 1,
-//                   prefix: "0c36e04120e67799408ad0ca94cbf8f9d6f8052b582e24f8edc875b5debdd1f76c2eaad38b20",
-//                   suffix: "",
-//                 },
-//                 InnerOp {
-//                   hash: 1,
-//                   prefix: "0e64e0412039320167a5a81774e382d624fb8f53e0490c0d57097b4ce13e6ea5ef96995a9b20",
-//                   suffix: "",
-//                 },
-//                 InnerOp {
-//                   hash: 1,
-//                   prefix: "10c001e041202174dc719c3824e60fe016fa9cd3a3a578385806b9a8074140711c75dc16328420",
-//                   suffix: "",
-//                 },
-//               ]
-//             }
-//           }
-//         },
-//         CommitmentProof {
-//           proof: CommitmentProof_Exist {
-//             exist: {
-//               key: "696263",
-//               value: "0017eee38d5e7d7a82f8dee1dc86e54aecb6dc1fcaa9114d99d52e69dae534a6",
-//               leaf: LeafOp {
-//                 hash: 1,
-//                 prehash_key: 0,
-//                 prehash_value: 1,
-//                 length: 1,
-//                 prefix: "00",
-//               },
-//               path: [
-//                 InnerOp {
-//                   hash: 1,
-//                   prefix: "0106b99c0d8119ff1edbcbe165d0f19337dbbc080e677c88e57aa2ae767ebf0f0f",
-//                   suffix: "",
-//                 },
-//                 InnerOp {
-//                   hash: 1,
-//                   prefix: "01",
-//                   suffix: "f03e9a3a8125b3030d3da809a5065fb5f4fb91ae04b45c455218f4844614fc48",
-//                 },
-//                 InnerOp {
-//                   hash: 1,
-//                   prefix: "0124409a1441553dd16e3e14d0545222d206e3deaf20e7556054ed528c9f5d8eed",
-//                   suffix: "",
-//                 },
-//                 InnerOp {
-//                   hash: 1,
-//                   prefix: "0176296b655bd54a7397f37e0b2c6c863029a29e4eeddedcb063c6839209a88996",
-//                   suffix: "",
-//                 },
-//                 InnerOp {
-//                   hash: 1,
-//                   prefix: "01",
-//                   suffix: "381fe6c71ac03eaf7d2bc970c0dd01c055a150251864848311bd448ab19a7833",
-//                 },
-//               ]
-//             }
-//           }
-//         }
-//       ]
-//     },
-//     proof_client: MerkleProof {
-//       proofs: [
-//         CommitmentProof {
-//           proof: CommitmentProof_Exist {
-//             exist: {
-//               key: "636c69656e74732f323030302d63617264616e6f2d6d69746872696c2d322f636c69656e745374617465",
-//               value: "0a232f6962632e636c69656e74732e6d69746872696c2e76312e436c69656e745374617465121f0a023432120310900b1a0020262a0408c0f407320a080510641a0408111014",
-//               leaf: LeafOp {
-//                 hash: 1,
-//                 prehash_key: 0,
-//                 prehash_value: 1,
-//                 length: 1,
-//                 prefix: "0002e041",
-//               },
-//               path: [
-//                 InnerOp {
-//                   hash: 1,
-//                   prefix: "0204e04120",
-//                   suffix: "200aba125c7d414aec1d9e3b213b223223c3a5ef9474808b39ff069ad39c69cfc1",
-//                 },
-//                 InnerOp {
-//                   hash: 1,
-//                   prefix: "0408e04120",
-//                   suffix: "2029380b21dfdb8c5a9a091e2bda0a9ac2655c79636633d9061768a2ab47265dad",
-//                 },
-//                 InnerOp {
-//                   hash: 1,
-//                   prefix: "060ce04120",
-//                   suffix: "2039eac247da7dc3973a78ae7fc64085cddc7963205a05ace78fe282da5934c1d9",
-//                 },
-//                 InnerOp {
-//                   hash: 1,
-//                   prefix: "0814e04120dc347722e757e290393ef04cbc714b76b5ffd74d31f0ee225e57ac6d9f19784920",
-//                   suffix: "",
-//                 },
-//                 InnerOp {
-//                   hash: 1,
-//                   prefix: "0a2ce04120874d2da69087f29a147724d45e0f1bde72410dca43b75a9392e3198b276a944720",
-//                   suffix: "",
-//                 },
-//                 InnerOp {
-//                   hash: 1,
-//                   prefix: "0c5ce0412001d973048823dc745249b4f8e28a90ea1cd7376fe2dbfda3ca591e609d807fc920",
-//                   suffix: "",
-//                 },
-//                 InnerOp {
-//                   hash: 1,
-//                   prefix: "10c001e04120",
-//                   suffix: "20b6dec90d95d1f49513ea39600b033e1aa94411c0fc7768fd5dc9b5eb9e639f8b",
-//                 },
-//                 InnerOp {
-//                   hash: 1,
-//                   prefix: "12e602e04120c191258c8996f7908445745e2451e61a5e2009c1d57f9f9f4e575cd27e9c70cf20",
-//                   suffix: "",
-//                 },
-//                 InnerOp {
-//                   hash: 1,
-//                   prefix: "14e604e041202c52b6d1c1936db571e427349d8a08a094a597825af1734398ee6c0cff43a61f20",
-//                   suffix: "",
-//                 },
-//               ]
-//             }
-//           }
-//         },
-//         CommitmentProof {
-//           proof: CommitmentProof_Exist {
-//             exist: {
-//               key: "696263",
-//               value: "0017eee38d5e7d7a82f8dee1dc86e54aecb6dc1fcaa9114d99d52e69dae534a6",
-//               leaf: LeafOp {
-//                 hash: 1,
-//                 prehash_key: 0,
-//                 prehash_value: 1,
-//                 length: 1,
-//                 prefix: "00",
-//               },
-//               path: [
-//                 InnerOp {
-//                   hash: 1,
-//                   prefix: "0106b99c0d8119ff1edbcbe165d0f19337dbbc080e677c88e57aa2ae767ebf0f0f",
-//                   suffix: "",
-//                 },
-//                 InnerOp {
-//                   hash: 1,
-//                   prefix: "01",
-//                   suffix: "f03e9a3a8125b3030d3da809a5065fb5f4fb91ae04b45c455218f4844614fc48",
-//                 },
-//                 InnerOp {
-//                   hash: 1,
-//                   prefix: "0124409a1441553dd16e3e14d0545222d206e3deaf20e7556054ed528c9f5d8eed",
-//                   suffix: "",
-//                 },
-//                 InnerOp {
-//                   hash: 1,
-//                   prefix: "0176296b655bd54a7397f37e0b2c6c863029a29e4eeddedcb063c6839209a88996",
-//                   suffix: "",
-//                 },
-//                 InnerOp {
-//                   hash: 1,
-//                   prefix: "01",
-//                   suffix: "381fe6c71ac03eaf7d2bc970c0dd01c055a150251864848311bd448ab19a7833",
-//                 },
-//               ]
-//             }
-//           }
-//         }
-//       ]
-//     },
-//     proof_height: proof_height,
-//   }
-
-//   let verify_proof_redeemer : Redeemer =
-//     BatchVerifyMembership(
-//       [
-//         VerifyMembershipParams {
-//           cs: client_datum_state.client_state,
-//           cons_state: consensus_state,
-//           height: proof_height,
-//           delay_time_period: 0,
-//           delay_block_period: 0,
-//           proof: proof_try,
-//           path: conn_merkle_path,
-//           value: expected_connection_bz,
-//         },
-//         VerifyMembershipParams {
-//           cs: client_datum_state.client_state,
-//           cons_state: consensus_state,
-//           height: proof_height,
-//           delay_time_period: 0,
-//           delay_block_period: 0,
-//           proof: proof_client,
-//           path: client_merkle_path,
-//           value: counterparty_client_state_bz,
-//         },
-//       ],
-//     )
-
-//   let redeemers: Pairs<ScriptPurpose, Redeemer> =
-//     [
-//       Pair(Spend(output_reference), connection_redeemer),
-//       Pair(Mint(verify_proof_policy_id), verify_proof_redeemer),
-//     ]
-
-//   let connection_input = Input {
-//     output_reference: OutputReference {
-//       transaction_id: #"14495989d441944b13bc7f9a7cce4ec71ce97f8eae4db800b9db59884a9ae54e",
-//       output_index: 1,
-//     },
-//     output: Output {
-//       address: Address {
-//         payment_credential: #"7005599342b255c3178be53b53999d84315891725e3e180218b34bccf9"
-//       },
-//       value: from_asset(connection_auth_token.policy_id, connection_auth_token.name, 1),
-//       datum: InlineDatum(input_conn_datum),
-//       reference_script: None,
-//     },
-//   }
-
-//   let transaction =
-//     Transaction {
-//       ..transaction.placeholder,
-//       inputs: inputs,
-//       reference_inputs: reference_inputs,
-//       outputs: outputs,
-//       redeemers: redeemers,
-//       validity_range: validity_range,
-//     }
-
-//   spending_connection.spend_connection.spend(
-//     client_minting_policy_id,
-//     verify_proof_policy_id,
-//     Some(updated_datum),
-//     connection_redeemer,
-//     conn_input.output_reference,
-//     transaction,
-//   )
-// }

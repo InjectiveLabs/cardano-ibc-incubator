@@ -1,6 +1,8 @@
+name: ${GATEWAY_COMPOSE_PROJECT:-gateway}
+
 services:
   app:
-    container_name: gateway-app
+    container_name: ${GATEWAY_CONTAINER_NAME:-gateway-app}
     build:
       context: ../..
       dockerfile: cardano/gateway/Dockerfile
@@ -12,33 +14,21 @@ services:
       PORT: 8000
       # The host-side port mapping below supplies the plaintext trust boundary.
       GRPC_HOST: 0.0.0.0
+      CONSENSUS_HISTORY_CACHE_DIR: /var/lib/cardano-ibc/consensus-history
     networks:
       - cardano_network
     volumes:
+      - consensus-history:/var/lib/cardano-ibc/consensus-history
       - ./dist:/usr/src/app/dist
-      - ../../chains/mithrils/data/aggregator/stores:/usr/chains/mithrils/data/aggregator/stores
       - ../offchain/deployments:/usr/src/app/cardano/offchain/deployments:ro
       - ../../manifests:/usr/src/app/manifests:ro
     env_file:
       - .env
 
-  bridge-history-sync:
-    container_name: gateway-bridge-history-sync
-    build:
-      context: ../..
-      dockerfile: cardano/gateway/Dockerfile
-    command: ["node", "dist/scripts/yaci-bridge-history-sync.js"]
-    restart: on-failure
-    networks:
-      - cardano_network
-    volumes:
-      - ./dist:/usr/src/app/dist
-      - ../offchain/deployments:/usr/src/app/cardano/offchain/deployments:ro
-      - ../../manifests:/usr/src/app/manifests:ro
-    env_file:
-      - .env
+volumes:
+  consensus-history:
 
 networks:
   cardano_network:
-    external: true
-    name: cardano_ibc_net
+    external: ${CARDANO_DOCKER_NETWORK_EXTERNAL:-true}
+    name: ${CARDANO_DOCKER_NETWORK:-cardano_ibc_net}

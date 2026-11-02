@@ -1,30 +1,42 @@
-use aiken/builtin
 use aiken/cbor
 use aiken/collection/list
 use aiken/collection/pairs
-use aiken/fuzz
 use aiken/interval
-use aiken/math
+use aiken/primitive/bytearray
 use cardano/address
 use cardano/assets.{from_asset}
 use cardano/transaction.{
-  InlineDatum, Input, Output, OutputReference, Redeemer, ScriptPurpose, Spend,
-  Transaction, Withdraw,
+  InlineDatum, Input, Mint, Output, OutputReference, Redeemer, ScriptPurpose,
+  Spend, Transaction, Withdraw,
 }
 use host_state_stt
+use ibc/apps/transfer/types/transfer_module_datum.{
+  TransferModuleDatum, empty_escrow_shard_registry_root,
+}
 use ibc/auth.{AuthToken, generate_token_name}
 use ibc/client/ics_007_tendermint_client/client_datum.{
   ClientDatum, ClientDatumState,
 } as client_datum_mod
 use ibc/client/ics_007_tendermint_client/client_redeemer.{
+  CheckClientHistory, CheckStagedClientHistory, ReclaimTransferWithdrawal,
   RecoverClient, RecoverClientWithdrawal, RecoverClientWithdrawalRedeemer,
 }
 use ibc/client/ics_007_tendermint_client/client_state.{ClientState}
-use ibc/client/ics_007_tendermint_client/cometbft/constants.{
-  max_consensus_state_size,
+use ibc/client/ics_007_tendermint_client/cometbft/block/block_id.{
+  BlockID, PartSetHeader,
 }
+use ibc/client/ics_007_tendermint_client/cometbft/block/header.{TmHeader} as tm_header_mod
+use ibc/client/ics_007_tendermint_client/cometbft/protos/types_pb.{Consensus}
+use ibc/client/ics_007_tendermint_client/cometbft/version/consensus.{
+  block_protocol,
+}
+use ibc/client/ics_007_tendermint_client/consensus_history
 use ibc/client/ics_007_tendermint_client/consensus_state.{ConsensusState}
-use ibc/client/ics_007_tendermint_client/height.{Height}
+use ibc/client/ics_007_tendermint_client/height.{Height} as height_mod
+use ibc/client/ics_007_tendermint_client/multitx/client_redeemer as staged_client
+use ibc/client/ics_007_tendermint_client/multitx/types.{
+  BurnSessions, CommitCore, Complete, Finalize, SessionDatum, UpdatePlan,
+}
 use ibc/client/ics_007_tendermint_client/types/unchecked_rational
 use ibc/core/ics_002_client_semantics/types/keys.{client_prefix}
 use ibc/core/ics_023_vector_commitments/merkle
@@ -34,9 +46,13 @@ use ibc/core/ics_025_handler_interface/host_state.{
 }
 use ibc/core/ics_025_handler_interface/host_state_redeemer
 use ibc/core/ics_025_handler_interface/ibc_state_commitment
-use ibc/utils/bits
+use ibc/testing/sparse_tree
+use minting_tendermint_update_session
 use recover_client
 use spending_client
+use spending_multitx_client
+use spending_tendermint_update_session
+use update_staged_client
 
 const host_policy = #"11111111111111111111111111111111111111111111111111111111"
 
@@ -82,6 +98,63 @@ fn substitute_token() -> AuthToken {
   AuthToken { policy_id: client_policy, name: substitute_name }
 }
 
+fn reclaim_transfer(escrow_root: ByteArray, obligation: Int) -> Bool {
+  let port_policy = #"77777777777777777777777777777777777777777777777777777777"
+  let module_policy =
+    #"88888888888888888888888888888888888888888888888888888888"
+  let port_name = "transfer"
+  let module_name = "module"
+  let input =
+    Input {
+      output_reference: OutputReference {
+        transaction_id: #"9999999999999999999999999999999999999999999999999999999999999999",
+        output_index: 0,
+      },
+      output: Output {
+        address: address.from_script("transfer module"),
+        value: from_asset(port_policy, port_name, 1)
+          |> assets.add(module_policy, module_name, 1),
+        datum: InlineDatum(
+          TransferModuleDatum {
+            escrow_shard_registry_root: escrow_root,
+            outstanding_voucher_obligation: obligation,
+          },
+        ),
+        reference_script: None,
+      },
+    }
+  let transaction =
+    Transaction {
+      ..transaction.placeholder,
+      inputs: [input],
+      mint: from_asset(port_policy, port_name, -1)
+        |> assets.add(module_policy, module_name, -1),
+    }
+  recover_client.recover_client.withdraw(
+    host_policy,
+    #"",
+    ReclaimTransferWithdrawal {
+      port_unit: bytearray.concat(port_policy, port_name),
+      module_unit: bytearray.concat(module_policy, module_name),
+      escrow_policy: "unused escrow policy",
+    },
+    address.Script(recovery_script_hash),
+    transaction,
+  )
+}
+
+test reclaim_transfer_accepts_zero_voucher_obligation() {
+  reclaim_transfer(empty_escrow_shard_registry_root, 0)
+}
+
+test reclaim_transfer_rejects_outstanding_voucher_obligation() fail {
+  reclaim_transfer(empty_escrow_shard_registry_root, 1)
+}
+
+test reclaim_transfer_rejects_outstanding_escrow() fail {
+  reclaim_transfer(#"11", 0)
+}
+
 test recovery_token_names_match_client_stt_derivation() {
   let host_token =
     AuthToken { policy_id: host_policy, name: host_state_token_name }
@@ -110,6 +183,7 @@ fn consensus(timestamp: Int, marker: ByteArray) -> ConsensusState {
 
 fn client_state(latest_height: Height, frozen_height: Height) -> ClientState {
   ClientState {
+    upgrade_path: [],
     chain_id: "chain-1",
     trust_level: unchecked_rational.new(1, 3),
     trusting_period,
@@ -129,6 +203,7 @@ fn datum(
 ) -> ClientDatum {
   let consensus_states = [Pair(latest_height, consensus(timestamp, token.name))]
   ClientDatum {
+    history_root: #"0000000000000000000000000000000000000000000000000000000000000000",
     state: ClientDatumState {
       client_state: client_state(latest_height, frozen_height),
       consensus_states,
@@ -151,6 +226,29 @@ fn active_substitute() -> ClientDatum {
   datum(substitute_token(), height(20), active_timestamp, zero_height())
 }
 
+// The counterparty upgraded from chain-1 to chain-2 and restarted its heights,
+// so (2, 5) is later than the subject's (1, 10) despite the smaller height.
+fn renamed_substitute() -> ClientDatum {
+  let substitute =
+    datum(
+      substitute_token(),
+      Height { revision_number: 2, revision_height: 5 },
+      active_timestamp,
+      zero_height(),
+    )
+  ClientDatum {
+    ..substitute,
+    state: ClientDatumState {
+      ..substitute.state,
+      client_state: ClientState {
+        ..substitute.state.client_state,
+        chain_id: "chain-2",
+        trusting_period: trusting_period + 500_000_000,
+      },
+    },
+  }
+}
+
 fn expected_recovered(
   subject: ClientDatum,
   substitute: ClientDatum,
@@ -162,135 +260,27 @@ fn expected_recovered(
     pairs.get_first(substitute.state.processed_times, substitute_height)
   expect Some(substitute_processed_height) =
     pairs.get_first(substitute.state.processed_heights, substitute_height)
-  let final_index =
-    math.min(
-      max_consensus_state_size - 1,
-      list.length(subject.state.consensus_states),
-    )
 
   ClientDatum {
     ..subject,
+    history_root: consensus_history.insert(
+      subject.history_root,
+      consensus_history.from_client(subject),
+      list.repeat(ibc_state_commitment.empty_hash, 64),
+    ),
     state: ClientDatumState {
       client_state: ClientState {
         ..subject.state.client_state,
+        chain_id: substitute.state.client_state.chain_id,
+        trusting_period: substitute.state.client_state.trusting_period,
         frozen_height: zero_height(),
         latest_height: substitute_height,
       },
-      consensus_states: [
-        Pair(substitute_height, substitute_consensus),
-        ..subject.state.consensus_states
-      ]
-        |> list.slice(from: 0, to: final_index),
-      processed_times: [
-        Pair(substitute_height, substitute_time),
-        ..subject.state.processed_times
-      ]
-        |> list.slice(from: 0, to: final_index),
-      processed_heights: [
-        Pair(substitute_height, substitute_processed_height),
-        ..subject.state.processed_heights
-      ]
-        |> list.slice(from: 0, to: final_index),
+      consensus_states: [Pair(substitute_height, substitute_consensus)],
+      processed_times: [Pair(substitute_height, substitute_time)],
+      processed_heights: [Pair(substitute_height, substitute_processed_height)],
     },
   }
-}
-
-fn commitment_key_bit(key_hash: ByteArray, depth: Int) -> Int {
-  let byte_index = 7 - depth / 8
-  let bit_in_byte = depth % 8
-  bits.shr(builtin.index_bytearray(key_hash, byte_index), bit_in_byte) % 2
-}
-
-fn shares_path_above(
-  first_hash: ByteArray,
-  second_hash: ByteArray,
-  depth: Int,
-) -> Bool {
-  let next_depth = depth + 1
-  if next_depth == ibc_state_commitment.merkle_depth_bits {
-    True
-  } else {
-    commitment_key_bit(first_hash, next_depth) == commitment_key_bit(
-      second_hash,
-      next_depth,
-    ) && shares_path_above(first_hash, second_hash, next_depth)
-  }
-}
-
-fn sparse_subtree_root(
-  entries: Pairs<ByteArray, ByteArray>,
-  depth: Int,
-) -> ByteArray {
-  when entries is {
-    [] -> ibc_state_commitment.empty_hash
-    _ ->
-      if depth < 0 {
-        expect [Pair(key, value)] = entries
-        ibc_state_commitment.leaf_hash(
-          builtin.sha2_256(key),
-          ibc_state_commitment.value_hash(value),
-        )
-      } else {
-        let left =
-          list.filter(
-            entries,
-            fn(entry) {
-              commitment_key_bit(builtin.sha2_256(entry.1st), depth) == 0
-            },
-          )
-        let right =
-          list.filter(
-            entries,
-            fn(entry) {
-              commitment_key_bit(builtin.sha2_256(entry.1st), depth) == 1
-            },
-          )
-        ibc_state_commitment.inner_hash(
-          sparse_subtree_root(left, depth - 1),
-          sparse_subtree_root(right, depth - 1),
-        )
-      }
-  }
-}
-
-fn sparse_siblings_go(
-  entries: Pairs<ByteArray, ByteArray>,
-  target_key: ByteArray,
-  target_hash: ByteArray,
-  depth: Int,
-) -> List<ByteArray> {
-  if depth == ibc_state_commitment.merkle_depth_bits {
-    []
-  } else {
-    let target_bit = commitment_key_bit(target_hash, depth)
-    let sibling_entries =
-      list.filter(
-        entries,
-        fn(entry) {
-          let entry_hash = builtin.sha2_256(entry.1st)
-          entry.1st != target_key && commitment_key_bit(entry_hash, depth) != target_bit && shares_path_above(
-            entry_hash,
-            target_hash,
-            depth,
-          )
-        },
-      )
-    [
-      sparse_subtree_root(sibling_entries, depth - 1),
-      ..sparse_siblings_go(entries, target_key, target_hash, depth + 1)
-    ]
-  }
-}
-
-fn sparse_siblings(
-  entries: Pairs<ByteArray, ByteArray>,
-  target_key: ByteArray,
-) -> List<ByteArray> {
-  sparse_siblings_go(entries, target_key, builtin.sha2_256(target_key), 0)
-}
-
-fn sparse_root(entries: Pairs<ByteArray, ByteArray>) -> ByteArray {
-  sparse_subtree_root(entries, ibc_state_commitment.merkle_depth_bits - 1)
 }
 
 const host_reference =
@@ -324,7 +314,14 @@ fn host_datum() -> HostStateDatum {
     },
     nft_policy: host_policy,
     deployer,
-    control: HostStateControl { port_registry: [], shutdown: Active },
+    control: HostStateControl {
+      last_heartbeat_time: 0,
+      port_registry: [],
+      shutdown: Active,
+      live_clients: 0,
+      live_connections: 0,
+      live_channels: 0,
+    },
   }
 }
 
@@ -393,7 +390,10 @@ fn recovery_transaction_with_host(
     }
   let host_redeemer: Redeemer = host_update_redeemer
   let subject_redeemer: Redeemer =
-    RecoverClient { substitute_token: substitute.token }
+    RecoverClient {
+      substitute_token: substitute.token,
+      history_siblings: list.repeat(ibc_state_commitment.empty_hash, 64),
+    }
   let withdrawal_redeemer: Redeemer = recovery_redeemer(subject, substitute)
   let base_redeemers: Pairs<ScriptPurpose, Redeemer> =
     [
@@ -456,7 +456,6 @@ fn recovery_transaction(
     host_state_redeemer.UpdateClient {
       client_state_siblings: [],
       consensus_state_siblings: [],
-      removed_consensus_state_siblings: [],
     },
   )
 }
@@ -470,6 +469,7 @@ fn run_recovery(
 ) -> Bool {
   recover_client.recover_client.withdraw(
     host_policy,
+    #"",
     recovery_redeemer(subject, substitute),
     address.Script(recovery_script_hash),
     recovery_transaction(
@@ -493,8 +493,89 @@ fn run_atomic_recovery_with_policy(
   actual_client_policy: ByteArray,
   verify_host_state: Bool,
 ) -> Bool {
-  let original_subject = frozen_subject()
-  let original_substitute = active_substitute()
+  run_atomic_recovery_for_protocol(
+    correct_output_root,
+    actual_client_policy,
+    verify_host_state,
+    False,
+  )
+}
+
+fn staged_recovery_transaction(
+  tx: Transaction,
+  substitute: AuthToken,
+) -> Transaction {
+  let staged_redeemer: Redeemer =
+    staged_client.RecoverClient {
+      substitute_token: substitute,
+      history_siblings: list.repeat(
+        #"0000000000000000000000000000000000000000000000000000000000000000",
+        64,
+      ),
+    }
+  Transaction {
+    ..tx,
+    redeemers: list.map(
+      tx.redeemers,
+      fn(pair) {
+        if pair.1st == Spend(subject_reference) {
+          Pair(pair.1st, staged_redeemer)
+        } else {
+          pair
+        }
+      },
+    ),
+  }
+}
+
+fn run_atomic_recovery_for_protocol(
+  correct_output_root: Bool,
+  actual_client_policy: ByteArray,
+  verify_host_state: Bool,
+  staged: Bool,
+) -> Bool {
+  run_atomic_recovery_with_validation(
+    correct_output_root,
+    actual_client_policy,
+    verify_host_state,
+    staged,
+    True,
+  )
+}
+
+// Serializing the complete context keeps every fixture field in both halves
+// of the budget pair. These are context bytes, not signed transaction bytes.
+fn atomic_fixture_is_constructed(tx: Transaction) -> Bool {
+  bytearray.length(cbor.serialise(tx)) > 0
+}
+
+fn run_atomic_recovery_with_validation(
+  correct_output_root: Bool,
+  actual_client_policy: ByteArray,
+  verify_host_state: Bool,
+  staged: Bool,
+  verify_validators: Bool,
+) -> Bool {
+  run_atomic_recovery_between(
+    frozen_subject(),
+    active_substitute(),
+    correct_output_root,
+    actual_client_policy,
+    verify_host_state,
+    staged,
+    verify_validators,
+  )
+}
+
+fn run_atomic_recovery_between(
+  original_subject: ClientDatum,
+  original_substitute: ClientDatum,
+  correct_output_root: Bool,
+  actual_client_policy: ByteArray,
+  verify_host_state: Bool,
+  staged: Bool,
+  verify_validators: Bool,
+) -> Bool {
   let subject =
     ClientDatum {
       ..original_subject,
@@ -512,21 +593,32 @@ fn run_atomic_recovery_with_policy(
       },
     }
   let recovered = expected_recovered(subject, substitute)
+  let subject_height = subject.state.client_state.latest_height
+  let substitute_height = substitute.state.client_state.latest_height
   let subject_client_key = client_keys.full_client_state_path("07-tendermint-0")
   let subject_old_consensus_key =
-    client_keys.full_client_consensus_state_path("07-tendermint-0", "10")
+    client_keys.full_client_consensus_state_path(
+      "07-tendermint-0",
+      height_mod.to_string(subject_height),
+    )
   let subject_new_consensus_key =
-    client_keys.full_client_consensus_state_path("07-tendermint-0", "20")
+    client_keys.full_client_consensus_state_path(
+      "07-tendermint-0",
+      height_mod.to_string(substitute_height),
+    )
   let substitute_client_key =
     client_keys.full_client_state_path("07-tendermint-1")
   let substitute_consensus_key =
-    client_keys.full_client_consensus_state_path("07-tendermint-1", "20")
+    client_keys.full_client_consensus_state_path(
+      "07-tendermint-1",
+      height_mod.to_string(substitute_height),
+    )
   expect Some(subject_old_consensus) =
-    pairs.get_first(subject.state.consensus_states, height(10))
+    pairs.get_first(subject.state.consensus_states, subject_height)
   expect Some(subject_new_consensus) =
-    pairs.get_first(substitute.state.consensus_states, height(20))
+    pairs.get_first(substitute.state.consensus_states, substitute_height)
   expect Some(substitute_consensus) =
-    pairs.get_first(substitute.state.consensus_states, height(20))
+    pairs.get_first(substitute.state.consensus_states, substitute_height)
   let old_entries: Pairs<ByteArray, ByteArray> =
     [
       Pair(subject_client_key, cbor.serialise(subject.state.client_state)),
@@ -534,8 +626,9 @@ fn run_atomic_recovery_with_policy(
       Pair(substitute_client_key, cbor.serialise(substitute.state.client_state)),
       Pair(substitute_consensus_key, cbor.serialise(substitute_consensus)),
     ]
-  let old_root = sparse_root(old_entries)
-  let client_state_siblings = sparse_siblings(old_entries, subject_client_key)
+  let old_root = sparse_tree.root(old_entries)
+  let client_state_siblings =
+    sparse_tree.siblings(old_entries, subject_client_key)
   let root_after_client_update =
     ibc_state_commitment.apply_update(
       old_root,
@@ -551,9 +644,10 @@ fn run_atomic_recovery_with_policy(
       Pair(substitute_client_key, cbor.serialise(substitute.state.client_state)),
       Pair(substitute_consensus_key, cbor.serialise(substitute_consensus)),
     ]
-  expect root_after_client_update == sparse_root(entries_after_client_update)
+  expect
+    root_after_client_update == sparse_tree.root(entries_after_client_update)
   let consensus_state_siblings =
-    sparse_siblings(entries_after_client_update, subject_new_consensus_key)
+    sparse_tree.siblings(entries_after_client_update, subject_new_consensus_key)
   let new_root =
     ibc_state_commitment.apply_update(
       root_after_client_update,
@@ -567,7 +661,7 @@ fn run_atomic_recovery_with_policy(
       Pair(subject_new_consensus_key, cbor.serialise(subject_new_consensus)),
       ..entries_after_client_update
     ]
-  expect new_root == sparse_root(final_entries)
+  expect new_root == sparse_tree.root(final_entries)
   let old_host_datum = host_datum_at(old_root, 0)
   let output_root =
     if correct_output_root {
@@ -580,7 +674,6 @@ fn run_atomic_recovery_with_policy(
     host_state_redeemer.UpdateClient {
       client_state_siblings,
       consensus_state_siblings,
-      removed_consensus_state_siblings: [],
     }
   let transaction =
     recovery_transaction_with_host(
@@ -596,38 +689,75 @@ fn run_atomic_recovery_with_policy(
       host_update_redeemer,
     )
 
-  expect
-    spending_client.spend_client.spend(
-      host_policy,
-      address.Script(recovery_script_hash),
-      Some(subject),
-      RecoverClient { substitute_token: substitute.token },
-      subject_reference,
-      transaction,
-    )
-  expect
-    recover_client.recover_client.withdraw(
-      host_policy,
-      recovery_redeemer(subject, substitute),
-      address.Script(recovery_script_hash),
-      transaction,
-    )
-  if verify_host_state {
-    host_state_stt.host_state_stt.spend(
-      host_policy,
-      client_script_hash,
-      connection_script_hash,
-      channel_script_hash,
-      client_policy,
-      "unused connection minting policy",
-      "unused channel minting policy",
-      Some(old_host_datum),
-      host_update_redeemer,
-      host_reference,
-      transaction,
-    )
-  } else {
+  let transaction =
+    if staged {
+      staged_recovery_transaction(transaction, substitute.token)
+    } else {
+      transaction
+    }
+  expect atomic_fixture_is_constructed(transaction)
+  if !verify_validators {
     True
+  } else {
+    expect
+      if staged {
+        spending_multitx_client.spend_multitx_client.spend(
+          host_policy,
+          "unused session mint policy",
+          address.Script(recovery_script_hash),
+          Some(subject),
+          staged_client.RecoverClient {
+            substitute_token: substitute.token,
+            history_siblings: list.repeat(
+              #"0000000000000000000000000000000000000000000000000000000000000000",
+              64,
+            ),
+          },
+          subject_reference,
+          transaction,
+        )
+      } else {
+        spending_client.spend_client.spend(
+          host_policy,
+          address.Script(recovery_script_hash),
+          Some(subject),
+          RecoverClient {
+            substitute_token: substitute.token,
+            history_siblings: list.repeat(
+              #"0000000000000000000000000000000000000000000000000000000000000000",
+              64,
+            ),
+          },
+          subject_reference,
+          transaction,
+        )
+      }
+    expect
+      recover_client.recover_client.withdraw(
+        host_policy,
+        #"",
+        recovery_redeemer(subject, substitute),
+        address.Script(recovery_script_hash),
+        transaction,
+      )
+    if verify_host_state {
+      host_state_stt.host_state_stt.spend(
+        host_policy,
+        client_script_hash,
+        connection_script_hash,
+        channel_script_hash,
+        client_policy,
+        "unused connection minting policy",
+        "unused channel minting policy",
+        "",
+        Some(old_host_datum),
+        host_update_redeemer,
+        host_reference,
+        transaction,
+      )
+    } else {
+      True
+    }
   }
 }
 
@@ -645,6 +775,557 @@ test atomic_recovery_host_rejects_counterfeit_client_policy() fail {
 
 test counterfeit_recovery_pair_passes_local_validators() {
   run_atomic_recovery_with_policy(True, other_client_policy, False)
+}
+
+test staged_atomic_recovery_all_validators_accept_real_root_transition() {
+  run_atomic_recovery_for_protocol(True, client_policy, True, True)
+}
+
+test staged_atomic_recovery_fixture_setup_baseline() {
+  run_atomic_recovery_with_validation(True, client_policy, True, True, False)
+}
+
+test atomic_recovery_follows_renamed_chain_across_height_reset() {
+  run_atomic_recovery_between(
+    frozen_subject(),
+    renamed_substitute(),
+    True,
+    client_policy,
+    True,
+    False,
+    True,
+  )
+}
+
+test staged_atomic_recovery_follows_renamed_chain_across_height_reset() {
+  run_atomic_recovery_between(
+    expired_subject(),
+    renamed_substitute(),
+    True,
+    client_policy,
+    True,
+    True,
+    True,
+  )
+}
+
+const evidence_session_policy =
+  #"abababababababababababababababababababababababababababab"
+
+const evidence_session_script =
+  #"acacacacacacacacacacacacacacacacacacacacacacacacacacacac"
+
+const evidence_validator_root =
+  #"adadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadad"
+
+fn freeze_receipt(
+  token_name: ByteArray,
+  app_hash: ByteArray,
+  subject: ClientDatum,
+) -> SessionDatum {
+  expect [Pair(trusted_height, trusted_consensus_state)] =
+    subject.state.consensus_states
+  let header =
+    TmHeader {
+      ..tm_header_mod.null_tm_header(),
+      version: Consensus { block: block_protocol, app: 0 },
+      chain_id: subject.state.client_state.chain_id,
+      height: trusted_height.revision_height + 1,
+      time: active_timestamp + 100_000_000,
+      validators_hash: evidence_validator_root,
+      next_validators_hash: evidence_validator_root,
+      app_hash,
+    }
+  SessionDatum {
+    session_token: AuthToken {
+      policy_id: evidence_session_policy,
+      name: token_name,
+    },
+    owner: deployer,
+    plan: UpdatePlan {
+      client_token: subject.token,
+      trusted_height,
+      trusted_consensus_state,
+      trust_level: subject.state.client_state.trust_level,
+      trusting_period: subject.state.client_state.trusting_period,
+      max_clock_drift: subject.state.client_state.max_clock_drift,
+      header,
+      commit: CommitCore {
+        height: header.height,
+        round: 0,
+        block_id: BlockID {
+          hash: tm_header_mod.hash(header),
+          part_set_header: PartSetHeader {
+            total: 1,
+            hash: evidence_validator_root,
+          },
+        },
+      },
+      target_validator_count: 1,
+      trusted_validator_count: 0,
+    },
+    phase: Complete {
+      target_root: evidence_validator_root,
+      target_total_power: 10,
+      target_signed_power: 10,
+      trusted_root: None,
+      trusted_total_power: 0,
+      trusted_signed_power: 0,
+    },
+  }
+}
+
+fn freeze_session_input(receipt: SessionDatum, tx_hash: ByteArray) -> Input {
+  Input {
+    output_reference: OutputReference {
+      transaction_id: tx_hash,
+      output_index: 0,
+    },
+    output: Output {
+      address: address.from_script(evidence_session_script),
+      value: from_asset(evidence_session_policy, receipt.session_token.name, 1),
+      datum: InlineDatum(receipt),
+      reference_script: None,
+    },
+  }
+}
+
+fn run_atomic_staged_freeze(correct_root: Bool, verify_validators: Bool) -> Bool {
+  let original_subject =
+    datum(subject_token(), height(10), active_timestamp, zero_height())
+  let subject =
+    ClientDatum {
+      ..original_subject,
+      state: ClientDatumState {
+        ..original_subject.state,
+        consensus_states: [
+          Pair(height(10), consensus(active_timestamp, evidence_validator_root)),
+        ],
+      },
+    }
+  let frozen =
+    ClientDatum {
+      ..subject,
+      state: ClientDatumState {
+        ..subject.state,
+        client_state: ClientState {
+          ..subject.state.client_state,
+          frozen_height: Height { revision_number: 0, revision_height: 1 },
+        },
+      },
+    }
+  let client_key = client_keys.full_client_state_path("07-tendermint-0")
+  let consensus_key =
+    client_keys.full_client_consensus_state_path("07-tendermint-0", "1-10")
+  expect [Pair(_, trusted)] = subject.state.consensus_states
+  let old_entries =
+    [
+      Pair(client_key, cbor.serialise(subject.state.client_state)),
+      Pair(consensus_key, cbor.serialise(trusted)),
+    ]
+  let old_root = sparse_tree.root(old_entries)
+  let client_state_siblings = sparse_tree.siblings(old_entries, client_key)
+  let new_root =
+    ibc_state_commitment.apply_update(
+      old_root,
+      client_key,
+      cbor.serialise(subject.state.client_state),
+      cbor.serialise(frozen.state.client_state),
+      client_state_siblings,
+    )
+  expect
+    new_root == sparse_tree.root(
+      [
+        Pair(client_key, cbor.serialise(frozen.state.client_state)),
+        Pair(consensus_key, cbor.serialise(trusted)),
+      ],
+    )
+  let old_host = host_datum_at(old_root, 0)
+  let new_host =
+    host_datum_at(
+      if correct_root {
+        new_root
+      } else {
+        old_root
+      },
+      1,
+    )
+  let first =
+    freeze_receipt(
+      evidence_validator_root,
+      #"aeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeae",
+      subject,
+    )
+  let second =
+    freeze_receipt(
+      #"afafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafaf",
+      evidence_validator_root,
+      subject,
+    )
+  let first_input =
+    freeze_session_input(
+      first,
+      #"babababababababababababababababababababababababababababababababa",
+    )
+  let second_input =
+    freeze_session_input(
+      second,
+      #"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    )
+  let host_redeemer =
+    host_state_redeemer.UpdateClient {
+      client_state_siblings,
+      consensus_state_siblings: [],
+    }
+
+  let client_redeemer =
+    staged_client.FinalizeMisbehaviour {
+      history_witnesses: [],
+      session_token_1: first.session_token,
+      session_token_2: second.session_token,
+    }
+  let mint_redeemer =
+    BurnSessions {
+      token_names: [first.session_token.name, second.session_token.name],
+    }
+  let host_redeemer_data: Redeemer = host_redeemer
+  let client_redeemer_data: Redeemer = client_redeemer
+  let mint_redeemer_data: Redeemer = mint_redeemer
+  let history_redeemer =
+    CheckStagedClientHistory { subject_token: subject.token }
+  let history_data: Redeemer = history_redeemer
+  let finalization_data: Redeemer = Finalize
+  let tx =
+    Transaction {
+      ..transaction.placeholder,
+      inputs: [
+        Input {
+          output_reference: host_reference,
+          output: host_output_with_datum(old_host),
+        },
+        Input {
+          output_reference: subject_reference,
+          output: client_output(subject, client_script_hash),
+        },
+        first_input,
+        second_input,
+      ],
+      outputs: [
+        host_output_with_datum(new_host),
+        client_output(frozen, client_script_hash),
+      ],
+      validity_range: interval.between(1900, 2000),
+      extra_signatories: [deployer],
+      mint: from_asset(evidence_session_policy, first.session_token.name, -1)
+        |> assets.add(evidence_session_policy, second.session_token.name, -1),
+      withdrawals: [Pair(address.Script(recovery_script_hash), 0)],
+      redeemers: [
+        Pair(Withdraw(address.Script(recovery_script_hash)), history_data),
+        Pair(Spend(host_reference), host_redeemer_data),
+        Pair(Spend(subject_reference), client_redeemer_data),
+        Pair(Spend(first_input.output_reference), finalization_data),
+        Pair(Spend(second_input.output_reference), finalization_data),
+        Pair(Mint(evidence_session_policy), mint_redeemer_data),
+      ],
+    }
+  expect atomic_fixture_is_constructed(tx)
+  if !verify_validators {
+    True
+  } else {
+    and {
+      update_staged_client.update_staged_client.withdraw(
+        host_policy,
+        evidence_session_policy,
+        recovery_script_hash,
+        history_redeemer,
+        address.Script(recovery_script_hash),
+        tx,
+      ),
+      spending_multitx_client.spend_multitx_client.spend(
+        host_policy,
+        recovery_script_hash,
+        address.Script(recovery_script_hash),
+        Some(subject),
+        client_redeemer,
+        subject_reference,
+        tx,
+      ),
+      spending_tendermint_update_session.spend_tendermint_update_session.spend(
+        host_policy,
+        Some(first),
+        Finalize,
+        first_input.output_reference,
+        tx,
+      ),
+      spending_tendermint_update_session.spend_tendermint_update_session.spend(
+        host_policy,
+        Some(second),
+        Finalize,
+        second_input.output_reference,
+        tx,
+      ),
+      minting_tendermint_update_session.mint_tendermint_update_session.mint(
+        evidence_session_script,
+        mint_redeemer,
+        evidence_session_policy,
+        tx,
+      ),
+      host_state_stt.host_state_stt.spend(
+        host_policy,
+        client_script_hash,
+        connection_script_hash,
+        channel_script_hash,
+        client_policy,
+        "unused connection minting policy",
+        "unused channel minting policy",
+        "",
+        Some(old_host),
+        host_redeemer,
+        host_reference,
+        tx,
+      ),
+    }
+  }
+}
+
+test staged_atomic_freeze_fixture_setup_baseline() {
+  run_atomic_staged_freeze(True, False)
+}
+
+test staged_atomic_freeze_all_validators_accept_real_root_transition() {
+  run_atomic_staged_freeze(True, True)
+}
+
+test staged_atomic_freeze_host_rejects_wrong_committed_root() fail {
+  run_atomic_staged_freeze(False, True)
+}
+
+test staged_atomic_recovery_host_rejects_wrong_committed_root() fail {
+  run_atomic_recovery_for_protocol(False, client_policy, True, True)
+}
+
+test staged_atomic_recovery_host_rejects_counterfeit_client_policy() fail {
+  run_atomic_recovery_for_protocol(True, other_client_policy, True, True)
+}
+
+fn run_staged_recovery(
+  subject: ClientDatum,
+  substitute: ClientDatum,
+  recovered: ClientDatum,
+  substitute_script_hash: ByteArray,
+  signers: List<ByteArray>,
+) -> Bool {
+  let tx =
+    recovery_transaction(
+      subject,
+      substitute,
+      recovered,
+      substitute_script_hash,
+      signers,
+      True,
+      True,
+    )
+      |> staged_recovery_transaction(substitute.token)
+  and {
+    spending_multitx_client.spend_multitx_client.spend(
+      host_policy,
+      "unused session mint policy",
+      address.Script(recovery_script_hash),
+      Some(subject),
+      staged_client.RecoverClient {
+        substitute_token: substitute.token,
+        history_siblings: list.repeat(
+          #"0000000000000000000000000000000000000000000000000000000000000000",
+          64,
+        ),
+      },
+      subject_reference,
+      tx,
+    ),
+    recover_client.recover_client.withdraw(
+      host_policy,
+      #"",
+      recovery_redeemer(subject, substitute),
+      address.Script(recovery_script_hash),
+      tx,
+    ),
+  }
+}
+
+test staged_recovery_accepts_expired_subject() {
+  let subject = expired_subject()
+  let substitute = active_substitute()
+  run_staged_recovery(
+    subject,
+    substitute,
+    expected_recovered(subject, substitute),
+    client_script_hash,
+    [deployer],
+  )
+}
+
+test staged_recovery_accepts_frozen_subject() {
+  let subject = frozen_subject()
+  let substitute = active_substitute()
+  run_staged_recovery(
+    subject,
+    substitute,
+    expected_recovered(subject, substitute),
+    client_script_hash,
+    [deployer],
+  )
+}
+
+test staged_recovery_rejects_missing_authority() fail {
+  let subject = frozen_subject()
+  let substitute = active_substitute()
+  run_staged_recovery(
+    subject,
+    substitute,
+    expected_recovered(subject, substitute),
+    client_script_hash,
+    [],
+  )
+}
+
+test staged_recovery_rejects_active_subject() fail {
+  let subject =
+    datum(subject_token(), height(10), active_timestamp, zero_height())
+  let substitute = active_substitute()
+  run_staged_recovery(
+    subject,
+    substitute,
+    expected_recovered(subject, substitute),
+    client_script_hash,
+    [deployer],
+  )
+}
+
+test staged_recovery_rejects_frozen_substitute() fail {
+  let subject = frozen_subject()
+  let substitute =
+    datum(substitute_token(), height(20), active_timestamp, height(7))
+  run_staged_recovery(
+    subject,
+    substitute,
+    expected_recovered(subject, substitute),
+    client_script_hash,
+    [deployer],
+  )
+}
+
+test staged_recovery_rejects_expired_substitute() fail {
+  let subject = frozen_subject()
+  let substitute = datum(substitute_token(), height(20), 0, zero_height())
+  run_staged_recovery(
+    subject,
+    substitute,
+    expected_recovered(subject, substitute),
+    client_script_hash,
+    [deployer],
+  )
+}
+
+test staged_recovery_rejects_older_substitute() fail {
+  let subject = frozen_subject()
+  let substitute =
+    datum(substitute_token(), height(9), active_timestamp, zero_height())
+  run_staged_recovery(
+    subject,
+    substitute,
+    expected_recovered(subject, substitute),
+    client_script_hash,
+    [deployer],
+  )
+}
+
+test staged_recovery_rejects_another_client_address() fail {
+  let subject = frozen_subject()
+  let substitute = active_substitute()
+  run_staged_recovery(
+    subject,
+    substitute,
+    expected_recovered(subject, substitute),
+    other_client_script_hash,
+    [deployer],
+  )
+}
+
+test staged_recovery_rejects_changed_immutable_parameters() fail {
+  let subject = frozen_subject()
+  let original_substitute = active_substitute()
+  let substitute =
+    ClientDatum {
+      ..original_substitute,
+      state: ClientDatumState {
+        ..original_substitute.state,
+        client_state: ClientState {
+          ..original_substitute.state.client_state,
+          unbonding_period: original_substitute.state.client_state.unbonding_period + 1,
+        },
+      },
+    }
+  run_staged_recovery(
+    subject,
+    substitute,
+    expected_recovered(subject, substitute),
+    client_script_hash,
+    [deployer],
+  )
+}
+
+test staged_recovery_rejects_missing_authority_withdrawal() fail {
+  let subject = frozen_subject()
+  let substitute = active_substitute()
+  let tx =
+    recovery_transaction(
+      subject,
+      substitute,
+      expected_recovered(subject, substitute),
+      client_script_hash,
+      [deployer],
+      False,
+      False,
+    )
+      |> staged_recovery_transaction(substitute.token)
+  spending_multitx_client.spend_multitx_client.spend(
+    host_policy,
+    "unused session mint policy",
+    address.Script(recovery_script_hash),
+    Some(subject),
+    staged_client.RecoverClient {
+      substitute_token: substitute.token,
+      history_siblings: list.repeat(
+        #"0000000000000000000000000000000000000000000000000000000000000000",
+        64,
+      ),
+    },
+    subject_reference,
+    tx,
+  )
+}
+
+test staged_recovery_rejects_another_substitute_in_spend() fail {
+  let subject = frozen_subject()
+  let substitute = active_substitute()
+  let tx =
+    recovery_transaction(
+      subject,
+      substitute,
+      expected_recovered(subject, substitute),
+      client_script_hash,
+      [deployer],
+      True,
+      True,
+    )
+      |> staged_recovery_transaction(subject.token)
+  recover_client.recover_client.withdraw(
+    host_policy,
+    #"",
+    recovery_redeemer(subject, substitute),
+    address.Script(recovery_script_hash),
+    tx,
+  )
 }
 
 test recover_state_copies_checkpoint_and_clears_frozen() {
@@ -671,6 +1352,7 @@ fn history(first_height: Int, count: Int) -> Pairs<Height, ConsensusState> {
 fn subject_with_history(history_size: Int) -> ClientDatum {
   let consensus_states = history(history_size, history_size)
   ClientDatum {
+    history_root: #"0000000000000000000000000000000000000000000000000000000000000000",
     state: ClientDatumState {
       client_state: client_state(height(history_size), zero_height()),
       consensus_states,
@@ -696,142 +1378,112 @@ fn substitute_after(history_size: Int) -> ClientDatum {
   )
 }
 
-fn run_recovery_with_history(history_size: Int) -> Bool {
-  let subject = subject_with_history(history_size)
-  let substitute = substitute_after(history_size)
-  run_recovery(
+test recovery_rejects_legacy_300_entry_datum() fail {
+  let subject = subject_with_history(300)
+  let substitute = substitute_after(300)
+  client_datum_mod.recover_state(
     subject,
     substitute,
     expected_recovered(subject, substitute),
-    client_script_hash,
-    [deployer],
   )
 }
 
-fn recovery_transaction_fixture_with_history(history_size: Int) -> Bool {
-  let subject = subject_with_history(history_size)
-  let substitute = substitute_after(history_size)
+test recovery_keeps_one_tip_after_300_updates() {
+  // Earlier records are committed off-chain and are not recovery inputs.
+  let subject = datum(subject_token(), height(300), 0, zero_height())
+  let substitute = substitute_after(300)
+  let recovered = expected_recovered(subject, substitute)
   let transaction =
     recovery_transaction(
       subject,
       substitute,
-      expected_recovered(subject, substitute),
+      recovered,
       client_script_hash,
       [deployer],
       True,
       True,
     )
-
   and {
+    client_datum_mod.recover_state(subject, substitute, recovered),
+    list.length(recovered.state.consensus_states) == 1,
+    list.length(recovered.state.processed_times) == 1,
+    list.length(recovered.state.processed_heights) == 1,
     list.length(transaction.inputs) == 2,
     list.length(transaction.reference_inputs) == 1,
     list.length(transaction.outputs) == 2,
-    list.length(transaction.withdrawals) == 1,
-    list.length(transaction.extra_signatories) == 1,
     list.length(transaction.redeemers) == 3,
+    run_recovery(subject, substitute, recovered, client_script_hash, [deployer]),
   }
 }
 
-// These large-history tests are diagnostic cost probes. A passing result only
-// means the transition is correct. It does not mean the full three-script
-// recovery transaction fits public execution limits. The 150 and 300 entry
-// withdrawal-validator probes already exceed the public memory limit alone.
-test recovery_capacity_fixture_300_cost() {
-  let subject = subject_with_history(max_consensus_state_size)
-  let substitute = substitute_after(max_consensus_state_size)
+test recovery_adopts_substitute_chain_id_and_trusting_period() {
+  let subject = expired_subject()
+  let substitute = renamed_substitute()
   let recovered = expected_recovered(subject, substitute)
-
-  and {
-    list.length(subject.state.consensus_states) == max_consensus_state_size,
-    list.length(subject.state.processed_times) == max_consensus_state_size,
-    list.length(subject.state.processed_heights) == max_consensus_state_size,
-    list.length(recovered.state.consensus_states) == max_consensus_state_size,
-    list.length(recovered.state.processed_times) == max_consensus_state_size,
-    list.length(recovered.state.processed_heights) == max_consensus_state_size,
-  }
-}
-
-test recover_state_at_capacity_evicts_only_one_tail() {
-  let subject = subject_with_history(max_consensus_state_size)
-  let substitute = substitute_after(max_consensus_state_size)
-  let recovered = expected_recovered(subject, substitute)
-
   and {
     client_datum_mod.recover_state(subject, substitute, recovered),
-    list.length(recovered.state.consensus_states) == max_consensus_state_size,
-    pairs.has_key(recovered.state.consensus_states, height(2)),
-    !pairs.has_key(recovered.state.consensus_states, height(1)),
+    recovered.state.client_state.chain_id == "chain-2",
+    recovered.state.client_state.trusting_period == substitute.state.client_state.trusting_period,
   }
 }
 
-test recover_client_validator_history_50_cost() {
-  run_recovery_with_history(50)
-}
-
-test recovery_transaction_fixture_history_50_cost() {
-  recovery_transaction_fixture_with_history(50)
-}
-
-test recover_client_validator_history_100_cost() {
-  run_recovery_with_history(100)
-}
-
-test recovery_transaction_fixture_history_100_cost() {
-  recovery_transaction_fixture_with_history(100)
-}
-
-test recover_client_validator_history_150_cost() {
-  run_recovery_with_history(150)
-}
-
-test recovery_transaction_fixture_history_150_cost() {
-  recovery_transaction_fixture_with_history(150)
-}
-
-test recover_client_validator_history_300_cost() {
-  run_recovery_with_history(max_consensus_state_size)
-}
-
-test recovery_transaction_fixture_history_300_cost() {
-  recovery_transaction_fixture_with_history(max_consensus_state_size)
-}
-
-test recovery_parameters_reject_chain_id_change() fail {
+test recovery_rejects_output_keeping_subject_chain_id() fail {
   let subject = expired_subject()
-  let substitute = active_substitute()
-  let incompatible_substitute =
-    ClientDatum {
-      ..substitute,
-      state: ClientDatumState {
-        ..substitute.state,
-        client_state: ClientState {
-          ..substitute.state.client_state,
-          chain_id: "another-chain-1",
-        },
-      },
-    }
+  let substitute = renamed_substitute()
+  let recovered = expected_recovered(subject, substitute)
   client_datum_mod.recover_state(
     subject,
-    incompatible_substitute,
-    expected_recovered(subject, incompatible_substitute),
+    substitute,
+    ClientDatum {
+      ..recovered,
+      state: ClientDatumState {
+        ..recovered.state,
+        client_state: ClientState {
+          ..recovered.state.client_state,
+          chain_id: subject.state.client_state.chain_id,
+        },
+      },
+    },
   )
 }
 
-test recovery_parameters_require_exact_immutable_fields() {
+test recovery_rejects_output_keeping_subject_trusting_period() fail {
+  let subject = expired_subject()
+  let substitute = renamed_substitute()
+  let recovered = expected_recovered(subject, substitute)
+  client_datum_mod.recover_state(
+    subject,
+    substitute,
+    ClientDatum {
+      ..recovered,
+      state: ClientDatumState {
+        ..recovered.state,
+        client_state: ClientState {
+          ..recovered.state.client_state,
+          trusting_period: subject.state.client_state.trusting_period,
+        },
+      },
+    },
+  )
+}
+
+test recovery_parameters_ignore_chain_id_and_trusting_period_only() {
   let subject = expired_subject().state.client_state
 
   and {
-    !client_datum_mod.recovery_parameters_match(
+    client_datum_mod.recovery_parameters_match(
       subject,
-      ClientState { ..subject, chain_id: "another-chain-1" },
+      ClientState {
+        ..subject,
+        chain_id: "another-chain-2",
+        trusting_period: trusting_period + 1,
+        frozen_height: height(1),
+        latest_height: height(20),
+      },
     ),
     !client_datum_mod.recovery_parameters_match(
       subject,
       ClientState { ..subject, trust_level: unchecked_rational.new(2, 3) },
-    ),
-    !client_datum_mod.recovery_parameters_match(
-      subject,
-      ClientState { ..subject, trusting_period: trusting_period + 1 },
     ),
     !client_datum_mod.recovery_parameters_match(
       subject,
@@ -845,7 +1497,30 @@ test recovery_parameters_require_exact_immutable_fields() {
       subject,
       ClientState { ..subject, proof_specs: merkle.get_sdk_specs() },
     ),
-    client_datum_mod.recovery_parameters_match(
+    !client_datum_mod.recovery_parameters_match(
+      subject,
+      ClientState { ..subject, upgrade_path: ["upgrade", "upgradedIBCState"] },
+    ),
+  }
+}
+
+test immutable_parameters_also_fix_chain_id_and_trusting_period() {
+  let subject = expired_subject().state.client_state
+
+  and {
+    !client_datum_mod.immutable_parameters_match(
+      subject,
+      ClientState { ..subject, chain_id: "another-chain-1" },
+    ),
+    !client_datum_mod.immutable_parameters_match(
+      subject,
+      ClientState { ..subject, trusting_period: trusting_period + 1 },
+    ),
+    !client_datum_mod.immutable_parameters_match(
+      subject,
+      ClientState { ..subject, unbonding_period: subject.unbonding_period + 1 },
+    ),
+    client_datum_mod.immutable_parameters_match(
       subject,
       ClientState {
         ..subject,
@@ -854,6 +1529,85 @@ test recovery_parameters_require_exact_immutable_fields() {
       },
     ),
   }
+}
+
+fn state_value_recovery(output_ada: Int, output_reserve: Int) -> Bool {
+  let subject = expired_subject()
+  let substitute = active_substitute()
+  let transaction =
+    recovery_transaction(
+      subject,
+      substitute,
+      expected_recovered(subject, substitute),
+      client_script_hash,
+      [deployer],
+      True,
+      True,
+    )
+  expect [host_input, subject_input] = transaction.inputs
+  expect [subject_output, host_output] = transaction.outputs
+  let subject_input =
+    Input {
+      ..subject_input,
+      output: Output {
+        ..subject_input.output,
+        value: subject_input.output.value
+          |> assets.merge(assets.from_lovelace(8_000_000))
+          |> assets.add("reserve policy", "reserve", 7),
+      },
+    }
+  let subject_output =
+    Output {
+      ..subject_output,
+      value: subject_output.value
+        |> assets.merge(assets.from_lovelace(output_ada))
+        |> assets.add("reserve policy", "reserve", output_reserve),
+    }
+  let transaction =
+    Transaction {
+      ..transaction,
+      inputs: [host_input, subject_input],
+      outputs: [subject_output, host_output],
+    }
+  and {
+    spending_client.spend_client.spend(
+      host_policy,
+      address.Script(recovery_script_hash),
+      Some(subject),
+      RecoverClient {
+        substitute_token: substitute.token,
+        history_siblings: list.repeat(
+          #"0000000000000000000000000000000000000000000000000000000000000000",
+          64,
+        ),
+      },
+      subject_reference,
+      transaction,
+    ),
+    recover_client.recover_client.withdraw(
+      host_policy,
+      #"",
+      recovery_redeemer(subject, substitute),
+      address.Script(recovery_script_hash),
+      transaction,
+    ),
+  }
+}
+
+test state_value_recovery_preserves_existing_unrelated_assets() {
+  state_value_recovery(8_000_000, 7)
+}
+
+test state_value_recovery_allows_ada_top_up() {
+  state_value_recovery(10_000_000, 7)
+}
+
+test state_value_recovery_rejects_ada_sweep() fail {
+  state_value_recovery(2_000_000, 7)
+}
+
+test state_value_recovery_rejects_unrelated_asset_sweep() fail {
+  state_value_recovery(8_000_000, 0)
 }
 
 test recover_client_accepts_expired_subject() {
@@ -880,9 +1634,7 @@ test recover_client_accepts_frozen_subject() {
   )
 }
 
-test prop_client_recovery_accepts_expired_subject(_seed via fuzz.int()) {
-  fuzz.label(@"regression.contract.client.recovery.valid_expired")
-
+test regression_client_recovery_accepts_expired_subject() {
   let subject = expired_subject()
   let substitute = active_substitute()
   run_recovery(
@@ -894,9 +1646,7 @@ test prop_client_recovery_accepts_expired_subject(_seed via fuzz.int()) {
   )
 }
 
-test prop_client_recovery_accepts_frozen_subject(_seed via fuzz.int()) {
-  fuzz.label(@"regression.contract.client.recovery.valid_frozen")
-
+test regression_client_recovery_accepts_frozen_subject() {
   let subject = frozen_subject()
   let substitute = active_substitute()
   run_recovery(
@@ -920,9 +1670,7 @@ test recover_client_rejects_missing_authority() fail {
   )
 }
 
-test prop_client_recovery_rejects_missing_authority(_seed via fuzz.int()) fail {
-  fuzz.label(@"regression.contract.client.recovery.invalid_missing_authority")
-
+test regression_client_recovery_rejects_missing_authority() fail {
   let subject = expired_subject()
   let substitute = active_substitute()
   run_recovery(
@@ -1008,7 +1756,10 @@ test spend_client_forwards_valid_recovery() {
     host_policy,
     address.Script(recovery_script_hash),
     Some(subject),
-    RecoverClient { substitute_token: substitute.token },
+    RecoverClient {
+      substitute_token: substitute.token,
+      history_siblings: list.repeat(ibc_state_commitment.empty_hash, 64),
+    },
     subject_reference,
     recovery_transaction(
       subject,
@@ -1029,7 +1780,10 @@ test spend_client_rejects_missing_recovery_withdrawal() fail {
     host_policy,
     address.Script(recovery_script_hash),
     Some(subject),
-    RecoverClient { substitute_token: substitute.token },
+    RecoverClient {
+      substitute_token: substitute.token,
+      history_siblings: list.repeat(ibc_state_commitment.empty_hash, 64),
+    },
     subject_reference,
     recovery_transaction(
       subject,
@@ -1043,7 +1797,7 @@ test spend_client_rejects_missing_recovery_withdrawal() fail {
   )
 }
 
-fn spend_with_withdrawal_redeemer(withdrawal_redeemer: Redeemer) -> Bool {
+fn spend_with_forged_recovery_support(support: Redeemer) -> Bool {
   let subject = expired_subject()
   let substitute = active_substitute()
   let tx =
@@ -1056,51 +1810,148 @@ fn spend_with_withdrawal_redeemer(withdrawal_redeemer: Redeemer) -> Bool {
       True,
       False,
     )
+  let credential = address.Script(recovery_script_hash)
+  let raw: Redeemer = support
   spending_client.spend_client.spend(
     host_policy,
-    address.Script(recovery_script_hash),
+    credential,
     Some(subject),
-    RecoverClient { substitute_token: substitute.token },
+    RecoverClient {
+      substitute_token: substitute.token,
+      history_siblings: list.repeat(ibc_state_commitment.empty_hash, 64),
+    },
     subject_reference,
     Transaction {
       ..tx,
-      redeemers: [
-        Pair(
-          Withdraw(address.Script(recovery_script_hash)),
-          withdrawal_redeemer,
-        ),
-        ..tx.redeemers
-      ],
+      redeemers: [Pair(Withdraw(credential), raw), ..tx.redeemers],
     },
   )
 }
 
-test spend_client_rejects_recovery_for_another_subject() {
-  !spend_with_withdrawal_redeemer(
+test recovery_spend_rejects_update_support_branch() fail {
+  spend_with_forged_recovery_support(
+    CheckClientHistory { subject_token: subject_token() },
+  )
+}
+
+test recovery_spend_rejects_other_subject_support() fail {
+  spend_with_forged_recovery_support(
     RecoverClientWithdrawal {
-      subject_token: AuthToken {
-        ..subject_token(),
-        policy_id: other_client_policy,
-      },
+      subject_token: substitute_token(),
       substitute_token: substitute_token(),
     },
   )
 }
 
-test spend_client_rejects_recovery_from_another_substitute() {
-  !spend_with_withdrawal_redeemer(
+test recovery_spend_rejects_other_substitute_support() fail {
+  spend_with_forged_recovery_support(
     RecoverClientWithdrawal {
       subject_token: subject_token(),
-      substitute_token: AuthToken {
-        ..substitute_token(),
-        policy_id: other_client_policy,
-      },
+      substitute_token: subject_token(),
     },
   )
 }
 
-test spend_client_rejects_malformed_recovery_withdrawal() {
-  !spend_with_withdrawal_redeemer(Void)
+test recovery_support_rejects_history_root_copy_from_substitute() fail {
+  let subject = expired_subject()
+  let substitute = active_substitute()
+  let recovered =
+    ClientDatum {
+      ..expected_recovered(subject, substitute),
+      history_root: substitute.history_root,
+    }
+  run_recovery(subject, substitute, recovered, client_script_hash, [deployer])
+}
+
+test recovery_retains_nonempty_subject_history_not_substitute_history() {
+  let before = datum(subject_token(), height(9), 0, zero_height())
+  let record = consensus_history.from_client(before)
+  let entries =
+    [
+      Pair(
+        consensus_history.key(record.client_token, record.height),
+        consensus_history.value(record),
+      ),
+    ]
+  let subject =
+    ClientDatum { ..expired_subject(), history_root: sparse_tree.root(entries) }
+  let substitute = active_substitute()
+  let old_tip = consensus_history.from_client(subject)
+  let siblings =
+    sparse_tree.siblings(
+      entries,
+      consensus_history.key(old_tip.client_token, old_tip.height),
+    )
+  let output =
+    ClientDatum {
+      ..expected_recovered(expired_subject(), substitute),
+      history_root: consensus_history.insert(
+        subject.history_root,
+        old_tip,
+        siblings,
+      ),
+    }
+  let tx =
+    recovery_transaction(
+      subject,
+      substitute,
+      output,
+      client_script_hash,
+      [deployer],
+      True,
+      True,
+    )
+  let redeemer =
+    RecoverClient {
+      substitute_token: substitute.token,
+      history_siblings: siblings,
+    }
+  let raw: Redeemer = redeemer
+  let supported =
+    Transaction {
+      ..tx,
+      redeemers: list.map(
+        tx.redeemers,
+        fn(pair) {
+          if pair.1st == Spend(subject_reference) {
+            Pair(pair.1st, raw)
+          } else {
+            pair
+          }
+        },
+      ),
+    }
+  and {
+    spending_client.spend_client.spend(
+      host_policy,
+      address.Script(recovery_script_hash),
+      Some(subject),
+      redeemer,
+      subject_reference,
+      supported,
+    ),
+    recover_client.recover_client.withdraw(
+      host_policy,
+      #"",
+      recovery_redeemer(subject, substitute),
+      address.Script(recovery_script_hash),
+      supported,
+    ),
+    output.history_root == sparse_tree.root(
+      [
+        Pair(
+          consensus_history.key(old_tip.client_token, old_tip.height),
+          consensus_history.value(old_tip),
+        ),
+        ..entries
+      ],
+    ),
+    output.history_root != substitute.history_root,
+  }
+}
+
+test spend_client_rejects_malformed_recovery_withdrawal() fail {
+  spend_with_forged_recovery_support(Void)
 }
 
 test unrelated_valid_recovery_cannot_authorize_a_real_client_spend() {
@@ -1130,7 +1981,10 @@ test unrelated_valid_recovery_cannot_authorize_a_real_client_spend() {
       False,
     )
   let fake_spend_redeemer: Redeemer =
-    RecoverClient { substitute_token: fake_substitute.token }
+    RecoverClient {
+      substitute_token: fake_substitute.token,
+      history_siblings: list.repeat(ibc_state_commitment.empty_hash, 64),
+    }
   let fake_withdrawal_redeemer: Redeemer =
     recovery_redeemer(fake_subject, fake_substitute)
   let tx =
@@ -1169,6 +2023,7 @@ test unrelated_valid_recovery_cannot_authorize_a_real_client_spend() {
   expect
     recover_client.recover_client.withdraw(
       host_policy,
+      #"",
       recovery_redeemer(fake_subject, fake_substitute),
       address.Script(recovery_script_hash),
       tx,
@@ -1177,7 +2032,10 @@ test unrelated_valid_recovery_cannot_authorize_a_real_client_spend() {
     host_policy,
     address.Script(recovery_script_hash),
     Some(subject),
-    RecoverClient { substitute_token: substitute.token },
+    RecoverClient {
+      substitute_token: substitute.token,
+      history_siblings: list.repeat(ibc_state_commitment.empty_hash, 64),
+    },
     subject_reference,
     tx,
   )

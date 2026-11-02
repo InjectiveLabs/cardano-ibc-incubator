@@ -6,12 +6,13 @@ import {
   Lucid,
   type LucidEvolution,
   type Script,
-  slotToUnixTime,
   type UTxO,
   validatorToScriptHash,
 } from "@lucid-evolution/lucid";
 import { Emulator, generateEmulatorAccount } from "@lucid-evolution/provider";
+import { createCardanoScalusEvaluator } from "../src/scalus-evaluator.ts";
 import { type DeploymentTemplate, readValidator } from "../src/utils.ts";
+import { loadHostStateValidator } from "../src/deployment-plan.ts";
 import {
   HostStateDatum,
   HostStateNftRedeemer,
@@ -149,7 +150,9 @@ function testReclaimableReference(): UTxO {
 Deno.test("shutdown grace starts at the slot-aligned transaction expiry", async () => {
   const account = generateEmulatorAccount({ lovelace: 1_000_000_000n });
   const emulator = new Emulator([account]);
-  const lucid = await Lucid(emulator, "Preprod");
+  const lucid = await Lucid(emulator, "Preprod", {
+    evaluator: createCardanoScalusEvaluator(),
+  });
   lucid.selectWallet.fromSeed(account.seedPhrase);
   const now = emulator.now() + 123;
   const timing = shutdownTiming(lucid, {
@@ -163,11 +166,11 @@ Deno.test("shutdown grace starts at the slot-aligned transaction expiry", async 
   const body = completed.toTransaction().body();
   assertEquals(
     timing.validTo,
-    slotToUnixTime("Preprod", Number(body.ttl())),
+    lucid.slotToUnixTime(Number(body.ttl())),
   );
   assertEquals(
     timing.validFrom,
-    slotToUnixTime("Preprod", Number(body.validity_interval_start())),
+    lucid.slotToUnixTime(Number(body.validity_interval_start())),
   );
   assert(timing.validTo <= now + 10 * 60 * 1000);
   assert(timing.validTo > now);
@@ -321,7 +324,9 @@ Deno.test("finalize shutdown rejects the wrong terminal reference script", () =>
 Deno.test("atomic finalization stays below the mainnet transaction size", async () => {
   const account = generateEmulatorAccount({ lovelace: 1_000_000_000n });
   const emulator = new Emulator([account]);
-  const lucid = await Lucid(emulator, "Preprod");
+  const lucid = await Lucid(emulator, "Preprod", {
+    evaluator: createCardanoScalusEvaluator(),
+  });
   lucid.selectWallet.fromSeed(account.seedPhrase);
 
   const nonce = {
@@ -335,10 +340,9 @@ Deno.test("atomic finalization stays below the mainnet transaction size", async 
     Data.Tuple([OutputReferenceSchema]) as unknown as [typeof nonce],
   );
   const dummyHash = "20".repeat(28);
-  const [hostValidator, hostValidatorHash, hostAddress] = readValidator(
-    "host_state_stt.host_state_stt.spend",
-    lucid,
-    [
+  const [hostValidator, hostValidatorHash, hostAddress] =
+    loadHostStateValidator(
+      lucid,
       nftPolicyId,
       dummyHash,
       dummyHash,
@@ -346,17 +350,7 @@ Deno.test("atomic finalization stays below the mainnet transaction size", async 
       "21".repeat(28),
       "22".repeat(28),
       "23".repeat(28),
-    ],
-    Data.Tuple([
-      Data.Bytes(),
-      Data.Bytes(),
-      Data.Bytes(),
-      Data.Bytes(),
-      Data.Bytes(),
-      Data.Bytes(),
-      Data.Bytes(),
-    ]) as unknown as [string, string, string, string, string, string, string],
-  );
+    );
   const [, referenceValidatorHash, referenceAddress] = readValidator(
     "reference_validator.refer_only.else",
     lucid,
@@ -388,6 +382,10 @@ Deno.test("atomic finalization stays below the mainnet transaction size", async 
             grace_period_end: BigInt(now),
           },
         },
+        live_clients: 0n,
+        live_connections: 0n,
+        live_channels: 0n,
+        last_heartbeat_time: 0n,
       },
     },
     HostStateDatum,

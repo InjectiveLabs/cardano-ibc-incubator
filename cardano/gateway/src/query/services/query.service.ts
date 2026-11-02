@@ -1,4 +1,10 @@
-/* eslint-disable @typescript-eslint/no-unused-vars */
+import { bootstrapSettlementCredit } from './settlement-credit';
+import { encodeInitialClient, initialClientPlan } from './client-initialization';
+import { withAuthenticatedPoolBindings } from './pool-registry-checkpoint';
+import { Cbor, CborArray, CborBytes, CborSimple } from '@harmoniclabs/cbor';
+import { queryPraosNoncesAtPoint, operationalCertificatePoolIdBytes } from '../../shared/helpers/ogmios';
+import { packetLane, packetLaneTokenName } from '@cardano-ibc/tx-builder/dist/packet-lanes';
+import { PacketStateService, latestPacketProofHeight } from './packet-state.service';
 import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import {
   QueryClientStateRequest,
@@ -7,6 +13,10 @@ import {
   QueryClientStatesResponse,
   QueryConsensusStateRequest,
   QueryConsensusStateResponse,
+  QueryConsensusStatesRequest,
+  QueryConsensusStatesResponse,
+  QueryConsensusStateHeightsRequest,
+  QueryConsensusStateHeightsResponse,
   QueryLatestHeightRequest,
   QueryLatestHeightResponse,
   QueryNewClientRequest,
@@ -17,22 +27,21 @@ import {
   ConsensusState as ConsensusStateTendermint,
 } from '@cardano-ibc/proto-types/build/ibc/lightclients/tendermint/v1/tendermint';
 import {
-  ClientState as ClientStateMithril,
-  ConsensusState as ConsensusStateMithril,
-  MithrilCertificate,
-  MithrilHeader,
-} from '@cardano-ibc/proto-types/build/ibc/lightclients/mithril/v1/mithril';
-import {
   ClientState as ClientStateProbabilistic,
   ConsensusState as ConsensusStateProbabilistic,
-  EpochContext as ProbabilisticEpochContext,
+  PraosNonceState,
   OperationalCertificateCounter,
+  EpochContext as ProbabilisticEpochContext,
+  MithrilStakeCertificates,
   ProbabilisticBlock,
   ProbabilisticHeader,
   StakeDistributionEntry,
 } from '@cardano-ibc/proto-types/build/ibc/lightclients/probabilistic/v1/probabilistic';
 import { Any } from '@cardano-ibc/proto-types/build/google/protobuf/any';
-import { IdentifiedClientState } from '@cardano-ibc/proto-types/build/ibc/core/client/v1/client';
+import {
+  ConsensusStateWithHeight,
+  IdentifiedClientState,
+} from '@cardano-ibc/proto-types/build/ibc/core/client/v1/client';
 import { LucidService } from '@shared/modules/lucid/lucid.service';
 import { KupoService } from '@shared/modules/kupo/kupo.service';
 import { ConfigService } from '@nestjs/config';
@@ -40,6 +49,8 @@ import { decodeHostStateDatum, HostStateDatum } from '@shared/types/host-state-d
 import { normalizeClientStateFromDatum } from '@shared/helpers/client-state';
 import { normalizeConsensusStateFromDatum } from '@shared/helpers/consensus-state';
 import { ClientDatum, decodeClientDatum } from '@shared/types/client-datum';
+import { ConsensusState } from '@shared/types/consensus-state';
+import { Height } from '@shared/types/height';
 import {
   GATEWAY_GRPC_ERROR_CODE,
   GrpcFailedPreconditionException,
@@ -57,11 +68,14 @@ import {
   QueryTransactionByHashResponse,
   QueryIBCHeaderRequest,
   QueryIBCHeaderResponse,
+  QueryMithrilStakeCertificatesRequest,
+  QueryMithrilStakeCertificatesResponse,
 } from '@cardano-ibc/proto-types/build/ibc/core/types/v1/query';
 import { UtxoDto } from '../dtos/utxo.dto';
 import {
   CHANNEL_ID_PREFIX,
   CHANNEL_TOKEN_PREFIX,
+  CLIENT_ID_PREFIX,
   CLIENT_PREFIX,
   CONNECTION_TOKEN_PREFIX,
   EVENT_TYPE_CHANNEL,
@@ -80,6 +94,7 @@ import {
   normalizeTxsResultFromClientDatum,
   normalizeTxsResultFromConnDatum,
   normalizeTxsResultFromChannelRedeemer,
+  normalizeTxsResultFromChannelUpgrade,
   normalizeTxsResultFromModuleRedeemer,
   normalizeTxsResultFromRecvPacketSuccessAcknowledgement,
 } from '@shared/helpers/block-results';
@@ -93,30 +108,33 @@ import { ChannelDatum, decodeChannelDatum } from '@shared/types/channel/channel-
 import { getChannelIdByTokenName, getConnectionIdFromConnectionHops } from '@shared/helpers/channel';
 import { getConnectionIdByTokenName } from '@shared/helpers/connection';
 import { UTxO } from '@lucid-evolution/lucid';
-import { bytesFromBase64 } from '@cardano-ibc/proto-types/build/helpers';
 import { getIdByTokenName } from '@shared/helpers/helper';
-import {
-  decodeMintChannelRedeemer,
-  decodeSpendChannelRedeemer,
-  SpendChannelRedeemer,
-} from '../../shared/types/channel/channel-redeemer';
+import { decodeMintChannelRedeemer, decodeSpendChannelRedeemer } from '../../shared/types/channel/channel-redeemer';
 import {
   decodeMintConnectionRedeemer,
   decodeSpendConnectionRedeemer,
 } from '../../shared/types/connection/connection-redeemer';
 import { decodeIBCModuleRedeemer } from '../../shared/types/port/ibc_module_redeemer';
-import { Packet } from '@shared/types/channel/packet';
-import { decodeMintClientRedeemer, findSpendClientRedeemer } from '@shared/types/client-redeemer';
+import {
+  decodeMintClientRedeemer,
+  findSpendClientRedeemer,
+  type SpendClientRedeemer,
+} from '@shared/types/client-redeemer';
+import type { Header as TendermintHeader } from '@shared/types/header';
+import {
+  decodeSessionDatum,
+  decodeSpendMultitxClientRedeemer,
+  decodeSpendSessionRedeemer,
+  sameTendermintUpdatePlan,
+  type SessionDatum,
+  type SpendSessionRedeemer,
+  type SpendMultitxClientRedeemer,
+} from '@shared/types/tendermint-update-session';
+import { reconstructStagedTendermintHeader } from '@shared/helpers/staged-tendermint-event';
+import type { GatewayEvent } from '../../tx/tx-events.service';
 import { validQueryClientStateParam, validQueryConsensusStateParam } from '../helpers/client.validate';
 import { MiniProtocalsService } from '../../shared/modules/mini-protocals/mini-protocals.service';
 import { MithrilService } from '../../shared/modules/mithril/mithril.service';
-import { getNanoseconds } from '../../shared/helpers/time';
-import { operationalCertificatePoolIdBytes } from '../../shared/helpers/ogmios';
-import { doubleToFraction } from '../../shared/helpers/number';
-import {
-  normalizeMithrilStakeDistribution,
-  normalizeMithrilStakeDistributionCertificate,
-} from '../../shared/helpers/mithril-header';
 import { IbcTreeStateStore } from '../../shared/helpers/ibc-state-root';
 import { serializeExistenceProof } from '../../shared/helpers/ics23-proof-serialization';
 import {
@@ -127,16 +145,19 @@ import {
 } from '@cardano-ibc/proto-types/build/ibc/applications/transfer/v1/query';
 import { Denom, Hop } from '@cardano-ibc/proto-types/build/ibc/applications/transfer/v1/token';
 import { DenomTraceService } from './denom-trace.service';
-import { convertHex2String } from '@shared/helpers/hex';
-import { HISTORY_SERVICE, HistoryBlock, HistoryService } from './history.service';
+import { HISTORY_SERVICE, HistoryBlock, HistoryService, HistoryTxEvidence } from './history.service';
 import {
-  resolveCurrentLiveHostStateTxHeight,
   assertProofContextHostState,
   resolveProofContextForQuery,
   resolveProofHeightForCurrentRoot,
 } from './proof-context';
 import {
-  loadStakeWeightedStabilityEvidenceByHeight,
+  loadMithrilStakeCertificates,
+  MITHRIL_STAKE_CERTIFICATES_TYPE_URL,
+  MithrilStakeMismatchError,
+  requireMithrilStakeAgreement,
+} from './mithril-certified-stake';
+import {
   loadStakeWeightedStabilityHeaderEvidence,
   StakeWeightedStabilityHeaderEvidence,
 } from './stability-evidence';
@@ -144,11 +165,26 @@ import { IbcTreeCacheService } from '../../shared/services/ibc-tree-cache.servic
 import { ProofQueryOptions } from '../helpers/query-height';
 import { BoundedCache } from '../../shared/helpers/bounded-cache';
 import { MetricsService } from '../../health/metrics.service';
+import { validPagination } from '../helpers/helper';
+import { decodePaginationKey, generatePaginationKey, getPaginationParams } from '../../shared/helpers/pagination';
+import { PaginationKeyDto } from '../dtos/pagination.dto';
 
 type ParsedTxRedeemer = {
   type: string;
   data: string;
   index: bigint;
+};
+
+type StoredConsensusState = {
+  height: Height;
+  consensusState: ConsensusState;
+  processedTime: bigint;
+  processedHeight: bigint;
+};
+
+type CanonicalTxInput = {
+  txHash: string;
+  outputIndex: number;
 };
 
 // Packet status responses keep raw attributes so callers can inspect partially decoded events.
@@ -175,37 +211,26 @@ type PacketEventQuery = {
   eventType?: string;
 };
 
-const STABILITY_LATEST_HEIGHT_MAX_ATTEMPTS = 40;
-const STABILITY_LATEST_HEIGHT_DELAY_MS = 2_000;
 const MAX_PROTO_UINT64 = (1n << 64n) - 1n;
 export const TX_REDEEMER_CACHE_MAX_ENTRIES = 1024;
 export const TX_REDEEMER_CACHE_TTL_MS = 60 * 60 * 1000;
 
 const TX_REDEEMER_CACHE_METRIC = 'tx_redeemers';
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const consensusHeightKey = (height: Height): string =>
+  `${height.revisionNumber.toString()}/${height.revisionHeight.toString()}`;
 
-function getPacketFromSpendChannelRedeemer(redeemer: SpendChannelRedeemer): Packet | undefined {
-  if (typeof redeemer === 'string') return undefined;
-  if ('RecvPacket' in redeemer) return redeemer.RecvPacket.packet;
-  if ('AcknowledgePacket' in redeemer) return redeemer.AcknowledgePacket.packet;
-  if ('TimeoutPacket' in redeemer) return redeemer.TimeoutPacket.packet;
-  if ('TimeoutOnClose' in redeemer) return redeemer.TimeoutOnClose.packet;
-  if ('SendPacket' in redeemer) return redeemer.SendPacket.packet;
-  return undefined;
-}
+const compareConsensusHeights = (left: Height, right: Height): number => {
+  if (left.revisionNumber !== right.revisionNumber) {
+    return left.revisionNumber < right.revisionNumber ? -1 : 1;
+  }
+  if (left.revisionHeight === right.revisionHeight) return 0;
+  return left.revisionHeight < right.revisionHeight ? -1 : 1;
+};
 
-function isNonRetryableStabilityLatestHeightError(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error);
-  return (
-    message.includes('Target point is too old') ||
-    message.includes('Failed to acquire requested point') ||
-    message.includes('stake-weighted stability currently supports only current-epoch anchors')
-  );
-}
 @Injectable()
 export class QueryService {
-  private readonly txRedeemerCache: BoundedCache<string, Promise<ParsedTxRedeemer[]>>;
+  private readonly txEvidenceCache: BoundedCache<string, Promise<HistoryTxEvidence>>;
 
   constructor(
     private readonly logger: Logger,
@@ -214,13 +239,14 @@ export class QueryService {
     @Inject(KupoService) private kupoService: KupoService,
     @Inject(HISTORY_SERVICE) private historyService: HistoryService,
     @Inject(MiniProtocalsService) private miniProtocalsService: MiniProtocalsService,
-    @Inject(MithrilService) private mithrilService: MithrilService,
     @Inject(DenomTraceService) private denomTraceService: DenomTraceService,
     @Inject(IbcTreeCacheService) private ibcTreeCacheService: IbcTreeCacheService,
     private readonly ibcTreeStore: IbcTreeStateStore,
+    private readonly packetState: PacketStateService,
     @Optional() @Inject(MetricsService) metricsService?: MetricsService,
+    @Optional() @Inject(MithrilService) private readonly mithrilService?: MithrilService,
   ) {
-    this.txRedeemerCache = new BoundedCache({
+    this.txEvidenceCache = new BoundedCache({
       maxEntries: TX_REDEEMER_CACHE_MAX_ENTRIES,
       ttlMs: TX_REDEEMER_CACHE_TTL_MS,
       onSizeChange: (size) => metricsService?.setCacheEntries(TX_REDEEMER_CACHE_METRIC, size),
@@ -228,60 +254,48 @@ export class QueryService {
   }
 
   private async getProofHeight(context: string): Promise<bigint> {
-    const lightClientMode =
-      this.configService.get<'mithril' | 'stake-weighted-stability'>('cardanoLightClientMode') ||
-      'stake-weighted-stability';
-
     return resolveProofHeightForCurrentRoot({
       logger: this.logger,
       lucidService: this.lucidService,
-      mithrilService: this.mithrilService,
       historyService: this.historyService,
       context,
-      lightClientMode,
-      maxAttempts: lightClientMode === 'stake-weighted-stability' ? 40 : 10,
-      delayMs: lightClientMode === 'stake-weighted-stability' ? 2_000 : 1_500,
+      maxAttempts: 40,
+      delayMs: 2_000,
     });
   }
 
   private async getProofContext(context: string, requestedHeight?: bigint) {
-    const lightClientMode =
-      this.configService.get<'mithril' | 'stake-weighted-stability'>('cardanoLightClientMode') ||
-      'stake-weighted-stability';
-
     return resolveProofContextForQuery({
       ibcTreeStore: this.ibcTreeStore,
       logger: this.logger,
       lucidService: this.lucidService,
-      mithrilService: this.mithrilService,
       historyService: this.historyService,
       ibcTreeCacheService: this.ibcTreeCacheService,
       context,
       requestedHeight,
-      lightClientMode,
-      maxAttempts: lightClientMode === 'stake-weighted-stability' ? 40 : 10,
-      delayMs: lightClientMode === 'stake-weighted-stability' ? 2_000 : 1_500,
+      maxAttempts: 40,
+      delayMs: 2_000,
     });
   }
 
-  private async getTransactionRedeemers(txHash: string): Promise<ParsedTxRedeemer[]> {
+  private async getTransactionEvidence(txHash: string): Promise<HistoryTxEvidence> {
     const cacheKey = txHash.toLowerCase();
-    let lookup = this.txRedeemerCache.get(cacheKey);
+    let lookup = this.txEvidenceCache.get(cacheKey);
     if (!lookup) {
-      lookup = this.loadTransactionRedeemers(cacheKey);
-      this.txRedeemerCache.set(cacheKey, lookup);
+      lookup = this.miniProtocalsService.fetchTransactionEvidence(cacheKey);
+      this.txEvidenceCache.set(cacheKey, lookup);
     }
 
     try {
       return await lookup;
     } catch (error) {
-      this.txRedeemerCache.deleteIfValue(cacheKey, lookup);
+      this.txEvidenceCache.deleteIfValue(cacheKey, lookup);
       throw error;
     }
   }
 
-  private async loadTransactionRedeemers(txHash: string): Promise<ParsedTxRedeemer[]> {
-    const evidence = await this.miniProtocalsService.fetchTransactionEvidence(txHash);
+  private async getTransactionRedeemers(txHash: string): Promise<ParsedTxRedeemer[]> {
+    const evidence = await this.getTransactionEvidence(txHash);
     return evidence.redeemers.map((redeemer) => ({
       type: redeemer.type,
       index: BigInt(redeemer.index),
@@ -289,315 +303,495 @@ export class QueryService {
     }));
   }
 
-  async queryNewMithrilClient(request: QueryNewClientRequest): Promise<QueryNewClientResponse> {
-    const { height } = request;
-    if (!height) {
-      throw new GrpcInvalidArgumentException('Invalid argument: "height" must be provided');
+  private async getCanonicalTransactionInputs(txHash: string): Promise<CanonicalTxInput[]> {
+    const evidence = await this.getTransactionEvidence(txHash);
+    if (!evidence.txBodyCborHex) {
+      throw new Error(`Cannot bind historical redeemers for ${txHash}: transaction body evidence is missing`);
     }
 
-    // NOTE: Do not use the WASM Mithril client here.
-    //
-    // Our local Mithril aggregator returns certificate JSON that does not include the legacy `beacon`
-    // field (it instead encodes coordinates inside `signed_entity_type`). The WASM client performs
-    // strict JSON deserialization and fails with errors like:
-    // "missing field `beacon` at line ...".
-    //
-    // For the Gateway's purposes (building a Mithril IBC client/consensus state), we only need the
-    // raw REST payloads and can avoid strict deserialization entirely.
-    const mithrilStakeDistributionsList = await this.mithrilService.getMostRecentMithrilStakeDistributions();
-
-    const snapshots = await this.mithrilService.getCardanoTransactionsSetSnapshot();
-    const snapshot = snapshots.find((entry) => BigInt(entry.block_number) === BigInt(height));
-    if (!snapshot) {
-      throw new GrpcNotFoundException(`Not found: "height" ${height} not found`);
+    const { CML } = this.lucidService.LucidImporter;
+    const body = CML.TransactionBody.from_cbor_hex(evidence.txBodyCborHex);
+    const bodyInputs = body.inputs();
+    const inputs: CanonicalTxInput[] = [];
+    for (let index = 0; index < bodyInputs.len(); index += 1) {
+      const input = bodyInputs.get(index);
+      inputs.push({
+        txHash: input.transaction_id().to_hex().toLowerCase(),
+        outputIndex: Number(input.index()),
+      });
     }
 
-    const snapshotCertificate = await this.mithrilService.getCertificateByHash(snapshot.certificate_hash);
-    const stakeDistributionCertHash = snapshotCertificate.previous_hash;
-    if (!stakeDistributionCertHash) {
-      throw new GrpcNotFoundException('Not found: transaction snapshot certificate is missing previous_hash');
-    }
+    return inputs.sort((left, right) => {
+      if (left.txHash !== right.txHash) return left.txHash < right.txHash ? -1 : 1;
+      return left.outputIndex - right.outputIndex;
+    });
+  }
 
-    const stakeDistribution = mithrilStakeDistributionsList.find(
-      (d) => d.certificate_hash === stakeDistributionCertHash,
+  private findInputIndexForToken(
+    inputs: readonly CanonicalTxInput[],
+    historicalOutputs: readonly UtxoDto[],
+    address: string,
+    token: AuthToken,
+  ): number | null {
+    const expectedRefs = new Set(
+      historicalOutputs
+        .filter(
+          (utxo) =>
+            utxo.address.toLowerCase() === address.toLowerCase() &&
+            utxo.assetsPolicy.toLowerCase() === token.policyId.toLowerCase() &&
+            utxo.assetsName.toLowerCase() === token.name.toLowerCase(),
+        )
+        .map((utxo) => `${utxo.txHash.toLowerCase()}#${utxo.outputIndex}`),
     );
-    if (!stakeDistribution) {
-      throw new GrpcNotFoundException(
-        `Not found: no Mithril stake distribution found for certificate ${stakeDistributionCertHash}`,
+    const indexes = inputs.flatMap((input, index) =>
+      expectedRefs.has(`${input.txHash}#${input.outputIndex}`) ? [index] : [],
+    );
+    if (indexes.length > 1) {
+      throw new Error(
+        `Cannot bind historical redeemer: transaction consumes the ${token.policyId}${token.name} token more than once`,
       );
     }
-    const stakeDistributionCertificate = await this.mithrilService.getCertificateByHash(stakeDistributionCertHash);
+    return indexes[0] ?? null;
+  }
 
-    const phifFraction = doubleToFraction(stakeDistributionCertificate.metadata.parameters.phi_f);
-    const clientStateMithril: ClientStateMithril = {
-      /** Chain id */
-      chain_id: this.configService.get('cardanoChainId'),
-      /** Latest height the client was updated to */
-      latest_height: {
-        revision_number: 0n,
-        // We treat "height" as the Mithril transaction snapshot block number (see QueryLatestHeight).
-        revision_height: BigInt(snapshot.block_number),
-      },
-      /** Block height when the client was frozen due to a misbehaviour */
-      frozen_height: {
-        revision_number: 0n,
-        revision_height: 0n,
-      },
-      /** Epoch number of current chain state */
-      current_epoch: BigInt(stakeDistribution.epoch),
-      trusting_period: {
-        // The Cosmos-side light client rejects a zero trusting period.
-        //
-        // This value is a policy choice. For local devnet testing we just need a non-zero period
-        // so the client doesn't immediately expire. In production this should be derived from
-        // the security assumptions of the Cardano/Mithril verification model.
-        seconds: BigInt(this.configService.get<number>('cardanoClientTrustingPeriodSeconds') ?? 86_400),
-        nanos: 0,
-      },
-      protocol_parameters: {
-        /** Quorum parameter */
-        k: BigInt(stakeDistributionCertificate.metadata.parameters.k),
-        /** Security parameter (number of lotteries) */
-        m: BigInt(stakeDistributionCertificate.metadata.parameters.m),
-        /** f in phi(w) = 1 - (1 - f)^w, where w is the stake of a participant */
-        phi_f: {
-          numerator: phifFraction.numerator,
-          denominator: phifFraction.denominator,
-        },
-      },
-      /** Path at which next upgraded client will be committed. */
-      upgrade_path: [],
+  private async findStagedClientRedeemer(
+    clientUtxo: UtxoDto,
+    clientDatum: ClientDatum,
+    redeemers: ParsedTxRedeemer[],
+  ): Promise<SpendMultitxClientRedeemer | null> {
+    const deploymentConfig = this.configService.get('deployment');
+    const expectedPolicyId = deploymentConfig.validators.mintTendermintUpdateSession?.scriptHash;
+    if (!expectedPolicyId) return null;
+    const isStagedAction = (decoded: SpendMultitxClientRedeemer): boolean => {
+      if (typeof decoded === 'string') return decoded === 'UpgradeClient';
+      if ('RecoverClient' in decoded) {
+        return (
+          decoded.RecoverClient.substituteToken.policyId.toLowerCase() ===
+          deploymentConfig.validators.mintClientStt?.scriptHash?.toLowerCase()
+        );
+      }
+      const tokens =
+        'FinalizeUpdate' in decoded
+          ? [decoded.FinalizeUpdate.sessionToken]
+          : [decoded.FinalizeMisbehaviour.sessionToken1, decoded.FinalizeMisbehaviour.sessionToken2];
+      return tokens.every((token) => token.policyId.toLowerCase() === expectedPolicyId.toLowerCase());
+    };
 
-      // HostState NFT identification for this Cardano deployment (STT architecture).
-      //
-      // Cosmos-side verification uses this to locate the HostState output inside the
-      // certified transaction body and extract the `ibc_state_root` from its datum.
-      //
-      // This is a safety property: even if the transaction body has multiple outputs, the counterparty
-      // only accepts the output that carries this NFT.
-      host_state_nft_policy_id: Buffer.from(this.configService.get('deployment').hostStateNFT.policyId, 'hex'),
-      host_state_nft_token_name: Buffer.from(this.configService.get('deployment').hostStateNFT.name, 'hex'),
-    } as unknown as ClientStateMithril;
+    const containsFinalization = redeemers.some((redeemer) => {
+      if (redeemer.type !== REDEEMER_TYPE.SPEND) return false;
+      try {
+        const decoded = decodeSpendMultitxClientRedeemer(redeemer.data, this.lucidService.LucidImporter);
+        return isStagedAction(decoded);
+      } catch {
+        return false;
+      }
+    });
+    if (!containsFinalization) return null;
 
-    // ConsensusState timestamp is expressed in nanoseconds since Unix epoch.
-    const timestampMs = new Date(snapshotCertificate.metadata.sealed_at).valueOf();
-    const consensusTimestampNs = BigInt(timestampMs) * 1_000_000n;
-
-    // For the initial client, we include the current on-chain `ibc_state_root`.
-    //
-    // This is the trust anchor at client creation time (similar to other IBC clients).
-    // For subsequent updates, the counterparty does not "trust the Gateway's root":
-    // it authenticates the root per-height via `queryIBCHeader()` evidence
-    // (Mithril-certified transaction inclusion + HostState output datum extraction).
-    const hostStateUtxo = await this.lucidService.findUtxoAtHostStateNFT();
-    if (!hostStateUtxo?.datum) {
-      throw new GrpcInternalException('IBC infrastructure error: HostState UTxO missing datum');
+    const spendClientAddress = deploymentConfig.validators.spendClient?.address;
+    const clientPolicyId = deploymentConfig.validators.mintClientStt?.scriptHash;
+    if (!spendClientAddress || !clientPolicyId) {
+      throw new Error('Cannot bind staged finalization without the configured client scripts');
     }
-    const hostStateDatum = await this.lucidService.decodeDatum<HostStateDatum>(hostStateUtxo.datum, 'host_state');
-    const ibcStateRootBytes = Buffer.from(hostStateDatum.state.ibc_state_root, 'hex');
+    const clientToken = clientDatum.token;
+    if (
+      clientToken.policyId.toLowerCase() !== clientPolicyId.toLowerCase() ||
+      clientUtxo.assetsPolicy.toLowerCase() !== clientPolicyId.toLowerCase() ||
+      clientUtxo.assetsName.toLowerCase() !== clientToken.name.toLowerCase()
+    ) {
+      throw new Error('Cannot bind staged finalization to the canonical client NFT');
+    }
 
-    const consensusStateMithril: ConsensusStateMithril = {
-      timestamp: consensusTimestampNs,
-      first_cert_hash_latest_epoch: normalizeMithrilStakeDistributionCertificate(
-        stakeDistribution,
-        stakeDistributionCertificate,
-      ),
-      latest_cert_hash_tx_snapshot: snapshot.certificate_hash,
-      ibc_state_root: ibcStateRootBytes,
-    } as unknown as ConsensusStateMithril;
+    const [inputs, clientHistory] = await Promise.all([
+      this.getCanonicalTransactionInputs(clientUtxo.txHash),
+      this.historyService.findUtxosByPolicyIdAndPrefixTokenName(clientToken.policyId, clientToken.name),
+    ]);
+    const clientInputIndex = this.findInputIndexForToken(inputs, clientHistory, spendClientAddress, clientToken);
+    if (clientInputIndex === null) return null;
 
-    const clientStateAny: Any = {
-      type_url: '/ibc.lightclients.mithril.v1.ClientState',
-      value: ClientStateMithril.encode(clientStateMithril).finish(),
-    };
+    const clientRedeemer = redeemers.find(
+      (redeemer) => redeemer.type === REDEEMER_TYPE.SPEND && redeemer.index === BigInt(clientInputIndex),
+    );
+    if (!clientRedeemer) return null;
 
-    const consensusStateAny: Any = {
-      type_url: '/ibc.lightclients.mithril.v1.ConsensusState',
-      value: ConsensusStateMithril.encode(consensusStateMithril).finish(),
-    };
+    try {
+      const decoded = decodeSpendMultitxClientRedeemer(clientRedeemer.data, this.lucidService.LucidImporter);
+      if (isStagedAction(decoded)) return decoded;
+    } catch {
+      // A client input using the legacy redeemer belongs to the direct protocol.
+    }
+    return null;
+  }
 
-    const response: QueryNewClientResponse = {
-      client_state: clientStateAny,
-      consensus_state: consensusStateAny,
-    };
+  private async recoverStagedTendermintHeader(
+    clientUtxo: UtxoDto,
+    clientDatum: ClientDatum,
+    finalRedeemers: ParsedTxRedeemer[],
+  ): Promise<TendermintHeader | null> {
+    const redeemer = await this.findStagedClientRedeemer(clientUtxo, clientDatum, finalRedeemers);
+    if (!redeemer || typeof redeemer === 'string' || !('FinalizeUpdate' in redeemer)) return null;
+    return this.recoverStagedSessionHeader(clientUtxo, clientDatum, redeemer.FinalizeUpdate.sessionToken);
+  }
 
-    return response;
+  private async recoverStagedSessionHeader(
+    clientUtxo: UtxoDto,
+    clientDatum: ClientDatum,
+    sessionToken: AuthToken,
+  ): Promise<TendermintHeader> {
+    const deploymentConfig = this.configService.get('deployment');
+    const sessionAddress = deploymentConfig.validators.spendTendermintUpdateSession?.address;
+    if (!sessionAddress) {
+      throw new Error('Cannot reconstruct staged Tendermint event without the session spending validator');
+    }
+
+    const historicalOutputs = await this.historyService.findUtxosByPolicyIdAndPrefixTokenName(
+      sessionToken.policyId,
+      sessionToken.name,
+    );
+    const decodedOutputs: Array<{ utxo: UtxoDto; datum: SessionDatum }> = [];
+    for (const utxo of historicalOutputs) {
+      if (
+        utxo.blockNo > clientUtxo.blockNo ||
+        utxo.assetsPolicy.toLowerCase() !== sessionToken.policyId.toLowerCase() ||
+        utxo.assetsName.toLowerCase() !== sessionToken.name.toLowerCase() ||
+        utxo.address.toLowerCase() !== sessionAddress.toLowerCase() ||
+        !utxo.datum
+      ) {
+        continue;
+      }
+      try {
+        const datum = decodeSessionDatum(utxo.datum, this.lucidService.LucidImporter);
+        if (
+          datum.sessionToken.policyId.toLowerCase() === sessionToken.policyId.toLowerCase() &&
+          datum.sessionToken.name.toLowerCase() === sessionToken.name.toLowerCase()
+        ) {
+          decodedOutputs.push({ utxo, datum });
+        }
+      } catch {
+        // Ignore malformed/unrelated historical outputs; exact receipt checks follow.
+      }
+    }
+
+    const finalInputs = await this.getCanonicalTransactionInputs(clientUtxo.txHash);
+    const completeOutputs = decodedOutputs.filter(
+      ({ utxo, datum }) =>
+        finalInputs.some(
+          (input) => input.txHash === utxo.txHash.toLowerCase() && input.outputIndex === utxo.outputIndex,
+        ) &&
+        'Complete' in datum.phase &&
+        datum.plan.clientToken.policyId.toLowerCase() === clientDatum.token.policyId.toLowerCase() &&
+        datum.plan.clientToken.name.toLowerCase() === clientDatum.token.name.toLowerCase(),
+    );
+    if (completeOutputs.length !== 1) {
+      throw new Error(
+        `Cannot reconstruct staged Tendermint event: expected one completed session output, found ${completeOutputs.length}`,
+      );
+    }
+
+    const completeSession = completeOutputs[0].datum;
+    const sessionOutputsForPlan = decodedOutputs.filter(({ datum }) =>
+      sameTendermintUpdatePlan(datum.plan, completeSession.plan, this.lucidService.LucidImporter),
+    );
+    const sessionTxHashes = Array.from(new Set(sessionOutputsForPlan.map(({ utxo }) => utxo.txHash.toLowerCase())));
+    const sessionRedeemers: SpendSessionRedeemer[] = [];
+    const historicalTransactions = await Promise.all(
+      sessionTxHashes.map(async (txHash) => ({
+        txHash,
+        inputs: await this.getCanonicalTransactionInputs(txHash),
+        redeemers: await this.getTransactionRedeemers(txHash),
+      })),
+    );
+    for (const transaction of historicalTransactions) {
+      const sessionInputIndex = this.findInputIndexForToken(
+        transaction.inputs,
+        sessionOutputsForPlan.map(({ utxo }) => utxo),
+        sessionAddress,
+        sessionToken,
+      );
+      if (sessionInputIndex === null) continue;
+
+      const sessionRedeemer = transaction.redeemers.find(
+        (redeemer) => redeemer.type === REDEEMER_TYPE.SPEND && redeemer.index === BigInt(sessionInputIndex),
+      );
+      if (!sessionRedeemer) {
+        throw new Error(
+          `Cannot reconstruct staged Tendermint event: session redeemer missing in ${transaction.txHash}`,
+        );
+      }
+      try {
+        const decoded = decodeSpendSessionRedeemer(sessionRedeemer.data, this.lucidService.LucidImporter);
+        if (typeof decoded !== 'string' && ('VerifyTrusted' in decoded || 'VerifyTarget' in decoded)) {
+          sessionRedeemers.push(decoded);
+        }
+      } catch {
+        throw new Error(
+          `Cannot reconstruct staged Tendermint event: invalid session redeemer in ${transaction.txHash}`,
+        );
+      }
+    }
+
+    return reconstructStagedTendermintHeader(completeSession, sessionRedeemers);
+  }
+
+  private clientEventType(redeemers: ParsedTxRedeemer[], stagedHeader: TendermintHeader | null): string {
+    if (stagedHeader) return EVENT_TYPE_CLIENT.UPDATE_CLIENT;
+
+    const hasMintClientRedeemer = redeemers
+      .filter((redeemer) => redeemer.type === REDEEMER_TYPE.MINT)
+      .some((redeemer) => {
+        try {
+          return decodeMintClientRedeemer(redeemer.data, this.lucidService.LucidImporter) === 'MintClient';
+        } catch {
+          return false;
+        }
+      });
+    return hasMintClientRedeemer ? EVENT_TYPE_CLIENT.CREATE_CLIENT : EVENT_TYPE_CLIENT.UPDATE_CLIENT;
   }
 
   async queryNewClient(request: QueryNewClientRequest): Promise<QueryNewClientResponse> {
-    if (this.getLightClientMode() === 'stake-weighted-stability') {
-      return this.queryNewStabilityClient(request);
-    }
-    return this.queryNewMithrilClient(request);
+    return this.queryNewStabilityClient(request);
   }
 
   async queryNewStabilityClient(request: QueryNewClientRequest): Promise<QueryNewClientResponse> {
     const { height } = request;
-    if (!height) {
-      throw new GrpcInvalidArgumentException('Invalid argument: "height" must be provided');
-    }
     const cardanoChainId = this.configService.get<string>('cardanoChainId');
     if (!cardanoChainId) {
       throw new GrpcInternalException('Cardano chain ID is not configured');
     }
 
-    const stabilityEvidence = await loadStakeWeightedStabilityEvidenceByHeight({
-      historyService: this.historyService,
-      height: BigInt(height),
-      logger: this.logger,
+    const anchorBlock = height
+      ? await this.historyService.findBlockByHeight(BigInt(height))
+      : await this.historyService.findLatestBlock();
+    if (!anchorBlock) throw new GrpcNotFoundException('Initial Cardano block is not indexed');
+    const anchorHeight = BigInt(anchorBlock.height);
+    // Finding the instance's HostState at this height enforces its creation boundary.
+    const hostStateUtxo = await this.historyService.findHostStateUtxoAtOrBeforeBlockNo(anchorHeight);
+    if (!hostStateUtxo?.datum) throw new GrpcNotFoundException('HostState UTxO does not exist at the initial height');
+    const sequence = request.initialization_sequence ?? 0;
+    if (!Number.isSafeInteger(sequence) || sequence < 0 || sequence > 4096)
+      throw new GrpcInvalidArgumentException('Invalid client initialization sequence');
+    const deployment = this.configService.get('deployment');
+    const identity = `${cardanoChainId}:${deployment.hostStateNFT.policyId}.${deployment.hostStateNFT.name}:${anchorBlock.hash}:${this.configService.get<number>('cardanoClientTrustingPeriodSeconds') ?? 172_800}:${this.configService.get<number>('cardanoClientMaxClockDriftSeconds') ?? 10}:${this.configService.get<string>('cardanoRandomnessStabilisationWindowSlots')}`;
+    const plan = await initialClientPlan(identity, async () => {
+      // A client starts only from a stake table Mithril certified.
+      const mithrilEndpoint = this.configService.get<string>('mithrilEndpoint');
+      if (!mithrilEndpoint)
+        throw new GrpcFailedPreconditionException(
+          'Probabilistic client creation requires MITHRIL_ENDPOINT, because a client starts from Mithril-certified stake',
+        );
+      const context = await this.historyService.findEpochContextAtBlock(anchorBlock);
+      if (!context || context.epoch !== anchorBlock.epochNo)
+        throw new GrpcFailedPreconditionException('Initial epoch context is unavailable');
+      const poolProduction = await this.historyService.findObservedPoolProductionAtBlock(anchorBlock);
+      const poolRegistry = await this.historyService.findInitialPoolRegistryAtBlock(anchorBlock, [
+        ...context.stakeDistribution.map((row) => row.poolId),
+        ...poolProduction.pools.map((row) => row.pool_id),
+      ]);
+      const stabilityEvidence = {
+        anchorBlock,
+        anchorHeight,
+        anchorEpoch: anchorBlock.epochNo,
+        epochStakeDistribution: context.stakeDistribution,
+        epochVerificationContext: context.verificationContext,
+      };
+      const operationalCertificateCounters = this.toStabilityOperationalCertificateCounters(
+        await this.historyService.findOperationalCertificateCountersAtBlock(stabilityEvidence.anchorBlock),
+      );
+
+      const hostStateDatum = await this.lucidService.decodeDatum<HostStateDatum>(hostStateUtxo.datum!, 'host_state');
+      const hostStateRootBytes = Buffer.from(hostStateDatum.state.ibc_state_root, 'hex');
+      const stabilitySlotTiming = this.getStabilitySlotTiming(stabilityEvidence.anchorBlock);
+      const currentEpochContext = withAuthenticatedPoolBindings(
+        this.toStabilityEpochContext(
+          Number(stabilityEvidence.anchorEpoch),
+          stabilityEvidence.epochStakeDistribution.map((row) => ({
+            ...row,
+            firstRegistrationSlot: poolRegistry.effective.find((binding) => binding.pool_id === row.poolId)
+              ?.first_registration_slot,
+          })),
+          stabilityEvidence.epochVerificationContext,
+        ),
+        poolRegistry,
+      );
+
+      const window = this.configService.get<string>('cardanoRandomnessStabilisationWindowSlots');
+      if (!window || !/^[1-9][0-9]*$/.test(window) || BigInt(window) > (1n << 64n) - 1n) {
+        throw new GrpcFailedPreconditionException(
+          'Configure CARDANO_RANDOMNESS_STABILISATION_WINDOW_SLOTS from the network protocol rules',
+        );
+      }
+      const ogmiosEndpoint = this.configService.get<string>('ogmiosEndpoint');
+      if (!ogmiosEndpoint) throw new GrpcFailedPreconditionException('Ogmios endpoint is required for Praos bootstrap');
+      const nodeNonces = await queryPraosNoncesAtPoint(ogmiosEndpoint, {
+        slot: stabilityEvidence.anchorBlock.slotNo,
+        hash: stabilityEvidence.anchorBlock.hash,
+      });
+      const rawBlock = await this.miniProtocalsService.fetchBlockCbor(stabilityEvidence.anchorBlock);
+      const header = Cbor.parse(
+        this.miniProtocalsService.extractBlockHeaderCbor(rawBlock, stabilityEvidence.anchorBlock.hash),
+      );
+      const previousHash =
+        header instanceof CborArray && header.array[0] instanceof CborArray ? header.array[0].array[2] : undefined;
+      const genesisParent = previousHash instanceof CborSimple && previousHash.simple === null;
+      if (!genesisParent && (!(previousHash instanceof CborBytes) || previousHash.buffer.length !== 32)) {
+        throw new GrpcFailedPreconditionException('Bootstrap header previous-block hash is unavailable');
+      }
+      const nonceState = PraosNonceState.fromPartial({
+        ...nodeNonces,
+        last_applied_block_nonce: previousHash instanceof CborBytes ? previousHash.buffer : new Uint8Array(),
+      });
+      if (!Buffer.from(nonceState.epoch_nonce).equals(Buffer.from(currentEpochContext.epoch_nonce))) {
+        throw new GrpcFailedPreconditionException('Bootstrap node nonce disagrees with epoch context');
+      }
+
+      const clientStateProbabilistic: ClientStateProbabilistic = {
+        storage_version: 2,
+        verification_generation: 0n,
+        checkpoint_reference: new Uint8Array(),
+        storage_namespace: new Uint8Array(),
+        bootstrap_objects: new Uint8Array(),
+        bootstrap_pending: false,
+        chain_id: cardanoChainId,
+        latest_height: {
+          revision_number: 0n,
+          revision_height: stabilityEvidence.anchorHeight,
+        },
+        frozen_height: {
+          revision_number: 0n,
+          revision_height: 0n,
+        },
+        current_epoch: BigInt(stabilityEvidence.anchorEpoch),
+        trusting_period: {
+          seconds: BigInt(this.configService.get<number>('cardanoClientTrustingPeriodSeconds') ?? 172_800),
+          nanos: 0,
+        },
+        max_clock_drift: {
+          seconds: BigInt(this.configService.get<number>('cardanoClientMaxClockDriftSeconds') ?? 10),
+          nanos: 0,
+        },
+        upgrade_path: [],
+        packet_lane_policy_id: Buffer.from(this.configService.get('deployment').packetState.state.scriptHash, 'hex'),
+        host_state_nft_policy_id: Buffer.from(this.configService.get('deployment').hostStateNFT.policyId, 'hex'),
+        host_state_nft_token_name: Buffer.from(this.configService.get('deployment').hostStateNFT.name, 'hex'),
+        // epoch_contexts is the canonical verification source, but the current
+        // probabilistic payload also carries these flattened fields for verifier input.
+        epoch_stake_distribution: currentEpochContext.stake_distribution,
+        epoch_nonce: currentEpochContext.epoch_nonce,
+        slots_per_kes_period: currentEpochContext.slots_per_kes_period,
+        current_epoch_start_slot: currentEpochContext.epoch_start_slot,
+        current_epoch_end_slot_exclusive: currentEpochContext.epoch_end_slot_exclusive,
+        system_start_unix_ns: stabilitySlotTiming.systemStartUnixNs,
+        slot_length_ns: stabilitySlotTiming.slotLengthNs,
+        epoch_contexts: [currentEpochContext],
+        latest_checkpoint_nonce_state: nonceState,
+        latest_checkpoint_pool_registry: poolRegistry,
+        latest_checkpoint_pool_production: poolProduction,
+        latest_checkpoint_settlement_credit: bootstrapSettlementCredit(
+          BigInt(stabilityEvidence.anchorEpoch),
+          stabilityEvidence.epochStakeDistribution,
+        ),
+        randomness_stabilisation_window_slots: BigInt(window),
+        epoch_context_challenges: [], // Assigned by the Cosmos host during Initialize.
+        active_slot_coefficient_numerator: stabilityEvidence.epochVerificationContext.activeSlotCoefficientNumerator,
+        active_slot_coefficient_denominator:
+          stabilityEvidence.epochVerificationContext.activeSlotCoefficientDenominator,
+        latest_checkpoint_height: {
+          revision_number: 0n,
+          revision_height: stabilityEvidence.anchorHeight,
+        },
+        latest_checkpoint_block_hash: stabilityEvidence.anchorBlock.hash,
+        latest_checkpoint_epoch: BigInt(stabilityEvidence.anchorEpoch),
+        latest_checkpoint_slot: stabilityEvidence.anchorBlock.slotNo,
+        latest_checkpoint_timestamp: stabilityEvidence.anchorBlock.timestampUnixNs,
+        max_kes_evolutions: BigInt(stabilityEvidence.epochVerificationContext.maxKesEvolutions),
+        latest_checkpoint_operational_certificate_counters: operationalCertificateCounters,
+        operational_certificate_counter_history_start_height: {
+          revision_number: 0n,
+          revision_height: BigInt(stabilityEvidence.anchorHeight),
+        },
+        mithril_epoch: 0n,
+        mithril_aggregate_verification_key: '',
+        mithril_protocol_parameters_hash: '',
+      };
+
+      const consensusStateProbabilistic: ConsensusStateProbabilistic = {
+        verification_generation: 0n,
+        checkpoint_reference: new Uint8Array(),
+        packet_state_reference: new Uint8Array(),
+        nonce_state: nonceState,
+        pool_registry: poolRegistry,
+        pool_production: poolProduction,
+        settlement_credit: clientStateProbabilistic.latest_checkpoint_settlement_credit,
+        packet_state_snapshot: await this.packetState.snapshot(stabilityEvidence.anchorHeight),
+        timestamp: stabilityEvidence.anchorBlock.timestampUnixNs,
+        ibc_state_root: hostStateRootBytes,
+        accepted_block_hash: stabilityEvidence.anchorBlock.hash,
+        accepted_epoch: BigInt(stabilityEvidence.anchorEpoch),
+        unique_pools_count: 0n,
+        unique_stake_bps: 0n,
+        security_score_bps: 0n,
+      };
+
+      return encodeInitialClient(clientStateProbabilistic, consensusStateProbabilistic, mithrilEndpoint);
     });
-
-    const hostStateUtxo = await this.findExactStabilityAnchorHostStateUtxo(
-      stabilityEvidence.anchorHeight,
-      'new client creation',
-    );
-    if (!hostStateUtxo?.datum) {
-      throw new GrpcInternalException('IBC infrastructure error: HostState UTxO missing datum');
-    }
-
-    const operationalCertificateCounters = this.toStabilityOperationalCertificateCounters(
-      await this.historyService.findOperationalCertificateCountersAtBlock(stabilityEvidence.anchorBlock),
-    );
-
-    const hostStateDatum = await this.lucidService.decodeDatum<HostStateDatum>(hostStateUtxo.datum, 'host_state');
-    const hostStateRootBytes = Buffer.from(hostStateDatum.state.ibc_state_root, 'hex');
-    const stabilitySlotTiming = this.getStabilitySlotTiming(stabilityEvidence.anchorBlock);
-    const currentEpochContext = this.toStabilityEpochContext(
-      Number(stabilityEvidence.anchorEpoch),
-      stabilityEvidence.epochStakeDistribution,
-      stabilityEvidence.epochVerificationContext,
-    );
-
-    const clientStateProbabilistic: ClientStateProbabilistic = {
-      chain_id: cardanoChainId,
-      latest_height: {
-        revision_number: 0n,
-        revision_height: stabilityEvidence.anchorHeight,
-      },
-      frozen_height: {
-        revision_number: 0n,
-        revision_height: 0n,
-      },
-      current_epoch: BigInt(stabilityEvidence.anchorEpoch),
-      trusting_period: {
-        seconds: BigInt(this.configService.get<number>('cardanoClientTrustingPeriodSeconds') ?? 86_400),
-        nanos: 0,
-      },
-      max_clock_drift: {
-        seconds: BigInt(this.configService.get<number>('cardanoClientMaxClockDriftSeconds') ?? 10),
-        nanos: 0,
-      },
-      upgrade_path: [],
-      host_state_nft_policy_id: Buffer.from(this.configService.get('deployment').hostStateNFT.policyId, 'hex'),
-      host_state_nft_token_name: Buffer.from(this.configService.get('deployment').hostStateNFT.name, 'hex'),
-      // epoch_contexts is the canonical verification source, but the current
-      // probabilistic payload also carries these flattened fields for verifier input.
-      epoch_stake_distribution: currentEpochContext.stake_distribution,
-      epoch_nonce: currentEpochContext.epoch_nonce,
-      slots_per_kes_period: currentEpochContext.slots_per_kes_period,
-      current_epoch_start_slot: currentEpochContext.epoch_start_slot,
-      current_epoch_end_slot_exclusive: currentEpochContext.epoch_end_slot_exclusive,
-      system_start_unix_ns: stabilitySlotTiming.systemStartUnixNs,
-      slot_length_ns: stabilitySlotTiming.slotLengthNs,
-      epoch_contexts: [currentEpochContext],
-      active_slot_coefficient_numerator: stabilityEvidence.epochVerificationContext.activeSlotCoefficientNumerator,
-      active_slot_coefficient_denominator: stabilityEvidence.epochVerificationContext.activeSlotCoefficientDenominator,
-      latest_checkpoint_height: {
-        revision_number: 0n,
-        revision_height: stabilityEvidence.anchorHeight,
-      },
-      latest_checkpoint_block_hash: stabilityEvidence.anchorBlock.hash,
-      latest_checkpoint_epoch: BigInt(stabilityEvidence.anchorEpoch),
-      latest_checkpoint_slot: stabilityEvidence.anchorBlock.slotNo,
-      latest_checkpoint_timestamp: stabilityEvidence.anchorBlock.timestampUnixNs,
-      max_kes_evolutions: BigInt(stabilityEvidence.epochVerificationContext.maxKesEvolutions),
-      latest_checkpoint_operational_certificate_counters: operationalCertificateCounters,
-      operational_certificate_counter_history_start_height: {
-        revision_number: 0n,
-        revision_height: BigInt(stabilityEvidence.anchorHeight),
-      },
-    };
-
-    const consensusStateProbabilistic: ConsensusStateProbabilistic = {
-      timestamp: stabilityEvidence.anchorBlock.timestampUnixNs,
-      ibc_state_root: hostStateRootBytes,
-      accepted_block_hash: stabilityEvidence.anchorBlock.hash,
-      accepted_epoch: BigInt(stabilityEvidence.anchorEpoch),
-      unique_pools_count: BigInt(stabilityEvidence.metrics.qualifiedUniquePoolsCount),
-      unique_stake_bps: BigInt(stabilityEvidence.metrics.qualifiedUniqueStakeBps),
-      security_score_bps: BigInt(stabilityEvidence.metrics.securityScoreBps),
-    };
-
+    if (sequence > plan.imports.length)
+      throw new GrpcInvalidArgumentException('Initialization sequence exceeds the prepared imports');
     return {
       client_state: {
         type_url: '/ibc.lightclients.probabilistic.v1.ClientState',
-        value: ClientStateProbabilistic.encode(clientStateProbabilistic).finish(),
+        value: Buffer.from(plan.client_state, 'base64'),
       },
       consensus_state: {
         type_url: '/ibc.lightclients.probabilistic.v1.ConsensusState',
-        value: ConsensusStateProbabilistic.encode(consensusStateProbabilistic).finish(),
+        value: Buffer.from(plan.consensus_state, 'base64'),
+      },
+      initialization_message: sequence
+        ? {
+            type_url: '/ibc.lightclients.probabilistic.v1.ProbabilisticHeader',
+            value: Buffer.from(plan.imports[sequence - 1], 'base64'),
+          }
+        : undefined,
+    };
+  }
+
+  // Hermes submits these before the rollover they cover, so the client checks
+  // the epoch's stake table against Mithril instead of a response window.
+  async queryMithrilStakeCertificates(
+    request: QueryMithrilStakeCertificatesRequest,
+  ): Promise<QueryMithrilStakeCertificatesResponse> {
+    const epoch = request.mithril_epoch;
+    if (!epoch || epoch > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw new GrpcInvalidArgumentException('Invalid argument: "mithril_epoch" must be a positive epoch');
+    }
+    const mithril = this.mithrilStakeSource();
+    if (!mithril) {
+      throw new GrpcFailedPreconditionException('Mithril endpoint is not configured');
+    }
+    let certificates: string[];
+    try {
+      certificates = await loadMithrilStakeCertificates(mithril, Number(epoch));
+    } catch (error) {
+      throw new GrpcFailedPreconditionException(`Mithril stake certificates are unavailable: ${error.message}`);
+    }
+    if (!certificates.length) return {};
+    return {
+      client_message: {
+        type_url: MITHRIL_STAKE_CERTIFICATES_TYPE_URL,
+        value: MithrilStakeCertificates.encode({ certificates }).finish(),
       },
     };
   }
 
-  async latestHeight(request: QueryLatestHeightRequest): Promise<QueryLatestHeightResponse> {
-    if (this.getLightClientMode() === 'stake-weighted-stability') {
-      return this.latestCertifiedHeight();
-    }
-
-    const listSnapshots = await this.mithrilService.getCardanoTransactionsSetSnapshot();
-    if (!listSnapshots?.length) {
-      throw new GrpcInternalException('Mithril transaction snapshots unavailable for latest height');
-    }
-
-    const latestHeightResponse = {
-      height: listSnapshots[0].block_number,
-    };
-    this.logger.log(latestHeightResponse.height, 'QueryLatestHeight');
-    return latestHeightResponse as unknown as QueryLatestHeightResponse;
+  async latestHeight(_request: QueryLatestHeightRequest): Promise<QueryLatestHeightResponse> {
+    return this.latestCertifiedHeight();
   }
 
   async latestCertifiedHeight(): Promise<QueryLatestHeightResponse> {
-    for (let attempt = 0; attempt < STABILITY_LATEST_HEIGHT_MAX_ATTEMPTS; attempt++) {
-      try {
-        const liveHostStateTxHeight = await resolveCurrentLiveHostStateTxHeight({
-          lucidService: this.lucidService,
-          historyService: this.historyService,
-        });
-        const hostStateUtxo = await this.historyService.findHostStateUtxoAtOrBeforeBlockNo(liveHostStateTxHeight);
-        const stabilityEvidence = await loadStakeWeightedStabilityEvidenceByHeight({
-          historyService: this.historyService,
-          height: BigInt(hostStateUtxo.blockNo),
-          logger: this.logger,
-          missingAnchorBlockMessage: `Cardano history block for HostState tx ${hostStateUtxo.txHash} unavailable for stability latest height`,
-        });
-
-        return { height: stabilityEvidence.anchorHeight } as QueryLatestHeightResponse;
-      } catch (error) {
-        if (isNonRetryableStabilityLatestHeightError(error)) {
-          const message = error instanceof Error ? error.message : String(error);
-          throw new GrpcInternalException(
-            `Current HostState root is not yet stability-accepted for latest height: ${message}`,
-          );
-        }
-
-        if (attempt + 1 === STABILITY_LATEST_HEIGHT_MAX_ATTEMPTS) {
-          throw error;
-        }
-
-        const message = error instanceof Error ? error.message : String(error);
-        this.logger.warn(`[latestCertifiedHeight] ${message}; retrying stability latest height query`);
-        await sleep(STABILITY_LATEST_HEIGHT_DELAY_MS);
-      }
-    }
-
-    throw new GrpcInternalException(
-      `Unable to resolve stability latest height after ${STABILITY_LATEST_HEIGHT_MAX_ATTEMPTS} attempts`,
-    );
+    return { height: await latestPacketProofHeight(this.historyService, this.logger) };
   }
 
   private async getHostStateDatum(): Promise<HostStateDatum> {
-    const hostStateUtxo = await this.lucidService.findUtxoAtHostStateNFT();
+    const hostStateUtxo = await this.lucidService.findUtxoAtHostStateNFT(0n);
     if (!hostStateUtxo?.datum) {
       throw new GrpcInternalException('IBC infrastructure error: HostState UTxO missing datum');
     }
@@ -620,6 +814,133 @@ export class QueryService {
     return [clientDatum, spendClientUTXO];
   }
 
+  private async getConsensusStatesAtProofContext(
+    clientId: string,
+    proofContext: {
+      proofHeight: bigint;
+      tree: { get(path: string): Buffer | undefined };
+    },
+    requestedHeight?: Height | 'latest',
+  ): Promise<{ clientDatum: ClientDatum; records: StoredConsensusState[] }> {
+    const [clientDatum] = await this.getClientDatum(clientId, proofContext.proofHeight);
+    const resolvedRequestedHeight =
+      requestedHeight === 'latest' ? clientDatum.state.clientState.latestHeight : requestedHeight;
+    const expectedClientUnit = this.lucidService.getClientAuthTokenUnit(BigInt(clientId));
+    const expectedClientToken: AuthToken = {
+      policyId: expectedClientUnit.slice(0, 56),
+      name: expectedClientUnit.slice(56),
+    };
+    if (
+      clientDatum.token.policyId.toLowerCase() !== expectedClientToken.policyId.toLowerCase() ||
+      clientDatum.token.name.toLowerCase() !== expectedClientToken.name.toLowerCase()
+    ) {
+      throw new GrpcFailedPreconditionException(
+        `Client ${clientId} datum does not match its canonical authentication token`,
+      );
+    }
+
+    // The private index is recovered against today's live NFT. Its immutable
+    // records can also answer an older query, but ONLY when that exact public
+    // value exists in the selected HostState tree. Never substitute today's root.
+    const liveClient = await this.lucidService.findUtxoByUnit(expectedClientUnit);
+    const history = await this.lucidService.consensusHistoryRecords(liveClient);
+    const requestedKey = resolvedRequestedHeight ? consensusHeightKey(resolvedRequestedHeight) : undefined;
+    const latestHeight = clientDatum.state.clientState.latestHeight;
+    const records = new Map<string, StoredConsensusState>();
+    const recordPaths = new Set<string>();
+    for (const { datum: record, consensusValue } of history) {
+      if (
+        record.clientToken.policyId.toLowerCase() !== expectedClientToken.policyId.toLowerCase() ||
+        record.clientToken.name.toLowerCase() !== expectedClientToken.name.toLowerCase() ||
+        record.height.revisionNumber < 0n ||
+        record.height.revisionHeight <= 0n ||
+        record.processedTime < 0n ||
+        record.processedHeight < 0n
+      ) {
+        throw new GrpcFailedPreconditionException(
+          `Consensus-state history for client ${clientId} failed authentication`,
+        );
+      }
+      // Public paths carry the full revision height, so records archived before
+      // a revision upgrade stay queryable. Exclude records newer than the datum.
+      if (compareConsensusHeights(record.height, latestHeight) > 0) continue;
+      const key = consensusHeightKey(record.height);
+      if (requestedKey && key !== requestedKey) continue;
+      const pathHeight = `${record.height.revisionNumber}-${record.height.revisionHeight}`;
+      const path = `clients/07-tendermint-${clientId}/consensusStates/${pathHeight}`;
+      const committedValue = proofContext.tree.get(path);
+      if (!committedValue || committedValue.length === 0) {
+        // The record was not present at this historical anchor. This also
+        // preserves read compatibility with older, already-pruned snapshots.
+        continue;
+      }
+      if (!/^(?:[0-9a-f]{2})+$/i.test(consensusValue) || !committedValue.equals(Buffer.from(consensusValue, 'hex'))) {
+        throw new GrpcFailedPreconditionException(
+          `Consensus-state history ${clientId}@${key} does not match the committed IBC state root`,
+        );
+      }
+      if (records.has(key) || recordPaths.has(pathHeight)) {
+        throw new GrpcFailedPreconditionException(`Duplicate consensus-state history record for ${clientId}@${key}`);
+      }
+      records.set(key, {
+        height: record.height,
+        consensusState: record.consensusState,
+        processedTime: record.processedTime,
+        processedHeight: record.processedHeight,
+      });
+      recordPaths.add(pathHeight);
+    }
+
+    return {
+      clientDatum,
+      records: [...records.values()].sort((left, right) => compareConsensusHeights(left.height, right.height)),
+    };
+  }
+
+  private paginateConsensusStates(
+    records: StoredConsensusState[],
+    paginationRequest: QueryConsensusStatesRequest['pagination'],
+  ): {
+    records: StoredConsensusState[];
+    pagination: { next_key: Uint8Array; total: bigint };
+  } {
+    const pagination = getPaginationParams(validPagination(paginationRequest));
+    const {
+      'pagination.key': key = '',
+      'pagination.limit': limit = '100',
+      'pagination.count_total': countTotal = false,
+      'pagination.reverse': reverse = false,
+    } = pagination;
+    let { 'pagination.offset': offset = '0' } = pagination;
+    if (key) offset = decodePaginationKey(key);
+
+    const ordered = reverse ? [...records].reverse() : records;
+    const from = Number(offset);
+    const pageLimit = Number(limit);
+    const to = Math.min(from + pageLimit, ordered.length);
+    const nextKey = to < ordered.length ? generatePaginationKey({ offset: to } as PaginationKeyDto) : new Uint8Array();
+    return {
+      records: ordered.slice(from, to),
+      pagination: {
+        next_key: nextKey,
+        total: countTotal ? BigInt(ordered.length) : 0n,
+      },
+    };
+  }
+
+  private normalizeStoredConsensusState(record: StoredConsensusState): ConsensusStateTendermint {
+    const normalized = normalizeConsensusStateFromDatum(
+      new Map([[record.height, record.consensusState]]),
+      record.height.revisionHeight,
+    );
+    if (!normalized) {
+      throw new GrpcInternalException(
+        `Unable to encode Consensus State at height ${consensusHeightKey(record.height)}`,
+      );
+    }
+    return normalized;
+  }
+
   async queryClientStates(_request: QueryClientStatesRequest): Promise<QueryClientStatesResponse> {
     this.logger.log('queryClientStates');
 
@@ -637,9 +958,9 @@ export class QueryService {
         const clientId = clientSequence.toString();
         const [clientDatum] = await this.getClientDatum(clientId);
 
-        // Cardano currently hosts only Tendermint clients. Cardano-specific clients
-        // (`08-cardano-probabilistic` and the deprecated Mithril type) are hosted on
-        // counterparty chains, so this response uses the canonical Tendermint type URL.
+        // Cardano currently hosts only Tendermint clients. The Cardano-specific
+        // `08-cardano-probabilistic` client is hosted on counterparty chains, so this
+        // response uses the canonical Tendermint type URL.
         const clientStateTendermint = normalizeClientStateFromDatum(clientDatum.state.clientState);
         const clientStateAny: Any = {
           type_url: '/ibc.lightclients.tendermint.v1.ClientState',
@@ -685,10 +1006,7 @@ export class QueryService {
 
     const startedAt = Date.now();
     const proofContext = await this.getProofContext('queryClientState', options.queryHeight);
-    const [clientDatum, spendClientUTXO] = await this.getClientDatum(
-      clientId,
-      proofContext.proofHeight,
-    );
+    const [clientDatum, spendClientUTXO] = await this.getClientDatum(clientId, proofContext.proofHeight);
     this.logger.debug(
       `[queryClientState] loaded client UTxO ${spendClientUTXO.txHash}#${spendClientUTXO.outputIndex} in ${Date.now() - startedAt}ms`,
     );
@@ -754,31 +1072,40 @@ export class QueryService {
     );
     const { client_id: clientId } = validQueryConsensusStateParam(request);
     const proofContext = await this.getProofContext('queryConsensusState', options.queryHeight);
-    const [clientDatum] = await this.getClientDatum(
+    const requestedHeight: Height | 'latest' = request.latest_height
+      ? 'latest'
+      : {
+          revisionNumber: request.revision_number,
+          revisionHeight: request.revision_height,
+        };
+    const { clientDatum, records } = await this.getConsensusStatesAtProofContext(
       clientId,
-      proofContext.proofHeight,
+      proofContext,
+      requestedHeight,
     );
-
-    // Consensus height: identifies which consensus state entry to retrieve
-    // If latest_height is true, use the latest consensus state for this client.
-    let heightReq: bigint;
-    if (request.latest_height) {
-      heightReq = clientDatum.state.clientState.latestHeight.revisionHeight;
-      this.logger.log(`queryConsensusState: Using latest consensus height: ${heightReq}`);
-    } else {
-      // Canonical IBC request provides revision_number + revision_height.
-      // We key consensus states by revision_height in the on-chain datum.
-      heightReq = request.revision_height;
+    const selectedHeight = requestedHeight === 'latest' ? clientDatum.state.clientState.latestHeight : requestedHeight;
+    if (requestedHeight === 'latest') {
+      this.logger.log(`queryConsensusState: Using latest consensus height: ${consensusHeightKey(selectedHeight)}`);
     }
-    const consensusStateTendermint = normalizeConsensusStateFromDatum(clientDatum.state.consensusStates, heightReq);
-    if (!consensusStateTendermint)
-      throw new GrpcNotFoundException(`Unable to find Consensus State at height ${heightReq}`);
+    const record = records.find(({ height }) => consensusHeightKey(height) === consensusHeightKey(selectedHeight));
+    if (!record) {
+      throw new GrpcNotFoundException(`Unable to find Consensus State at height ${consensusHeightKey(selectedHeight)}`);
+    }
+    const consensusStateTendermint = normalizeConsensusStateFromDatum(
+      new Map([[record.height, record.consensusState]]),
+      record.height.revisionHeight,
+    );
+    if (!consensusStateTendermint) {
+      throw new GrpcInternalException(
+        `Unable to encode Consensus State at height ${consensusHeightKey(record.height)}`,
+      );
+    }
     const consensusStateAny: Any = {
       type_url: '/ibc.lightclients.tendermint.v1.ConsensusState',
       value: ConsensusStateTendermint.encode(consensusStateTendermint).finish(),
     };
     // Generate ICS-23 proof from the IBC state tree.
-    const ibcPath = `clients/07-tendermint-${clientId}/consensusStates/${heightReq}`;
+    const ibcPath = `clients/07-tendermint-${clientId}/consensusStates/${record.height.revisionNumber}-${record.height.revisionHeight}`;
 
     await assertProofContextHostState(proofContext, this.historyService, this.lucidService);
     const tree = proofContext.tree;
@@ -789,7 +1116,7 @@ export class QueryService {
       consensusProof = serializeExistenceProof(existenceProof);
 
       this.logger.log(
-        `Generated ICS-23 proof for consensus state ${clientId}@${heightReq}, proof size: ${consensusProof.length} bytes`,
+        `Generated ICS-23 proof for consensus state ${clientId}@${consensusHeightKey(record.height)}, proof size: ${consensusProof.length} bytes`,
       );
     } catch (error) {
       this.logger.error(`Failed to generate ICS-23 proof for ${ibcPath}: ${error.message}`);
@@ -807,6 +1134,53 @@ export class QueryService {
     return response as unknown as QueryConsensusStateResponse;
   }
 
+  async queryConsensusStates(
+    request: QueryConsensusStatesRequest,
+    options: ProofQueryOptions = {},
+  ): Promise<QueryConsensusStatesResponse> {
+    const { client_id: clientId } = validQueryClientStateParam({
+      client_id: request.client_id,
+    } as QueryClientStateRequest);
+    const proofContext = await this.getProofContext('queryConsensusStates', options.queryHeight);
+    const { records } = await this.getConsensusStatesAtProofContext(clientId, proofContext);
+    await assertProofContextHostState(proofContext, this.historyService, this.lucidService);
+    const page = this.paginateConsensusStates(records, request.pagination);
+    const consensusStates: ConsensusStateWithHeight[] = page.records.map((record) => ({
+      height: {
+        revision_number: record.height.revisionNumber,
+        revision_height: record.height.revisionHeight,
+      },
+      consensus_state: {
+        type_url: '/ibc.lightclients.tendermint.v1.ConsensusState',
+        value: ConsensusStateTendermint.encode(this.normalizeStoredConsensusState(record)).finish(),
+      },
+    }));
+    return {
+      consensus_states: consensusStates,
+      pagination: page.pagination,
+    };
+  }
+
+  async queryConsensusStateHeights(
+    request: QueryConsensusStateHeightsRequest,
+    options: ProofQueryOptions = {},
+  ): Promise<QueryConsensusStateHeightsResponse> {
+    const { client_id: clientId } = validQueryClientStateParam({
+      client_id: request.client_id,
+    } as QueryClientStateRequest);
+    const proofContext = await this.getProofContext('queryConsensusStateHeights', options.queryHeight);
+    const { records } = await this.getConsensusStatesAtProofContext(clientId, proofContext);
+    await assertProofContextHostState(proofContext, this.historyService, this.lucidService);
+    const page = this.paginateConsensusStates(records, request.pagination);
+    return {
+      consensus_state_heights: page.records.map(({ height }) => ({
+        revision_number: height.revisionNumber,
+        revision_height: height.revisionHeight,
+      })),
+      pagination: page.pagination,
+    };
+  }
+
   async queryBlockResults(request: QueryBlockResultsRequest): Promise<QueryBlockResultsResponse> {
     const { height } = request;
     this.logger.log(height, 'queryBlockResults');
@@ -815,10 +1189,10 @@ export class QueryService {
     }
     try {
       const deploymentConfig = this.configService.get('deployment');
-      const hostStateNFT = deploymentConfig.hostStateNFT as unknown as AuthToken;
 
-      const mintConnScriptHash = deploymentConfig.validators.mintConnectionStt.scriptHash;
+      const hostStateNFT = deploymentConfig.hostStateNFT as unknown as AuthToken;
       const mintChannelScriptHash = deploymentConfig.validators.mintChannelStt.scriptHash;
+      const mintConnScriptHash = deploymentConfig.validators.mintConnectionStt.scriptHash;
 
       const connectionBaseToken = hostStateNFT;
       const channelBaseToken = hostStateNFT;
@@ -848,7 +1222,19 @@ export class QueryService {
 
         // register/unregister event spo
         const spoEvents = await this._querySpoEvents(BigInt(blockNo));
-        const eventInBlock = [...txsClientResults, ...txsResults, ...spoEvents];
+        const laneTxHashes = [
+          ...new Set(
+            utxosInBlock
+              .filter((u) => u.assetsPolicy === deploymentConfig.packetState.state.scriptHash)
+              .map((u) => u.txHash),
+          ),
+        ];
+        const laneEvents = await Promise.all(
+          laneTxHashes.map(
+            async (txHash) => ({ code: 0, events: await this.packetState.events(txHash) }) as ResponseDeliverTx,
+          ),
+        );
+        const eventInBlock = [...txsClientResults, ...txsResults, ...laneEvents, ...spoEvents];
         totalEventResults.push(...eventInBlock);
       }
 
@@ -875,32 +1261,24 @@ export class QueryService {
     }
   }
 
-  async queryEvents(request: { since_height: bigint }): Promise<{
+  async queryEvents(request: { since_height?: bigint }): Promise<{
     current_height: bigint;
     scanned_to_height: bigint;
     events: Array<{ height: bigint; events: ResponseDeliverTx[] }>;
   }> {
-    const { since_height } = request;
-
-    if (since_height === undefined || since_height === null) {
-      throw new GrpcInvalidArgumentException('Invalid argument: "since_height" must be provided');
-    }
+    // Proto3 scalar fields have implicit defaults: a zero cursor may decode as absent.
+    // Normalize it here so an initial event scan includes block 1.
+    const since_height = request.since_height ?? 0n;
 
     try {
       // Event polling is an observer/query path, not a light-client verification path.
-      // In stability mode we must not gate it on accepted-anchor thresholds, otherwise
-      // freshly submitted Cardano txs cannot be observed until a descendant block lands.
-      let currentHeight: number;
-      if (this.getLightClientMode() === 'stake-weighted-stability') {
-        const latestBlock = await this.historyService.findLatestBlock();
-        if (!latestBlock) {
-          throw new GrpcInternalException('Cardano history latest block unavailable for event queries');
-        }
-        currentHeight = Number(latestBlock.height);
-      } else {
-        const latestHeight = await this.latestHeight({});
-        currentHeight = Number(latestHeight.height);
+      // It must not be gated on accepted-anchor thresholds, otherwise freshly
+      // submitted Cardano txs cannot be observed until a descendant block lands.
+      const latestBlock = await this.historyService.findLatestBlock();
+      if (!latestBlock) {
+        throw new GrpcInternalException('Cardano history latest block unavailable for event queries');
       }
+      const currentHeight = Number(latestBlock.height);
 
       // If since_height >= current, return empty
       if (Number(since_height) >= currentHeight) {
@@ -982,7 +1360,7 @@ export class QueryService {
   private async _parseEventConnection(
     utxo: UtxoDto,
     tokenBase: AuthToken,
-    mintScriptHash: string,
+    _mintScriptHash: string,
   ): Promise<ResponseDeliverTx | null> {
     let connDatumDecoded: ConnectionDatum;
     try {
@@ -993,7 +1371,6 @@ export class QueryService {
     const currentConnectionId = getConnectionIdByTokenName(utxo.assetsName, tokenBase, CONNECTION_TOKEN_PREFIX);
     const txsResult = normalizeTxsResultFromConnDatum(connDatumDecoded, currentConnectionId);
 
-    const spendAddress = this.configService.get('deployment').validators.spendConnection.address;
     const redeemers = await this.getTransactionRedeemers(utxo.txHash);
     redeemers
       .filter((redeemer) => redeemer.data !== REDEEMER_EMPTY_DATA && redeemer.data.length > 10)
@@ -1037,7 +1414,7 @@ export class QueryService {
   private async _parseEventChannel(
     utxo: UtxoDto,
     tokenBase: AuthToken,
-    mintScriptHash: string,
+    _mintScriptHash: string,
   ): Promise<ResponseDeliverTx | null> {
     let channelDatumDecoded: ChannelDatum;
     try {
@@ -1051,7 +1428,6 @@ export class QueryService {
 
     const txsResult = normalizeTxsResultFromChannelDatum(channelDatumDecoded, currentConnectionId, currentChannelId);
 
-    const spendAddress = this.configService.get('deployment').validators.spendChannel.address;
     let redeemers = await this.getTransactionRedeemers(utxo.txHash);
 
     redeemers = redeemers.filter((redeemer) => ![REDEEMER_EMPTY_DATA].includes(redeemer.data));
@@ -1082,7 +1458,6 @@ export class QueryService {
             txsResult.events[0].type = EVENT_TYPE_CHANNEL.OPEN_CONFIRM;
           if (spendRedeemer.hasOwnProperty('RecvPacket') || spendRedeemer.hasOwnProperty('SendPacket')) {
             // find redeemer module recv packet -> get packet ack
-            const spendTransferModuleAddress = this.configService.get('deployment').modules.transfer.address;
             const spendMockModuleAddress = this.configService.get('deployment').modules?.mock?.address;
             const packetEvent = normalizeTxsResultFromChannelRedeemer(spendRedeemer, channelDatumDecoded);
             txsResult.events = packetEvent.events;
@@ -1173,6 +1548,13 @@ export class QueryService {
           if (spendRedeemer.hasOwnProperty('ChanCloseConfirm')) {
             txsResult.events[0].type = EVENT_TYPE_CHANNEL.CLOSE_CONFIRM;
           }
+          if (typeof spendRedeemer === 'object' && 'ChanUpgrade' in spendRedeemer) {
+            txsResult.events = normalizeTxsResultFromChannelUpgrade(
+              spendRedeemer.ChanUpgrade,
+              channelDatumDecoded,
+              currentChannelId,
+            ).events;
+          }
           break;
         }
         default:
@@ -1192,7 +1574,6 @@ export class QueryService {
   private async _parseEventClient(utxos: UtxoDto[]): Promise<ResponseDeliverTx[]> {
     const deploymentConfig = this.configService.get('deployment');
     const mintClientScriptHash = deploymentConfig.validators.mintClientStt.scriptHash;
-    const spendClientAddress = deploymentConfig.validators.spendClient.address;
     const tokenBase = deploymentConfig.hostStateNFT;
 
     const txsResults = await Promise.all(
@@ -1209,21 +1590,47 @@ export class QueryService {
           }
 
           const redeemers = await this.getTransactionRedeemers(clientUtxo.txHash);
-          const hasMintClientRedeemer = redeemers
-            .filter((redeemer) => redeemer.type === REDEEMER_TYPE.MINT)
-            .some((redeemer) => {
-              try {
-                return decodeMintClientRedeemer(redeemer.data, this.lucidService.LucidImporter) === 'MintClient';
-              } catch {
-                return false;
-              }
-            });
-          const eventClient = hasMintClientRedeemer ? EVENT_TYPE_CLIENT.CREATE_CLIENT : EVENT_TYPE_CLIENT.UPDATE_CLIENT;
-          const spendClientRedeemerData = findSpendClientRedeemer(redeemers, this.lucidService.LucidImporter);
+          const stagedRedeemer = await this.findStagedClientRedeemer(clientUtxo, clientDatum, redeemers);
+          let stagedHeader: TendermintHeader | null = null;
+          let spendClientRedeemerData: SpendClientRedeemer | undefined;
+          if (stagedRedeemer === 'UpgradeClient') {
+            spendClientRedeemerData = 'UpgradeClient';
+          } else if (stagedRedeemer && typeof stagedRedeemer !== 'string') {
+            if ('RecoverClient' in stagedRedeemer) {
+              spendClientRedeemerData = {
+                RecoverClient: {
+                  substitute_token: stagedRedeemer.RecoverClient.substituteToken,
+                  history_siblings: stagedRedeemer.RecoverClient.historySiblings,
+                },
+              };
+            } else if ('FinalizeMisbehaviour' in stagedRedeemer) {
+              const { sessionToken1, sessionToken2 } = stagedRedeemer.FinalizeMisbehaviour;
+              const [header1, header2] = await Promise.all([
+                this.recoverStagedSessionHeader(clientUtxo, clientDatum, sessionToken1),
+                this.recoverStagedSessionHeader(clientUtxo, clientDatum, sessionToken2),
+              ]);
+              spendClientRedeemerData = {
+                UpdateClient: {
+                  msg: { MisbehaviourCase: [{ client_id: `${CLIENT_ID_PREFIX}-${clientId}`, header1, header2 }] },
+                  history_witnesses: stagedRedeemer.FinalizeMisbehaviour.historyWitnesses,
+                  history_siblings: [],
+                },
+              };
+            } else {
+              stagedHeader = await this.recoverStagedSessionHeader(
+                clientUtxo,
+                clientDatum,
+                stagedRedeemer.FinalizeUpdate.sessionToken,
+              );
+            }
+          } else {
+            spendClientRedeemerData = findSpendClientRedeemer(redeemers, this.lucidService.LucidImporter);
+          }
           const substituteClientId =
             typeof spendClientRedeemerData === 'object' && 'RecoverClient' in spendClientRedeemerData
               ? getIdByTokenName(spendClientRedeemerData.RecoverClient.substitute_token.name, tokenBase, CLIENT_PREFIX)
               : undefined;
+          const eventClient = this.clientEventType(redeemers, stagedHeader);
 
           const txsResult = normalizeTxsResultFromClientDatum(
             clientDatum,
@@ -1231,6 +1638,7 @@ export class QueryService {
             clientId,
             spendClientRedeemerData,
             substituteClientId,
+            stagedHeader,
           );
           return txsResult as unknown as ResponseDeliverTx;
         }),
@@ -1304,6 +1712,16 @@ export class QueryService {
     context: { hostStateNFT: AuthToken; mintChannelScriptHash: string },
   ): Promise<IndexedPacketEvent[]> {
     const packetEvents: IndexedPacketEvent[] = [];
+    const statePolicy = this.configService.get('deployment').packetState.state.scriptHash;
+    const seen = new Set<string>();
+    for (const utxo of utxos) {
+      if (utxo.assetsPolicy !== statePolicy || seen.has(utxo.txHash)) continue;
+      seen.add(utxo.txHash);
+      for (const event of await this.packetState.events(utxo.txHash)) {
+        const mapped = this.mapPacketEvent(utxo.txHash, utxo.blockNo, event as Event);
+        if (mapped) packetEvents.push(mapped);
+      }
+    }
 
     for (const utxo of utxos) {
       if (utxo.assetsPolicy !== context.mintChannelScriptHash) continue;
@@ -1360,6 +1778,45 @@ export class QueryService {
     };
   }
 
+  /** Rebuild client events for one confirmed tx without relying on process-local synthetic events. */
+  async queryClientEventsByTxHash(hash: string): Promise<{
+    tx_hash: string;
+    height: string;
+    indexed: boolean;
+    events: GatewayEvent[];
+  }> {
+    if (!hash) {
+      throw new GrpcInvalidArgumentException('Invalid argument: "hash" must be provided');
+    }
+
+    const normalizedHash = hash.toLowerCase();
+    const tx = await this.historyService.findTxByHash(normalizedHash);
+    if (!tx) {
+      throw new GrpcNotFoundException(`Not found: "hash" ${hash} not found`);
+    }
+
+    const clientUtxos = (await this.historyService.findClientUtxosByBlockNo(tx.height)).filter(
+      (utxo) => utxo.txHash.toLowerCase() === normalizedHash,
+    );
+    const txResults = await this._parseEventClient(clientUtxos);
+    const events = txResults.flatMap((result) =>
+      result.events.map((event) => ({
+        type: event.type,
+        attributes: event.event_attribute.map((attribute) => ({
+          key: attribute.key,
+          value: attribute.value,
+        })),
+      })),
+    );
+
+    return {
+      tx_hash: tx.hash,
+      height: tx.height.toString(),
+      indexed: true,
+      events,
+    };
+  }
+
   async queryPacketEventsByPacket(query: PacketEventQuery): Promise<{
     events: IndexedPacketEvent[];
   }> {
@@ -1399,6 +1856,15 @@ export class QueryService {
       }
     }
 
+    const packetConfig = this.configService.get('deployment').packetState;
+    for (const channel of candidateChannelIds) {
+      const lane = packetLane('transfer', channel, BigInt(query.sequence), packetConfig.laneCount);
+      const rows = await this.historyService.findUtxosByPolicyIdAndPrefixTokenName(
+        packetConfig.state.scriptHash,
+        packetLaneTokenName('transfer', channel, lane, packetConfig.laneCount),
+      );
+      for (const output of rows) utxosByRef.set(`${output.txHash}#${output.outputIndex}`, output);
+    }
     const packetEvents = await this.parsePacketEventsForChannelUtxos(Array.from(utxosByRef.values()), context);
     const events = packetEvents
       .filter((event) => this.packetEventMatchesQuery(event, query))
@@ -1420,10 +1886,6 @@ export class QueryService {
         limit,
         page,
       } = request;
-      const deploymentConfig = this.configService.get('deployment');
-      const hostStateNFT = deploymentConfig.hostStateNFT as unknown as AuthToken;
-      const mintChannelScriptHash = deploymentConfig.validators.mintChannelStt.scriptHash;
-      const spendAddress = deploymentConfig.validators.spendChannel.address;
       if (!srcChannelId?.startsWith(`${CHANNEL_ID_PREFIX}-`))
         throw new GrpcInvalidArgumentException(
           `Invalid argument: "packet_src_channel". Please use the prefix "${CHANNEL_ID_PREFIX}-"`,
@@ -1433,71 +1895,18 @@ export class QueryService {
           `Invalid argument: "packet_dst_channel". Please use the prefix "${CHANNEL_ID_PREFIX}-"`,
         );
 
-      // A packet for this path can be emitted from either channel side depending on the
-      // operation type, so load both channel UTxO sets up front.
-      const candidateChannelIds = Array.from(new Set([srcChannelId, dstChannelId]));
-      const channelTokenNames = candidateChannelIds.map((channelId) =>
-        this.lucidService.generateTokenName(
-          hostStateNFT,
-          CHANNEL_TOKEN_PREFIX,
-          BigInt(channelId.replaceAll(`${CHANNEL_ID_PREFIX}-`, '')),
-        ),
+      const matches = await this.queryPacketEventsByPacket({
+        sourceChannel: srcChannelId,
+        destinationChannel: dstChannelId,
+        sequence: String(packet_sequence),
+      });
+      const blockResults = [...new Set(matches.events.map((event) => event.height))].map(
+        (height) =>
+          ({
+            block_id: 0,
+            block: { height: Number(height) },
+          }) as unknown as ResultBlockSearch,
       );
-
-      // The same tx output can appear while scanning each side, so dedupe by out-ref.
-      const utxosByRef = new Map<string, UtxoDto>();
-      for (const channelTokenName of channelTokenNames) {
-        const utxos = await this.historyService.findUtxosByPolicyIdAndPrefixTokenName(
-          mintChannelScriptHash,
-          channelTokenName,
-        );
-        for (const utxo of utxos) {
-          utxosByRef.set(`${utxo.txId.toString()}#${utxo.outputIndex ?? ''}`, utxo);
-        }
-      }
-
-      const utxosOfChannel = Array.from(utxosByRef.values());
-      const blockSearchResults = await Promise.all(
-        utxosOfChannel.map(async (utxo) => {
-          let redeemers = await this.getTransactionRedeemers(utxo.txHash);
-          redeemers = redeemers.filter(
-            (redeemer) => redeemer.data !== REDEEMER_EMPTY_DATA && redeemer.data.length > 10,
-          );
-          let isMatched = false;
-          for (const redeemer of redeemers) {
-            if (redeemer.type !== REDEEMER_TYPE.SPEND) continue;
-            let spendRedeemer;
-            try {
-              spendRedeemer = decodeSpendChannelRedeemer(redeemer.data, this.lucidService.LucidImporter);
-            } catch {
-              continue;
-            }
-            const packet = getPacketFromSpendChannelRedeemer(spendRedeemer);
-            if (!packet) continue;
-            const packetSourceChannel = convertHex2String(packet.source_channel);
-            const packetDestinationChannel = convertHex2String(packet.destination_channel);
-            // Match either orientation because historical channel scanning is channel-centric and can
-            // surface redeemers from sends, receives, acks, or timeouts across both ends.
-            const directChannelMatch =
-              packetSourceChannel === srcChannelId && packetDestinationChannel === dstChannelId;
-            const reverseChannelMatch =
-              packetSourceChannel === dstChannelId && packetDestinationChannel === srcChannelId;
-            if (packet.sequence === BigInt(packet_sequence) && (directChannelMatch || reverseChannelMatch)) {
-              isMatched = true;
-              break;
-            }
-          }
-          if (!isMatched) return null;
-
-          return {
-            block_id: utxo.blockId,
-            block: {
-              height: utxo.blockNo,
-            },
-          } as unknown as ResultBlockSearch;
-        }),
-      );
-      const blockResults = blockSearchResults.filter((result): result is ResultBlockSearch => result !== null);
       const totalCount = blockResults.length;
       let blockResultsResp = blockResults;
       if (blockResults.length > limit) {
@@ -1557,261 +1966,20 @@ export class QueryService {
 
   async queryIBCHeader(request: QueryIBCHeaderRequest): Promise<QueryIBCHeaderResponse> {
     this.logger.log(`height = ${request.height}`, 'queryIBCHeader');
-
-    if (this.getLightClientMode() === 'stake-weighted-stability') {
-      return this.queryStabilityIBCHeader(request);
-    }
-
-    const { height } = request;
-    if (!height) {
-      throw new GrpcInvalidArgumentException('Invalid argument: "height" must be provided');
-    }
-
-    // This endpoint bridges two different proof systems:
-    //
-    // 1) Mithril can certify transaction inclusion at a given Cardano block number.
-    //    It does not certify "arbitrary ledger state" in the sense of a single global state root
-    //    that a counterparty can directly use for IBC membership proofs.
-    //
-    // 2) In our Cardano IBC design, the commitment root (`ibc_state_root`) is stored in the inline
-    //    datum of the HostState UTxO. So if we can prove "the HostState update transaction was included
-    //    at height H", the counterparty can authenticate the root at height H by:
-    //      - parsing the certified transaction body,
-    //      - locating the HostState output (by the HostState NFT),
-    //      - extracting `ibc_state_root` from the output datum.
-    //
-    // After the counterparty stores this authenticated root in its on-chain light client consensus state
-    // for height H, membership/non-membership proofs provided by the Gateway (for clients, connections,
-    // channels, packet state, etc.) can be verified against it without trusting the relayer/Gateway to
-    // supply a truthful root off-chain.
-
-    // Identify the HostState update at this height.
-    //
-    // The counterparty will verify:
-    // - the transaction is included in the Mithril-certified transaction set for this height
-    // - the transaction body hashes to `host_state_tx_hash`
-    // - the output at `host_state_tx_output_index` holds the HostState NFT and carries the inline datum
-    // `height` refers to the Mithril-certified height Hermes is operating on (latest stable block).
-    // The HostState UTxO may not change at every certified height, so we locate the most recent
-    // HostState output at or before the certified snapshot height we are actually going to use.
-
-    // This endpoint supplies the Cosmos-side Mithril light client with everything
-    // it needs to authenticate Cardano's IBC commitment root at `height`:
-    // - a Mithril transaction snapshot certificate (trust anchor)
-    // - a Mithril inclusion proof for the HostState update transaction
-    // - the HostState transaction body CBOR + output index so the client can extract `ibc_state_root`
-    //
-    // TODO(ibc): Support heights where the HostState does not change (root carried forward),
-    // and ensure the selected HostState output is the one live at end-of-block if multiple
-    // updates occur within a single block.
-    // Note: Use the HTTP Mithril API for listing artifacts and fetching certificates.
-    //
-    // The WASM mithril client performs strict JSON deserialization which can break if our
-    // local aggregator version changes its certificate JSON shape (we've observed runtime
-    // errors like "missing field `beacon`"). For the Gateway's purpose (transporting
-    // Mithril data to the Cosmos-side light client), we only need the raw certificate payload.
-    const mithrilStakeDistributionsList = await this.mithrilService.getMostRecentMithrilStakeDistributions();
-    if (!mithrilStakeDistributionsList?.length) {
-      throw new GrpcFailedPreconditionException(
-        gatewayGrpcError(
-          GATEWAY_GRPC_ERROR_CODE.HISTORY_NOT_READY,
-          'Mithril stake distributions are not available for header generation',
-        ),
-      );
-    }
-
-    // Mithril stake distribution certificate chain (epoch catch-up).
-    //
-    // The Cosmos-side Mithril light client verifies certificate chains epoch-by-epoch.
-    // If the client is updated after missing one or more epochs, it needs the intervening
-    // stake distribution certificates in order to verify the `previous_hash` chain.
-    //
-    // The Gateway includes a bounded list of previous stake distribution certificates so the
-    // light client can "catch up" across epochs in a single update.
-    const stakeDistributionByCertificateHash = new Map<string, any>();
-    for (const stakeDistribution of mithrilStakeDistributionsList) {
-      if (stakeDistribution?.certificate_hash) {
-        stakeDistributionByCertificateHash.set(stakeDistribution.certificate_hash, stakeDistribution);
-      }
-    }
-
-    // IMPORTANT: Mithril `cardano-transaction` proofs are currently served against the latest
-    // available CardanoTransactions snapshot (as exposed by the aggregator).
-    //
-    // If we pair:
-    // - a TransactionSnapshot at height H, with
-    // - a proof computed against a different snapshot height,
-    // then the Cosmos-side Mithril light client will reject the update with a merkle root mismatch.
-    //
-    // Therefore we align the header's TransactionSnapshot + certificate to the snapshot referenced
-    // by the returned proof.
-    const listSnapshots = await this.mithrilService.getCardanoTransactionsSetSnapshot();
-    const latestSnapshot = listSnapshots[0];
-    if (!latestSnapshot) {
-      throw new GrpcFailedPreconditionException(
-        gatewayGrpcError(
-          GATEWAY_GRPC_ERROR_CODE.HISTORY_NOT_READY,
-          'Mithril transaction snapshots are not available for header generation',
-        ),
-      );
-    }
-
-    // We always anchor to a certified snapshot height. If the caller requested a future height,
-    // fail early (this matches the expectation that "height" is a Mithril-certified height).
-    if (BigInt(height) > BigInt(latestSnapshot.block_number)) {
-      throw new GrpcNotFoundException(
-        gatewayGrpcError(GATEWAY_GRPC_ERROR_CODE.HEIGHT_NOT_FOUND, `Height ${height.toString()} not found`, {
-          height: height.toString(),
-          latestSnapshotHeight: latestSnapshot.block_number,
-        }),
-      );
-    }
-
-    // Start from the latest certified height (proof endpoint certifies against latest).
-    let snapshot = latestSnapshot;
-    let hostStateUtxo = await this.historyService.findHostStateUtxoAtOrBeforeBlockNo(BigInt(snapshot.block_number));
-    let hostStateTxProof: any;
-
-    // Ensure snapshot/proof/HostState tx are mutually consistent with strict bounded retries.
-    const maxAlignmentAttempts = 2;
-    let converged = false;
-    for (let attempt = 0; attempt < maxAlignmentAttempts; attempt++) {
-      hostStateTxProof = await this.mithrilService.getProofsCardanoTransactionList([hostStateUtxo.txHash]);
-      const proofSnapshotHeight = hostStateTxProof?.latest_block_number ?? snapshot.block_number;
-      const proofCertificateHash = hostStateTxProof?.certificate_hash;
-
-      const snapshotForProof =
-        listSnapshots.find((s) => BigInt(s.block_number) === BigInt(proofSnapshotHeight)) ??
-        (proofCertificateHash ? listSnapshots.find((s) => s.certificate_hash === proofCertificateHash) : undefined);
-
-      if (!snapshotForProof) {
-        throw new GrpcFailedPreconditionException(
-          gatewayGrpcError(
-            GATEWAY_GRPC_ERROR_CODE.HISTORY_NOT_READY,
-            `Mithril transaction snapshot for proof height ${proofSnapshotHeight} is unavailable`,
-          ),
-        );
-      }
-
-      snapshot = snapshotForProof;
-      const hostStateAtSnapshot = await this.historyService.findHostStateUtxoAtOrBeforeBlockNo(
-        BigInt(snapshot.block_number),
-      );
-      if (hostStateAtSnapshot.txHash === hostStateUtxo.txHash) {
-        hostStateUtxo = hostStateAtSnapshot;
-        converged = true;
-        break;
-      }
-      hostStateUtxo = hostStateAtSnapshot;
-    }
-
-    if (!converged) {
-      throw new GrpcInternalException(
-        `Failed to converge Mithril snapshot/proof/HostState alignment after ${maxAlignmentAttempts} attempts for requested height ${height.toString()}`,
-      );
-    }
-
-    const snapshotCertificate = await this.mithrilService.getCertificateByHash(snapshot.certificate_hash);
-    const hostStateTxProofBytes = Buffer.from(JSON.stringify(hostStateTxProof), 'utf8');
-
-    // Align the stake distribution certificate with the chosen transaction snapshot.
-    //
-    // The Cosmos-side verifier expects:
-    // - TransactionSnapshotCertificate.previous_hash == MithrilStakeDistributionCertificate.hash
-    // - Both certificates to refer to the same epoch progression.
-    const stakeDistributionCertHash = snapshotCertificate.previous_hash;
-    if (!stakeDistributionCertHash) {
-      throw new GrpcFailedPreconditionException(
-        gatewayGrpcError(
-          GATEWAY_GRPC_ERROR_CODE.HISTORY_NOT_READY,
-          'Transaction snapshot certificate is missing previous_hash',
-        ),
-      );
-    }
-
-    const mithrilStakeDistribution = stakeDistributionByCertificateHash.get(stakeDistributionCertHash);
-    if (!mithrilStakeDistribution) {
-      throw new GrpcFailedPreconditionException(
-        gatewayGrpcError(
-          GATEWAY_GRPC_ERROR_CODE.HISTORY_NOT_READY,
-          `Mithril stake distribution for certificate ${stakeDistributionCertHash} is unavailable`,
-        ),
-      );
-    }
-    const distributionCertificate = await this.mithrilService.getCertificateByHash(stakeDistributionCertHash);
-
-    // Build a bounded chain of previous stake distribution certificates to support epoch catch-up.
-    const previousMithrilStakeDistributionCertificates: MithrilCertificate[] = [];
-    let previousCertificateHash = distributionCertificate.previous_hash;
-    const maxPreviousCertificates = 20;
-    for (let depth = 0; depth < maxPreviousCertificates && previousCertificateHash; depth++) {
-      const previousCertificate = await this.mithrilService.getCertificateByHash(previousCertificateHash);
-      const previousStakeDistribution = stakeDistributionByCertificateHash.get(previousCertificate.hash);
-
-      if (!previousStakeDistribution) {
-        this.logger.warn(
-          `Mithril stake distribution artifact missing for previous certificate ${previousCertificate.hash}; truncating previous certificate chain`,
-        );
-        break;
-      }
-
-      previousMithrilStakeDistributionCertificates.push(
-        normalizeMithrilStakeDistributionCertificate(previousStakeDistribution, previousCertificate),
-      );
-
-      previousCertificateHash = previousCertificate.previous_hash;
-    }
-
-    // Older -> newer as expected by the Cosmos-side verifier (it may still sort defensively).
-    previousMithrilStakeDistributionCertificates.reverse();
-
-    const hostStateTxHash = hostStateUtxo.txHash;
-
-    const hostStateTxBodyCbor = await this.miniProtocalsService.fetchTransactionBodyCbor(hostStateTxHash);
-
-    const mithrilHeader: MithrilHeader = {
-      mithril_stake_distribution: normalizeMithrilStakeDistribution(mithrilStakeDistribution, distributionCertificate),
-      mithril_stake_distribution_certificate: normalizeMithrilStakeDistributionCertificate(
-        mithrilStakeDistribution,
-        distributionCertificate,
-      ),
-      transaction_snapshot: {
-        merkle_root: snapshot.merkle_root,
-        hash: snapshot.hash,
-        certificate_hash: snapshot.certificate_hash,
-        epoch: BigInt(snapshotCertificate.epoch),
-        block_number: BigInt(snapshot.block_number),
-        created_at: snapshot.created_at,
-      },
-      transaction_snapshot_certificate: normalizeMithrilStakeDistributionCertificate(
-        {
-          epoch: snapshot.epoch,
-          hash: snapshot.hash,
-          certificate_hash: snapshot.certificate_hash,
-          created_at: snapshot.created_at,
-        },
-        snapshotCertificate,
-      ),
-      previous_mithril_stake_distribution_certificates: previousMithrilStakeDistributionCertificates,
-
-      host_state_tx_hash: hostStateTxHash,
-      host_state_tx_body_cbor: hostStateTxBodyCbor,
-      host_state_tx_output_index: hostStateUtxo.outputIndex,
-      host_state_tx_proof: hostStateTxProofBytes,
-    };
-
-    const mithrilHeaderAny: Any = {
-      type_url: '/ibc.lightclients.mithril.v1.MithrilHeader',
-      value: MithrilHeader.encode(mithrilHeader).finish(),
-    };
-    const response: QueryIBCHeaderResponse = {
-      header: mithrilHeaderAny,
-    };
-    return response;
+    return this.queryStabilityIBCHeader(request);
   }
 
   async queryStabilityIBCHeader(request: QueryIBCHeaderRequest): Promise<QueryIBCHeaderResponse> {
-    const { height, trusted_height: trustedHeight } = request;
+    const { trusted_height: trustedHeight } = request;
+    const maintenance = request.checkpoint_only && request.height === 0n;
+    let height = request.height;
+    if (maintenance) {
+      const tip = await this.historyService.findLatestBlock();
+      if (!tip || BigInt(tip.height) <= trustedHeight + 24n) {
+        return {};
+      }
+      height = BigInt(tip.height) - 24n;
+    }
     if (!height) {
       throw new GrpcInvalidArgumentException('Invalid argument: "height" must be provided');
     }
@@ -1819,8 +1987,51 @@ export class QueryService {
       throw new GrpcInvalidArgumentException('Invalid argument: "trusted_height" must be provided');
     }
     const effectiveTrustedHeight = this.normalizeStabilityTrustedHeight(BigInt(trustedHeight), BigInt(height));
+    let settlementCreditClient: ClientStateProbabilistic | undefined;
+    if (request.probabilistic_client_state?.length) {
+      try {
+        settlementCreditClient = ClientStateProbabilistic.decode(request.probabilistic_client_state);
+        if (settlementCreditClient.storage_version !== 2) {
+          throw new Error('Unsupported probabilistic client storage format. Expected version 2.');
+        }
+        const checkpoint = settlementCreditClient.latest_checkpoint_height ?? settlementCreditClient.latest_height;
+        if (
+          !checkpoint ||
+          checkpoint.revision_height !== effectiveTrustedHeight ||
+          !settlementCreditClient.latest_checkpoint_settlement_credit ||
+          !settlementCreditClient.latest_checkpoint_pool_production
+        ) {
+          throw new Error('Destination client checkpoint does not match trusted_height');
+        }
+      } catch (error) {
+        throw new GrpcInvalidArgumentException(`Invalid settlement credit query context: ${error.message}`);
+      }
+    }
 
-    const stabilityHeader = await this.buildBoundedStabilityHeader(effectiveTrustedHeight, BigInt(height));
+    if (request.checkpoint_only && !settlementCreditClient) {
+      throw new GrpcInvalidArgumentException(
+        'Historical destination client context is required for challenge evidence',
+      );
+    }
+
+    // A challenger must be able to authenticate the actual block at a claimed
+    // height even when that block contains no HostState transaction.
+    let stabilityHeader: ProbabilisticHeader;
+    if (request.checkpoint_only) {
+      stabilityHeader = await this.buildBoundedStabilityHeader(
+        effectiveTrustedHeight,
+        BigInt(height),
+        settlementCreditClient,
+        !maintenance,
+        maintenance,
+      );
+    } else {
+      stabilityHeader = await this.buildBoundedStabilityHeader(
+        effectiveTrustedHeight,
+        BigInt(height),
+        settlementCreditClient,
+      );
+    }
 
     return {
       header: {
@@ -1830,7 +2041,13 @@ export class QueryService {
     };
   }
 
-  private async buildBoundedStabilityHeader(trustedHeight: bigint, targetHeight: bigint): Promise<ProbabilisticHeader> {
+  private async buildBoundedStabilityHeader(
+    trustedHeight: bigint,
+    targetHeight: bigint,
+    settlementCreditClient?: ClientStateProbabilistic,
+    challenge = false,
+    maintenance = false,
+  ): Promise<ProbabilisticHeader> {
     const targetDistance = targetHeight - trustedHeight;
     if (targetDistance <= 0n) {
       throw new GrpcInvalidArgumentException(
@@ -1839,13 +2056,12 @@ export class QueryService {
     }
 
     const maxBridgeBlocks = this.getStabilityCheckpointMaxBridgeBlocks();
-    const maxHeaderBytes = this.getStabilityCheckpointMaxHeaderBytes();
     const maxAdvance = BigInt(maxBridgeBlocks) + 1n;
     let candidateDistance = targetDistance < maxAdvance ? targetDistance : maxAdvance;
 
     while (candidateDistance >= 1n) {
       const candidateHeight = trustedHeight + candidateDistance;
-      const isCheckpoint = candidateHeight < targetHeight;
+      const isCheckpoint = challenge || maintenance || candidateHeight < targetHeight;
 
       let stabilityEvidence: StakeWeightedStabilityHeaderEvidence;
       try {
@@ -1853,19 +2069,26 @@ export class QueryService {
           historyService: this.historyService,
           height: candidateHeight,
           trustedHeight,
+          settlementCreditClient,
           logger: this.logger,
         });
       } catch (error) {
-        if (isCheckpoint && candidateDistance > 1n && this.isRecoverableCheckpointCandidateError(error)) {
+        if (candidateDistance > 1n && this.isRecoverableCheckpointCandidateError(error)) {
           candidateDistance -= 1n;
           continue;
         }
         throw error;
       }
 
-      const stabilityHeader = await this.buildStabilityHeader(stabilityEvidence, isCheckpoint);
+      const stabilityHeader = await this.buildStabilityHeader(
+        stabilityEvidence,
+        isCheckpoint,
+        Boolean(settlementCreditClient?.mithril_epoch),
+      );
+
       const encodedHeaderBytes = ProbabilisticHeader.encode(stabilityHeader).finish().length;
-      if (encodedHeaderBytes <= maxHeaderBytes) {
+      const capacityError = this.stabilityHeaderCapacityError(stabilityHeader);
+      if (!capacityError) {
         if (isCheckpoint) {
           this.logger.log(
             `Returning rootless stability checkpoint ${trustedHeight.toString()} -> ${stabilityEvidence.anchorHeight.toString()} while catching up to ${targetHeight.toString()} (${encodedHeaderBytes} bytes)`,
@@ -1874,30 +2097,13 @@ export class QueryService {
         return stabilityHeader;
       }
 
-      this.logger.warn(
-        `Stability ${isCheckpoint ? 'checkpoint' : 'root-bearing'} header ${trustedHeight.toString()} -> ${stabilityEvidence.anchorHeight.toString()} is ${encodedHeaderBytes} bytes, above the configured ${maxHeaderBytes}-byte limit`,
-      );
-
-      if (candidateDistance === 1n || targetDistance === 1n) {
+      if (candidateDistance === 1n) {
         throw new GrpcFailedPreconditionException(
-          gatewayGrpcError(
-            GATEWAY_GRPC_ERROR_CODE.HEIGHT_NOT_ACCEPTED,
-            `Even the smallest stability update from height ${trustedHeight.toString()} is ${encodedHeaderBytes} bytes, above the configured ${maxHeaderBytes}-byte checkpoint limit`,
-            {
-              trustedHeight: trustedHeight.toString(),
-              targetHeight: targetHeight.toString(),
-              encodedHeaderBytes,
-              maxHeaderBytes,
-            },
-          ),
+          gatewayGrpcError(GATEWAY_GRPC_ERROR_CODE.HEIGHT_NOT_ACCEPTED,
+            `The minimum observation after height ${trustedHeight.toString()} exceeds the supported workload: ${capacityError}`),
         );
       }
-
-      const proportionalDistance = Math.max(
-        1,
-        Math.floor((Number(candidateDistance) * maxHeaderBytes) / encodedHeaderBytes),
-      );
-      candidateDistance = BigInt(Math.min(Number(candidateDistance - 1n), proportionalDistance));
+      candidateDistance -= 1n;
     }
 
     throw new GrpcFailedPreconditionException(
@@ -1911,10 +2117,11 @@ export class QueryService {
   private async buildStabilityHeader(
     stabilityEvidence: StakeWeightedStabilityHeaderEvidence,
     isCheckpoint: boolean,
+    mithrilAnchored = false,
   ): Promise<ProbabilisticHeader> {
-    const hostStateUtxo = isCheckpoint
-      ? undefined
-      : await this.findExactStabilityAnchorHostStateUtxo(stabilityEvidence.anchorHeight, 'header generation');
+    // Complete bodies authenticate both changed lanes and unchanged roots.
+    // The anchor need not contain a HostState transaction.
+
     const requestedBlocks = [
       ...stabilityEvidence.bridgeBlocks,
       stabilityEvidence.anchorBlock,
@@ -1924,9 +2131,7 @@ export class QueryService {
     const blockWitnessByHeight = new Map<number, Buffer>(
       requestedBlocks.map((block, index) => [block.height, blockWitnesses[index]]),
     );
-    const headerWitnessBlocks = isCheckpoint
-      ? requestedBlocks
-      : [...stabilityEvidence.bridgeBlocks, ...stabilityEvidence.descendantBlocks];
+    const headerWitnessBlocks = stabilityEvidence.descendantBlocks;
     const headerWitnessByHeight = new Map<number, Buffer>(
       headerWitnessBlocks.map((block) => {
         const blockCbor = blockWitnessByHeight.get(block.height);
@@ -1937,14 +2142,22 @@ export class QueryService {
       }),
     );
 
-    const newEpochContext =
-      stabilityEvidence.anchorEpoch !== stabilityEvidence.trustedEpoch
+    const newEpochContext = stabilityEvidence.nextEpochContext
+      ? this.toStabilityEpochContext(
+          Number(stabilityEvidence.anchorEpoch) + 1,
+          stabilityEvidence.nextEpochContext.stakeDistribution,
+          stabilityEvidence.nextEpochContext.verificationContext,
+        )
+      : stabilityEvidence.anchorEpoch !== stabilityEvidence.trustedEpoch
         ? this.toStabilityEpochContext(
             Number(stabilityEvidence.anchorEpoch),
             stabilityEvidence.epochStakeDistribution,
             stabilityEvidence.epochVerificationContext,
           )
         : undefined;
+    if (newEpochContext && mithrilAnchored) {
+      await this.requireMithrilStakeAgreement(newEpochContext);
+    }
 
     const stabilityHeader: ProbabilisticHeader = {
       trusted_height: {
@@ -1953,17 +2166,16 @@ export class QueryService {
       },
       anchor_block: this.toStabilityBlock(
         stabilityEvidence.anchorBlock,
-        isCheckpoint ? undefined : blockWitnessByHeight.get(stabilityEvidence.anchorBlock.height),
-        isCheckpoint ? headerWitnessByHeight.get(stabilityEvidence.anchorBlock.height) : undefined,
+        blockWitnessByHeight.get(stabilityEvidence.anchorBlock.height),
       ),
       bridge_blocks: stabilityEvidence.bridgeBlocks.map((block) =>
-        this.toStabilityBlock(block, undefined, headerWitnessByHeight.get(block.height)),
+        this.toStabilityBlock(block, blockWitnessByHeight.get(block.height)),
       ),
       descendant_blocks: stabilityEvidence.descendantBlocks.map((block) =>
         this.toStabilityBlock(block, undefined, headerWitnessByHeight.get(block.height)),
       ),
-      host_state_tx_hash: hostStateUtxo?.txHash ?? '',
-      host_state_tx_output_index: hostStateUtxo?.outputIndex ?? 0,
+      host_state_tx_hash: '',
+      host_state_tx_output_index: 0,
       new_epoch_context: newEpochContext,
       is_checkpoint: isCheckpoint,
     };
@@ -1983,20 +2195,54 @@ export class QueryService {
     return stabilityHeader;
   }
 
+  // Mithril is optional. Without an aggregator, every epoch table takes the
+  // response window.
+  private mithrilStakeSource(): MithrilService | undefined {
+    return this.configService.get<string>('mithrilEndpoint') ? this.mithrilService : undefined;
+  }
+
+  // An anchored client freezes if it accepts a table that a later certificate
+  // contradicts, so a table that disagrees with Mithril is never proposed.
+  // Without a certified distribution the challenge period applies.
+  private async requireMithrilStakeAgreement(context: ProbabilisticEpochContext): Promise<void> {
+    const mithril = this.mithrilStakeSource();
+    if (!mithril) return;
+    let agreed: boolean;
+    try {
+      agreed = await requireMithrilStakeAgreement(mithril, Number(context.epoch), context.stake_distribution);
+    } catch (error) {
+      if (error instanceof MithrilStakeMismatchError) throw new GrpcFailedPreconditionException(error.message);
+      this.logger.warn(`Mithril stake check for epoch ${context.epoch} is unavailable: ${error.message}`);
+      return;
+    }
+    if (!agreed) {
+      this.logger.warn(`Mithril has not certified the epoch ${context.epoch} stake table, so it enters the challenge period`);
+    }
+  }
+
   private getStabilityCheckpointMaxBridgeBlocks(): number {
-    const value = this.configService.get<number>('cardanoStabilityCheckpointMaxBridgeBlocks') ?? 32;
+    const value = this.configService.get<number>('cardanoStabilityCheckpointMaxBridgeBlocks') ?? 96;
     if (!Number.isSafeInteger(value) || value < 0) {
       throw new GrpcInternalException('Invalid Cardano stability checkpoint bridge-block limit');
     }
-    return value;
+    return Math.min(value, 96);
   }
 
-  private getStabilityCheckpointMaxHeaderBytes(): number {
-    const value = this.configService.get<number>('cardanoStabilityCheckpointMaxHeaderBytes') ?? 768 * 1024;
-    if (!Number.isSafeInteger(value) || value <= 0) {
-      throw new GrpcInternalException('Invalid Cardano stability checkpoint header-size limit');
+
+
+  private stabilityHeaderCapacityError(header: ProbabilisticHeader): string | undefined {
+    if (header.bridge_blocks.length > 96 || 1 + header.bridge_blocks.length + header.descendant_blocks.length > 128) {
+      return 'block count exceeds the challenge capacity bound';
     }
-    return value;
+    if ((header.new_epoch_context?.stake_distribution.length ?? 0) > 4000) {
+      return 'stake table exceeds the challenge capacity bound';
+    }
+    const blocks = [...header.bridge_blocks, header.anchor_block!, ...header.descendant_blocks];
+
+    if (blocks.some((block) => block.block_cbor.length > 96 * 1024 || block.header_cbor.length > 1100)) {
+      return 'block witness exceeds the challenge capacity bound';
+    }
+    return undefined;
   }
 
   private isRecoverableCheckpointCandidateError(error: unknown): boolean {
@@ -2041,13 +2287,6 @@ export class QueryService {
       }
       throw new GrpcInternalException(`Failed to query denom: ${error.message}`);
     }
-  }
-
-  private getLightClientMode(): 'mithril' | 'stake-weighted-stability' {
-    return (
-      this.configService.get<'mithril' | 'stake-weighted-stability'>('cardanoLightClientMode') ||
-      'stake-weighted-stability'
-    );
   }
 
   private normalizeStabilityTrustedHeight(trustedHeight: bigint, anchorHeight: bigint): bigint {
@@ -2132,6 +2371,12 @@ export class QueryService {
       currentEpochEndSlotExclusive: bigint;
     },
   ): ProbabilisticEpochContext {
+    const missingRegistration = stakeDistribution.find((entry) => entry.firstRegistrationSlot == null);
+    if (missingRegistration) {
+      throw new GrpcFailedPreconditionException(
+        `First registration slot unavailable for pool ${missingRegistration.poolId} in epoch ${epoch}`,
+      );
+    }
     return {
       epoch: BigInt(epoch),
       stake_distribution: stakeDistribution.map(
@@ -2139,7 +2384,10 @@ export class QueryService {
           pool_id: entry.poolId,
           stake: this.toProtoUint64(entry.stake, `stake_distribution[${entry.poolId}].stake`),
           vrf_key_hash: Buffer.from(entry.vrfKeyHash, 'hex'),
-          first_registration_slot: entry.firstRegistrationSlot ?? 0n,
+          first_registration_slot: this.toProtoUint64(
+            entry.firstRegistrationSlot!,
+            `stake_distribution[${entry.poolId}].first_registration_slot`,
+          ),
           relative_stake_numerator: this.toProtoUint64(
             entry.relativeStakeNumerator,
             `stake_distribution[${entry.poolId}].relative_stake_numerator`,
@@ -2156,6 +2404,8 @@ export class QueryService {
       epoch_end_slot_exclusive: verificationContext.currentEpochEndSlotExclusive,
     };
   }
+
+
 
   private toStabilityOperationalCertificateCounters(counters: Map<string, bigint>): OperationalCertificateCounter[] {
     if (!(counters instanceof Map)) {
@@ -2201,16 +2451,6 @@ export class QueryService {
       throw new GrpcInternalException(`IBC infrastructure error: ${fieldName} is outside protobuf uint64 bounds`);
     }
     return value;
-  }
-
-  private async findExactStabilityAnchorHostStateUtxo(anchorHeight: bigint, context: string): Promise<UtxoDto> {
-    const hostStateUtxo = await this.historyService.findHostStateUtxoAtOrBeforeBlockNo(anchorHeight);
-    if (BigInt(hostStateUtxo.blockNo) !== anchorHeight) {
-      throw new GrpcNotFoundException(
-        `Not found: requested stability anchor height ${anchorHeight.toString()} is not a HostState tx block height for ${context}`,
-      );
-    }
-    return hostStateUtxo;
   }
 
   private normalizeIbcDenomHashInput(input: string | undefined): string {

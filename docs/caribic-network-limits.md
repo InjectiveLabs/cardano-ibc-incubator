@@ -50,16 +50,15 @@ bytes, 90,112 block-body bytes, 16,500,000 transaction memory units,
 20,000,000,000 block steps. The transaction-budget CI uses the same values and
 keeps its existing 750-byte and 5% reserves.
 
-The active local ledger source is
-`chains/cardano/config/devnet/genesis-alonzo.json` together with the Shelley
-genesis in that directory. `chains/cardano/config/protocol-parameters.json` is
-not loaded by Caribic.
+Local ledger limits come from `chains/cardano/devkit/node.properties`.
+The Plutus V3 cost model comes from the pinned protocol-11 snapshot in
+`chains/cardano/config/protocol-parameters.json`.
 
-The local Cardano ledger is still pinned to protocol version 9 and the
-repository cost models. These changes make its numeric capacity strict; they
-do not claim byte-for-byte protocol-version 11 execution parity. Full current
-Cardano execution parity requires a coordinated cardano-node, Ogmios, Kupo,
-Aiken, and cost-model upgrade.
+The local Cardano ledger and evaluators target protocol version 11 with the
+350-entry Plutus V3 cost model. The snapshot was captured on November 1, 2026
+from the [mainnet Koios API](https://api.koios.rest/api/v1/cli_protocol_params). The profile pins cardano-node 11.1.3 and
+Ogmios 7. Native Value operations require this ledger version. Smoke checks
+verify both generated genesis and the running node's protocol parameters.
 
 Fast governance periods, deterministic clocks, local token balances, and fee
 prices remain test settings. They are not transaction or validator capacity
@@ -89,12 +88,12 @@ fixture is the sorted-order late-match path after Cardano. Paying for the failed
 earlier candidate makes these two paths bound all four accepted wire profiles.
 
 The CI size budget is 15,634 bytes: the 16,384-byte ledger maximum less a
-750-byte reserve. Reference-script deployment has a 16,040-byte signed estimate,
+750-byte reserve. Reference-script deployment has a 15,775-byte signed estimate,
 so it is a headroom violation but remains below the ledger maximum. The combined
 receive path's additive model estimates 20,615 unsigned bytes and 20,875 signed
 bytes, which exceeds the ledger maximum. Actual balanced CBOR is not built here,
 so this estimate is not a direct measurement of a submitted transaction. Its
-96,763,049 memory units and 31,523,591,002 CPU steps also sum isolated Aiken
+96,805,885 memory units and 31,541,023,235 CPU steps also sum isolated Aiken
 fixtures; they are not a ledger evaluation of every validator in one combined
 transaction. Each recorded size or execution-unit overrun has an exact
 regression ceiling. CI rejects any increase, requires the ceiling to be lowered
@@ -104,7 +103,6 @@ scenarios remain report-only and are not covered by this ratchet.
 
 Sources:
 
-- Cardano epoch 651 parameters: <https://api.koios.rest/api/v1/epoch_params?epoch_no=eq.651>
 - Injective consensus parameters at height 180448981: <https://sentry.tm.injective.network/consensus_params?height=180448981>
 - Injective staking parameters: <https://sentry.lcd.injective.network/cosmos/staking/v1beta1/params>
 - Injective transaction-fee parameters: <https://sentry.lcd.injective.network/injective/txfees/v1beta1/params>

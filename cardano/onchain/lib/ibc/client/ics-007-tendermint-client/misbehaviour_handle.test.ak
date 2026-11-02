@@ -1,3 +1,4 @@
+use aiken/cbor
 use aiken/collection/list
 use aiken/fuzz
 use ibc/client/ics_007_tendermint_client/cometbft/block/block_id.{
@@ -15,7 +16,7 @@ use ibc/client/ics_007_tendermint_client/misbehaviour.{Misbehaviour}
 use ibc/client/ics_007_tendermint_client/misbehaviour_handle
 use ibc/client/ics_007_tendermint_client/msgs.{HeaderCase, MisbehaviourCase}
 use ibc/client/ics_007_tendermint_client/store
-use ibc/core/ics_002_client_semantics/types/keys as client_keys
+use ibc/core/ics_002_client_semantics/registry
 use ibc/testing/fuzz_dsl
 
 fn test_header(height: Int, time: Int, block_hash: ByteArray) -> Header {
@@ -56,6 +57,30 @@ fn check_with_client_id(
 
 fn check(header1: Header, header2: Header) -> Bool {
   check_with_client_id("07-tendermint-0", header1, header2)
+}
+
+test matching_header_with_definite_encoded_consensus_is_not_misbehaviour() {
+  // The Gateway stores canonical definite arrays. The equality check compares
+  // the checkpoint's fields, not its encoding against a fresh constructor.
+  expect Some(raw) = cbor.deserialise(#"d87983181e4111d879814122")
+  expect stored: ConsensusState = raw
+  let base = test_header(3, 30, #"01")
+  let matching =
+    Header {
+      ..base,
+      signed_header: SignedHeader {
+        ..base.signed_header,
+        header: tm_header.TmHeader {
+          ..base.signed_header.header,
+          next_validators_hash: #"11",
+          app_hash: #"22",
+        },
+      },
+    }
+  !misbehaviour_handle.check_for_misbehaviour(
+    HeaderCase(matching),
+    [Pair(Height { revision_number: 1, revision_height: 3 }, stored)],
+  )
 }
 
 test two_valid_monotonic_headers_in_normal_order_are_not_misbehaviour() {
@@ -137,9 +162,7 @@ test prop_client_misbehaviour_rejects_same_header(seed via fuzz.int()) {
     |> fuzz_dsl.assert_rejected
 }
 
-test prop_client_misbehaviour_rejects_wrong_client_id(_seed via fuzz.int()) {
-  fuzz.label(@"regression.unit.client.misbehaviour.invalid_wrong_client_id")
-
+test regression_client_misbehaviour_rejects_wrong_client_id() {
   // This remains unit.* depth on purpose: the production misbehaviour path is
   // already size-sensitive, so the canonical client-id predicate is covered
   // directly instead of being duplicated inside the largest validator.
@@ -147,8 +170,11 @@ test prop_client_misbehaviour_rejects_wrong_client_id(_seed via fuzz.int()) {
     "client",
     "misbehaviour",
     "wrong_client_id",
-    "client_keys.is_valid_client_id",
-    client_keys.is_valid_client_id("client-0"),
+    "registry.matches_id",
+    registry.matches_id(
+      registry.legacy("policy", "script", "proof"),
+      "client-0",
+    ),
   )
     |> fuzz_dsl.assert_rejected
 }

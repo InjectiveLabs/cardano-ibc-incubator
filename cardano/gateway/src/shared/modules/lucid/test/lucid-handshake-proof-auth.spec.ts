@@ -31,6 +31,8 @@ function harness() {
     spendChannel: utxo('spend-channel'),
     mintChannel: utxo('mint-channel'),
     spendTransferModule: utxo('spend-transfer-module'),
+    spendMockModule: utxo('spend-query-module'),
+    timeoutPacket: utxo('timeout-packet'),
     verifyProof: utxo('verify-proof'),
     receivePacket: utxo('receive-packet'),
   };
@@ -51,7 +53,7 @@ function harness() {
           spendConnection: { address: 'connection-address' },
           spendChannel: { address: 'channel-address' },
         },
-        modules: { transfer: { address: 'transfer-address' } },
+        modules: { transfer: { address: 'transfer-address' }, icq: { address: 'query-address' } },
       })),
     },
     referenceScripts: references,
@@ -62,10 +64,10 @@ function harness() {
 }
 
 describe('Lucid handshake proof authorization', () => {
-  it('adds the pinned verify-proof reference and mint to ConnectionOpenTry', () => {
+  it('adds the pinned verify-proof reference and mint to ConnectionOpenTry', async () => {
     const { service, builder, references } = harness();
 
-    service.createUnsignedConnectionOpenTryTransaction(
+    await service.createUnsignedConnectionOpenTryTransaction(
       utxo('host-input'),
       'host-redeemer',
       'connection-token',
@@ -83,26 +85,21 @@ describe('Lucid handshake proof authorization', () => {
       references.verifyProof,
       references.hostStateStt,
     ]);
-    expect(builder.mintAssets).toHaveBeenNthCalledWith(
-      1,
-      { 'connection-token': 1n },
-      'connection-redeemer',
-    );
-    expect(builder.mintAssets).toHaveBeenNthCalledWith(
-      2,
-      { 'verify-policy': 1n },
-      'verify-redeemer',
-    );
+    expect(builder.mintAssets).toHaveBeenNthCalledWith(1, { 'connection-token': 1n }, 'connection-redeemer');
+    expect(builder.mintAssets).toHaveBeenNthCalledWith(2, { 'verify-policy': 1n }, 'verify-redeemer');
+    expect(builder.readFrom).toHaveBeenCalledWith([utxo('client-input')]);
   });
 
-  it('adds the pinned verify-proof reference and mint to ConnectionOpenConfirm', () => {
+  it('adds the pinned verify-proof reference and mint to ConnectionOpenConfirm', async () => {
     const { service, builder, references } = harness();
+    const host = utxo('host-input', { lovelace: 8_000_000n, 'host-policyhost-name': 1n, reserve: 7n });
+    const connection = utxo('connection-input', { lovelace: 9_000_000n, 'connection-token': 1n });
 
-    service.createUnsignedConnectionOpenConfirmTransaction(
-      utxo('host-input'),
+    await service.createUnsignedConnectionOpenConfirmTransaction(
+      host,
       'host-redeemer',
       'host-datum',
-      utxo('connection-input'),
+      connection,
       'connection-redeemer',
       'connection-token',
       utxo('client-input'),
@@ -112,22 +109,30 @@ describe('Lucid handshake proof authorization', () => {
       'signer',
     );
 
+    expect(builder.pay.ToContract).toHaveBeenCalledWith(
+      'host-address',
+      { kind: 'inline', value: 'host-datum' },
+      host.assets,
+    );
+    expect(builder.pay.ToContract).toHaveBeenCalledWith(
+      'connection-address',
+      { kind: 'inline', value: 'connection-datum' },
+      connection.assets,
+    );
     expect(builder.readFrom).toHaveBeenNthCalledWith(1, [
       references.spendConnection,
       references.verifyProof,
       references.hostStateStt,
     ]);
     expect(builder.mintAssets).toHaveBeenCalledTimes(1);
-    expect(builder.mintAssets).toHaveBeenCalledWith(
-      { 'verify-policy': 1n },
-      'verify-redeemer',
-    );
+    expect(builder.mintAssets).toHaveBeenCalledWith({ 'verify-policy': 1n }, 'verify-redeemer');
+    expect(builder.readFrom).toHaveBeenCalledWith([utxo('client-input')]);
   });
 
-  it('adds the pinned verify-proof reference and mint to ChannelOpenTry', () => {
+  it('adds the pinned verify-proof reference and mint to ChannelOpenTry', async () => {
     const { service, builder, references } = harness();
 
-    service.createUnsignedChannelOpenTryTransaction({
+    await service.createUnsignedChannelOpenTryTransaction({
       moduleKey: 'transfer',
       connectionUtxo: utxo('connection-input'),
       clientUtxo: utxo('client-input'),
@@ -149,24 +154,52 @@ describe('Lucid handshake proof authorization', () => {
       references.verifyProof,
       references.hostStateStt,
     ]);
-    expect(builder.mintAssets).toHaveBeenNthCalledWith(
-      1,
-      { 'channel-token': 1n },
-      'channel-redeemer',
-    );
-    expect(builder.mintAssets).toHaveBeenNthCalledWith(
-      2,
-      { 'verify-policy': 1n },
-      'verify-redeemer',
-    );
+    expect(builder.mintAssets).toHaveBeenNthCalledWith(1, { 'channel-token': 1n }, 'channel-redeemer');
+    expect(builder.mintAssets).toHaveBeenNthCalledWith(2, { 'verify-policy': 1n }, 'verify-redeemer');
   });
 
-  it('requires a module callback in the generic RecvPacket builder', () => {
+  it('requires a module callback in the generic RecvPacket builder', async () => {
     const { service, builder, references } = harness();
     const moduleUtxo = utxo('module-input', { 'module-token': 1n });
 
-    service.createUnsignedRecvPacketTx({
-      moduleKey: 'transfer',
+    await service.createUnsignedRecvPacketModuleTx({
+      moduleKey: 'icq',
+      moduleUtxo,
+      encodedSpendModuleRedeemer: 'module-redeemer',
+      hostStateUtxo: utxo('host-input'),
+      encodedHostStateRedeemer: 'host-redeemer',
+      encodedUpdatedHostStateDatum: 'host-datum',
+      channelUtxo: utxo('channel-input'),
+      connectionUtxo: utxo('connection-input'),
+      clientUtxo: utxo('client-input'),
+      encodedSpendChannelRedeemer: 'channel-redeemer',
+      encodedUpdatedChannelDatum: 'channel-datum',
+      channelTokenUnit: 'channel-token',
+      recvPacketPolicyId: 'recv-policy',
+      channelToken: { policyId: 'channel-policy', name: 'channel-name' },
+      verifyProofPolicyId: 'verify-policy',
+      encodedVerifyProofRedeemer: 'verify-redeemer',
+    });
+
+    expect(builder.readFrom).toHaveBeenNthCalledWith(1, [
+      references.spendChannel,
+      references.spendMockModule,
+      references.receivePacket,
+      references.verifyProof,
+      references.hostStateStt,
+    ]);
+    expect(builder.collectFrom).toHaveBeenCalledWith([moduleUtxo], 'module-redeemer');
+    expect(builder.pay.ToContract).toHaveBeenCalledWith(
+      'query-address',
+      { kind: 'inline', value: 'd87980' },
+      { 'module-token': 1n },
+    );
+  });
+  it('preserves query module value and datum while authenticating a timeout', async () => {
+    const { service, builder, references } = harness();
+    const moduleUtxo = utxo('module-input', { lovelace: 7_000_000n, 'module-token': 1n });
+    await service.createUnsignedTimeoutPacketModuleTx({
+      moduleKey: 'icq',
       moduleUtxo,
       encodedSpendModuleRedeemer: 'module-redeemer',
       hostStateUtxo: utxo('host-input'),
@@ -179,24 +212,25 @@ describe('Lucid handshake proof authorization', () => {
       encodedUpdatedChannelDatum: 'channel-datum',
       channelTokenUnit: 'channel-token',
       constructedAddress: 'signer',
-      recvPacketPolicyId: 'recv-policy',
+      timeoutPacketPolicyId: 'timeout-policy',
       channelToken: { policyId: 'channel-policy', name: 'channel-name' },
       verifyProofPolicyId: 'verify-policy',
       encodedVerifyProofRedeemer: 'verify-redeemer',
     });
-
     expect(builder.readFrom).toHaveBeenNthCalledWith(1, [
       references.spendChannel,
-      references.spendTransferModule,
-      references.receivePacket,
+      references.spendMockModule,
+      references.timeoutPacket,
       references.verifyProof,
       references.hostStateStt,
     ]);
     expect(builder.collectFrom).toHaveBeenCalledWith([moduleUtxo], 'module-redeemer');
     expect(builder.pay.ToContract).toHaveBeenCalledWith(
-      'transfer-address',
-      { kind: 'inline', value: 'd87980' },
-      { 'module-token': 1n },
+      'query-address',
+      { kind: 'inline', value: moduleUtxo.datum },
+      moduleUtxo.assets,
     );
+    expect(builder.mintAssets).toHaveBeenCalledWith({ 'timeout-policy': 1n }, 'encoded-auth-token');
+    expect(builder.mintAssets).toHaveBeenCalledWith({ 'verify-policy': 1n }, 'verify-redeemer');
   });
 });

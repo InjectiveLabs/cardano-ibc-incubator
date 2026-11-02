@@ -1,13 +1,130 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import {
   aikenSemanticSignature,
   classifyAikenChanges,
+  classifyCiWorkflowChange,
 } from './detect-aiken-semantic-changes.mjs';
+
+test('scopes edits to existing workflow jobs and falls back for shared changes', () => {
+  const source = readFileSync(new URL('../../.github/workflows/ci.yml', import.meta.url), 'utf8');
+  const gatewayEdit = source.replace(
+    '        run: npm run --prefix cardano/gateway lint:check',
+    '        run: npm run --prefix cardano/gateway lint',
+  );
+  assert.notEqual(gatewayEdit, source);
+  // The Gateway job now runs migration evidence checks, so edits must fail closed.
+  assert.deepEqual(classifyCiWorkflowChange(source, gatewayEdit), { relevant: true, fuzz: true });
+  const isolatedGateway = 'name: CI\njobs:\n  gateway:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npm test\n';
+  assert.deepEqual(
+    classifyCiWorkflowChange(isolatedGateway, isolatedGateway.replace('npm test', 'npm run build')),
+    { relevant: false, fuzz: false },
+  );
+
+  const budgetEdit = source.replace('      - name: Collect Aiken execution units', '      - name: Collect budget units');
+  assert.notEqual(budgetEdit, source);
+  assert.deepEqual(classifyCiWorkflowChange(source, budgetEdit), { relevant: true, fuzz: false });
+
+  for (const changed of [
+    source.replace('    name: Cardano Onchain Aiken Property/Fuzz', '    name: Validator fuzz tests'),
+    source.replace('  CI: true', '  CI: false'),
+    `${source}\n  new-job:\n    runs-on: ubuntu-latest\n`,
+    source.replace('  gateway:', '  gateway: &shared-job'),
+  ]) {
+    assert.notEqual(changed, source);
+    assert.deepEqual(classifyCiWorkflowChange(source, changed), { relevant: true, fuzz: true });
+  }
+  assert.deepEqual(classifyCiWorkflowChange(undefined, source), { relevant: true, fuzz: true });
+  assert.deepEqual(classifyCiWorkflowChange(source, 'jobs: {}'), { relevant: true, fuzz: true });
+});
+
+test('separates transaction inputs from validator and fuzz infrastructure changes', () => {
+  const repo = mkdtempSync(join(tmpdir(), 'aiken-suite-detector-'));
+  try {
+    execFileSync('git', ['init', '-q'], { cwd: repo });
+    execFileSync('git', ['config', 'user.email', 'ci@example.com'], { cwd: repo });
+    execFileSync('git', ['config', 'user.name', 'CI'], { cwd: repo });
+    execFileSync('git', ['commit', '--allow-empty', '-qm', 'base'], { cwd: repo });
+    for (const [path, relevant, fuzz] of [
+      ['cardano/gateway/package.json', true, false],
+      ['cardano/gateway/package-lock.json', true, false],
+      ['cardano/offchain/src/deployment.ts', true, false],
+      ['cardano/gateway/src/shared/types/channel/channel-datum.ts', true, false],
+      ['packages/cardano-ibc-tx-builder-runtime/package-lock.json', true, false],
+      ['chains/cardano/devkit/node.properties', true, false],
+      ['chains/cardano/devkit/Dockerfile', true, false],
+      ['scripts/ci/collect-cardano-tx-budget-units.sh', true, false],
+      ['cardano/onchain/aiken.lock', true, true],
+      ['cardano/onchain/validators/new.ak', true, true],
+      ['scripts/ci/check-aiken-fuzz-coverage.mjs', true, true],
+      ['scripts/ci/check-aiken-layering.sh', true, true],
+      ['scripts/ci/detect-aiken-semantic-changes.mjs', true, true],
+      ['.github/actions/setup/action.yml', true, true],
+      ['cardano/gateway/src/query/query.controller.ts', false, false],
+    ]) {
+      const target = join(repo, path);
+      mkdirSync(join(target, '..'), { recursive: true });
+      writeFileSync(target, '// changed\n');
+      execFileSync('git', ['add', '.'], { cwd: repo });
+      execFileSync('git', ['commit', '-qm', path], { cwd: repo });
+      const result = classifyAikenChanges(repo, 'HEAD^', 'HEAD');
+      assert.equal(result.aikenRelevantChanged, relevant, path);
+      assert.equal(result.aikenFuzzChanged, fuzz, path);
+    }
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test('aggregate requires budgets without fuzz and rejects failed required jobs', () => {
+  const workflow = readFileSync(new URL('../../.github/workflows/ci.yml', import.meta.url), 'utf8');
+  const aggregate = workflow.slice(workflow.indexOf('  aiken:\n'), workflow.indexOf('  tx-budgets:\n'));
+  const script = aggregate.match(/node - <<'NODE'\n([\s\S]*?)\n          NODE/)[1]
+    .replace(/^          /gm, '');
+  const run = (fuzz, overrides = {}, changed = 'true', runJobs = 'true') => {
+    const needs = Object.fromEntries([
+      'docs-update', 'aiken-changes', 'aiken-static', 'generated-artifacts', 'tx-budgets',
+      'aiken-smoke', 'aiken-fuzz', 'aiken-mutations', 'deno-offchain',
+      'migration-assurance', 'migration-packet-model', 'deno-funds',
+    ].map((name) => [name, { result: !fuzz && ['aiken-smoke', 'aiken-fuzz', 'aiken-mutations'].includes(name) ? 'skipped' : 'success' }]));
+    for (const [name, result] of Object.entries(overrides)) needs[name] = { result };
+    return execFileSync(process.execPath, ['-e', script], {
+      env: {
+        ...process.env,
+        RUN_JOBS: runJobs,
+        AIKEN_CHANGED: changed,
+        AIKEN_FILES_CHANGED: 'false',
+        AIKEN_PR_CHANGED: changed,
+        AIKEN_FUZZ_CHANGED: String(fuzz),
+        NEEDS_JSON: JSON.stringify(needs),
+      },
+      stdio: 'pipe',
+    });
+  };
+  assert.doesNotThrow(() => run(false));
+  assert.throws(() => run(false, { 'docs-update': 'failure' }));
+  assert.throws(() => run(false, {}, 'true', 'invalid'));
+  assert.doesNotThrow(() => run(false, { 'aiken-changes': 'skipped', 'deno-funds': 'skipped' }, '', 'false'));
+  assert.throws(() => run(false, { 'docs-update': 'failure' }, '', 'false'));
+  assert.throws(() => run(false, { 'deno-offchain': 'failure' }));
+  assert.throws(() => run(true, { 'deno-offchain': 'skipped' }));
+  assert.throws(() => run(false, { 'migration-assurance': 'failure' }));
+  assert.throws(() => run(true, { 'migration-packet-model': 'skipped' }));
+  assert.throws(() => run(false, { 'deno-funds': 'failure' }));
+  assert.throws(() => run(true, { 'deno-funds': 'skipped' }));
+  assert.throws(() => run(false, { 'tx-budgets': 'failure' }));
+  assert.throws(() => run(false, { 'tx-budgets': 'skipped' }));
+  assert.doesNotThrow(() => run(true));
+  assert.throws(() => run(true, { 'aiken-fuzz': 'skipped' }));
+  assert.throws(() => run(true, { 'aiken-mutations': 'failure' }));
+  assert.throws(() => run(true, { 'aiken-smoke': 'failure' }));
+  assert.throws(() => run(false, {}, 'invalid'));
+  assert.doesNotThrow(() => run(false, { 'tx-budgets': 'skipped', 'aiken-static': 'skipped' }, 'false'));
+});
 
 test('ignores ordinary standalone, trailing, and nested line-comment text', () => {
   const before = `
@@ -120,7 +237,7 @@ test('classifies modified comments as trivia and source additions as relevant', 
     execFileSync('git', ['config', 'user.name', 'CI'], { cwd: repo });
     const sourceDir = join(repo, 'cardano/onchain/validators');
     mkdirSync(sourceDir, { recursive: true });
-    const sourcePath = join(sourceDir, 'example.ak');
+const sourcePath = join(sourceDir, 'example.ak');
     writeFileSync(sourcePath, 'pub fn value() { 1 }\n');
     execFileSync('git', ['add', '.'], { cwd: repo });
     execFileSync('git', ['commit', '-qm', 'base'], { cwd: repo });
@@ -138,6 +255,7 @@ test('classifies modified comments as trivia and source additions as relevant', 
     assert.deepEqual(classifyAikenChanges(repo, base, comments), {
       aikenFilesChanged: true,
       aikenRelevantChanged: false,
+      aikenFuzzChanged: false,
       changedFiles: ['cardano/onchain/validators/example.ak'],
       reasons: [],
     });
@@ -281,6 +399,16 @@ test('classifies modified comments as trivia and source additions as relevant', 
       true,
     );
 
+    const offchainDir = join(repo, 'cardano/offchain/src');
+    mkdirSync(offchainDir, { recursive: true });
+    writeFileSync(join(offchainDir, 'packet-budgets.test.ts'), '// complete transaction budgets\n');
+    execFileSync('git', ['add', '.'], { cwd: repo });
+    execFileSync('git', ['commit', '-qm', 'test: change complete transaction budgets'], { cwd: repo });
+    assert.equal(
+      classifyAikenChanges(repo, txBudgetLimitsChanged, 'HEAD').aikenRelevantChanged,
+      true,
+    );
+
     const capacityFixtureDir = join(
       repo,
       'cardano/gateway/src/scripts/test/fixtures/tendermint-update-capacity',
@@ -323,6 +451,36 @@ test('classifies modified comments as trivia and source additions as relevant', 
         .aikenRelevantChanged,
       true,
     );
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+
+test('reruns the budget gate when only applied deployment inputs change', () => {
+  const repo = mkdtempSync(join(tmpdir(), 'deployment-change-detector-'));
+  try {
+    execFileSync('git', ['init', '-q'], { cwd: repo });
+    execFileSync('git', ['config', 'user.email', 'ci@example.com'], { cwd: repo });
+    execFileSync('git', ['config', 'user.name', 'CI'], { cwd: repo });
+    execFileSync('git', ['commit', '--allow-empty', '-qm', 'base'], { cwd: repo });
+    for (const path of [
+      'cardano/offchain/src/deployment-plan.ts',
+      'cardano/offchain/scripts/export-deployment-plan.ts',
+      'cardano/offchain/deno.lock',
+      'cardano/gateway/src/scripts/ci/applied-deployment-plan.ts',
+    ]) {
+      const base = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim();
+      const target = join(repo, path);
+      mkdirSync(join(target, '..'), { recursive: true });
+      writeFileSync(target, '// changed applied deployment input\n');
+      execFileSync('git', ['add', '.'], { cwd: repo });
+      execFileSync('git', ['commit', '-qm', 'deployment input'], { cwd: repo });
+      const result = classifyAikenChanges(repo, base, 'HEAD');
+      assert.equal(result.aikenFilesChanged, false, path);
+      assert.equal(result.aikenRelevantChanged, true, path);
+      assert.equal(result.aikenFuzzChanged, false, path);
+    }
   } finally {
     rmSync(repo, { recursive: true, force: true });
   }

@@ -9,14 +9,15 @@ use ibc/client/ics_007_tendermint_client/cometbft/protos/channel_pb
 use ibc/client/ics_007_tendermint_client/consensus_state.{ConsensusState}
 use ibc/client/ics_007_tendermint_client/height.{Height} as height_mod
 use ibc/client/ics_007_tendermint_client/types/verify_proof_redeemer.{
-  VerifyMembership,
+  VerifyMembership, VerifyProofEnvelope,
 }
 use ibc/core/ics_003_connection_semantics/connection_datum.{ConnectionDatum}
 use ibc/core/ics_003_connection_semantics/types/connection_end.{ConnectionEnd}
 use ibc/core/ics_003_connection_semantics/types/counterparty.{Counterparty} as conn_counterparty_mod
 use ibc/core/ics_003_connection_semantics/verify as verify_mod
-use ibc/core/ics_004/channel_datum.{ChannelDatum,
-  ChannelDatumState} as channel_datum_mod
+use ibc/core/ics_004/channel_datum.{
+  ChannelDatum, ChannelDatumState, initial_upgrade_state,
+} as channel_datum_mod
 use ibc/core/ics_004/channel_redeemer.{ChanOpenConfirm}
 use ibc/core/ics_004/types/channel.{Channel}
 use ibc/core/ics_004/types/counterparty.{ChannelCounterparty}
@@ -48,6 +49,7 @@ fn check_chan_open_confirm(mint: Value) {
       },
       connection_hops: [mock_data.connection_id],
       version: "mock-version",
+      upgrade_sequence: 0,
     }
 
   let input_channel_datum =
@@ -62,6 +64,7 @@ fn check_chan_open_confirm(mint: Value) {
         packet_commitment: [],
         packet_receipt: [],
         packet_acknowledgement: [],
+        upgrade: initial_upgrade_state,
       },
       port_id: mock_data.port_id,
       token: mock_data.channel_token,
@@ -247,6 +250,7 @@ fn check_chan_open_confirm(mint: Value) {
       counterparty: expected_counterparty,
       connection_hops: counterparty_hops,
       version: output_channel_datum.state.channel.version,
+      upgrade_sequence: 0,
     }
 
   let channel_bz =
@@ -255,17 +259,20 @@ fn check_chan_open_confirm(mint: Value) {
     ).2nd
 
   let verify_proof_redeemer: Redeemer =
-    VerifyMembership {
-      cs: client_datum.state.client_state,
-      cons_state,
-      height: proof_height,
-      processed_time: 0,
-      processed_height: 0,
-      delay_time_period: time_delay,
-      delay_block_period: block_delay,
-      proof: proof_ack,
-      path: merkle_path,
-      value: channel_bz,
+    VerifyProofEnvelope {
+      history_witness: None,
+      proof: VerifyMembership {
+        cs: client_datum.state.client_state,
+        cons_state,
+        height: proof_height,
+        processed_time: 0,
+        processed_height: 0,
+        delay_time_period: time_delay,
+        delay_block_period: block_delay,
+        proof: proof_ack,
+        path: merkle_path,
+        value: channel_bz,
+      },
     }
 
   let chan_open_confirm_redeemer: Redeemer = mock_data.channel_token

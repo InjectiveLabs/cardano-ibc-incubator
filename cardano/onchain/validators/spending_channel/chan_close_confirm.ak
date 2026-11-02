@@ -1,17 +1,15 @@
 use aiken/collection/pairs
 use cardano/assets.{PolicyId}
-use cardano/transaction.{Mint, Redeemer, ScriptPurpose, Transaction}
+use cardano/transaction.{Redeemer, ScriptPurpose, Transaction}
 use ibc/auth.{AuthToken}
-use ibc/client/ics_007_tendermint_client/client_datum.{
-  ClientDatum, ClientDatumState,
-}
-use ibc/client/ics_007_tendermint_client/client_state as client_state_mod
 use ibc/client/ics_007_tendermint_client/cometbft/protos/channel_pb
 use ibc/client/ics_007_tendermint_client/height.{Height} as height_mod
-use ibc/client/ics_007_tendermint_client/types/verify_proof_redeemer.{
-  VerifyMembership, VerifyProofRedeemer,
+use ibc/core/ics_002_client_semantics/client_view.{
+  ClientStateView as ClientDatumState,
 }
+use ibc/core/ics_002_client_semantics/registry
 use ibc/core/ics_002_client_semantics/types/client as client_status_mod
+use ibc/core/ics_002_client_semantics/verify_proof_redeemer.{VerifyMembership}
 use ibc/core/ics_003_connection_semantics/connection_datum.{ConnectionDatum}
 use ibc/core/ics_003_connection_semantics/types/connection_end.{ConnectionEnd}
 use ibc/core/ics_003_connection_semantics/types/counterparty.{Counterparty} as conn_counterparty_mod
@@ -25,12 +23,12 @@ use ibc/core/ics_004/types/counterparty.{ChannelCounterparty}
 use ibc/core/ics_004/types/keys as chan_keys_mod
 use ibc/core/ics_004/types/state as chan_state_mod
 use ibc/core/ics_005/types/ibc_module_redeemer.{Callback, OnChanCloseConfirm}
-use ibc/core/ics_023_vector_commitments/merkle.{MerkleProof}
+use ibc/core/ics_023_vector_commitments/merkle
 use ibc/core/ics_024_host_requirements/channel_keys
 use ibc/utils/validator_utils
 
 validator chan_close_confirm(
-  client_minting_policy_id: PolicyId,
+  client_registry: Data,
   connection_minting_policy_id: PolicyId,
   port_minting_policy_id: PolicyId,
   verify_proof_policy_id: PolicyId,
@@ -61,12 +59,14 @@ validator chan_close_confirm(
     expect updated_datum: ChannelDatum =
       validator_utils.get_inline_datum(updated_output)
 
-    let tx_valid_to = validator_utils.get_tx_valid_to(validity_range)
-
     let channel_sequence = auth.extract_token_sequence(datum.token.name)
     let channel_id = chan_keys_mod.format_channel_identifier(channel_sequence)
 
-    expect ChanCloseConfirm { proof_init, proof_height } = channel_redeemer
+    expect ChanCloseConfirm {
+      proof_init,
+      proof_height,
+      counterparty_upgrade_sequence,
+    } = channel_redeemer
 
     trace @"chan_close_confirm: tx context extracted"
 
@@ -78,13 +78,29 @@ validator chan_close_confirm(
     expect cur_channel.state != chan_state_mod.Closed
     trace @"chan_close_confirm: channel state is not Closed"
 
-    let (connection_datum, client_datum) =
-      validator_utils.validate_referred_connection_and_client(
+    let connection_datum =
+      validator_utils.validate_referred_connection(
         reference_inputs,
         datum.token.name,
-        client_minting_policy_id,
         connection_minting_policy_id,
         connection_id,
+      )
+    let client_registration =
+      registry.for_client(client_registry, connection_datum.state.client_id)
+    let verify_proof_policy_id =
+      validator_utils.registered_proof_policy(
+        client_registration,
+        verify_proof_policy_id,
+      )
+    let client_datum =
+      validator_utils.validate_registered_client(
+        reference_inputs,
+        datum.token.name,
+        client_registration,
+        connection_datum.state.client_id,
+        validator_utils.get_tx_valid_to(validity_range) * 1_000_000,
+        Some(proof_height),
+        validator_utils.verify_proof_envelope(redeemers, verify_proof_policy_id).history_witness,
       )
     trace @"chan_close_confirm: reference_inputs contain Connection utxo"
 
@@ -92,12 +108,7 @@ validator chan_close_confirm(
     trace @"chan_close_confirm: Connection is open"
     trace @"chan_close_confirm: reference_inputs contain Client utxo"
 
-    expect
-      client_state_mod.status(
-        client_datum.state.client_state,
-        tx_valid_to * 1_000_000,
-        client_datum.state.consensus_states,
-      ) == client_status_mod.Active
+    expect client_datum.status == client_status_mod.Active
     trace @"chan_close_confirm: client status is active"
 
     let valid_chan_close =
@@ -108,6 +119,7 @@ validator chan_close_confirm(
         updated_datum,
         proof_init,
         proof_height,
+        counterparty_upgrade_sequence,
         redeemers,
         verify_proof_policy_id,
       )
@@ -127,7 +139,6 @@ validator chan_close_confirm(
 
     and {
       channel_token == datum.token,
-      auth.contain_auth_token(updated_output, datum.token),
       channel_datum_mod.validate_chan_close_confirm(datum, updated_datum),
       valid_chan_close,
     }
@@ -143,8 +154,9 @@ fn validate_chan_close_confirm_proof(
   client_datum_state: ClientDatumState,
   channel_id: ByteArray,
   channel_datum: ChannelDatum,
-  proof: MerkleProof,
+  proof: Data,
   proof_height: Height,
+  counterparty_upgrade_sequence: Int,
   redeemers: Pairs<ScriptPurpose, Redeemer>,
   verify_proof_policy_id: PolicyId,
 ) -> Bool {
@@ -160,11 +172,11 @@ fn validate_chan_close_confirm_proof(
       counterparty: expected_counterparty,
       connection_hops: counterparty_hops,
       version: channel_datum.state.channel.version,
+      upgrade_sequence: counterparty_upgrade_sequence,
     }
 
-  expect Some(verify_proof_redeemer) =
-    pairs.get_first(redeemers, Mint(verify_proof_policy_id))
-  expect verify_proof_redeemer: VerifyProofRedeemer = verify_proof_redeemer
+  let verify_proof_redeemer =
+    validator_utils.verify_proof_envelope(redeemers, verify_proof_policy_id).proof
 
   let time_delay = connection.delay_period
   let block_delay = verify_mod.get_block_delay(connection)
@@ -194,16 +206,19 @@ fn validate_chan_close_confirm_proof(
       channel.convert_to_channel_proto(expected_channel),
     ).2nd
 
-  verify_proof_redeemer == VerifyMembership {
-    cs: client_datum_state.client_state,
-    cons_state: consensus_state,
-    height: proof_height,
-    processed_time,
-    processed_height,
-    delay_time_period: time_delay,
-    delay_block_period: block_delay,
-    proof,
-    path: merkle_path,
-    value: channel_bz,
-  }
+  validator_utils.proof_matches(
+    verify_proof_redeemer,
+    VerifyMembership {
+      cs: client_datum_state.client_state,
+      cons_state: consensus_state,
+      height: proof_height,
+      processed_time,
+      processed_height,
+      delay_time_period: time_delay,
+      delay_block_period: block_delay,
+      proof,
+      path: merkle_path,
+      value: channel_bz,
+    },
+  )
 }

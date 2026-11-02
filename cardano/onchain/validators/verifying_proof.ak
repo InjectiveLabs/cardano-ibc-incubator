@@ -3,16 +3,18 @@ use cardano/assets.{PolicyId}
 use cardano/transaction.{Transaction}
 use ibc/client/ics_007_tendermint_client/client_datum
 use ibc/client/ics_007_tendermint_client/client_state as client_state_mod
+use ibc/client/ics_007_tendermint_client/consensus_history
 use ibc/client/ics_007_tendermint_client/types/verify_proof_redeemer.{
-  BatchVerifyMembership, BatchVerifyMembershipAndNonMembership, VerifyMembership,
-  VerifyMembershipParams, VerifyNonMembership, VerifyNonMembershipParams,
-  VerifyProofRedeemer,
+  BatchVerifyMembership, BatchVerifyMembershipAndNonMembership,
+  VerifyClientUpgrade, VerifyMembership, VerifyMembershipParams,
+  VerifyNonMembership, VerifyNonMembershipParams, VerifyProofEnvelope,
 }
+use ibc/client/ics_007_tendermint_client/upgrade
 use ibc/utils/validator_utils
 
 validator verify_proof {
   mint(
-    redeemer: VerifyProofRedeemer,
+    redeemer: VerifyProofEnvelope,
     policy_id: PolicyId,
     transaction: Transaction,
   ) {
@@ -21,6 +23,8 @@ validator verify_proof {
     let current_time = tx_valid_from * 1_000_000
     let current_height = client_datum.processed_height_from_time(current_time)
 
+    // Require exactly one empty-name token to trigger proof verification; minting under other policies is unrestricted by this check.
+    // Example: minting { this_policy: { "": 1 }, other_policy: { "token": 5 } } passes this check; { this_policy: { "": 2 } } fails.
     expect
       validator_utils.require_exact_marker_mint(
         transaction.mint,
@@ -29,7 +33,21 @@ validator verify_proof {
         1,
       )
 
-    when redeemer is {
+    when redeemer.proof is {
+      VerifyClientUpgrade { input, output, upgrade: upgrade_data } -> and {
+          redeemer.history_witness == None,
+          upgrade.verify(
+            input,
+            output,
+            upgrade_data,
+            validator_utils.get_tx_valid_to(transaction.validity_range) * 1_000_000,
+          ),
+          consensus_history.insert(
+            input.history_root,
+            consensus_history.from_client(input),
+            upgrade_data.history_siblings,
+          ) == output.history_root,
+        }
       VerifyMembership {
         cs,
         cons_state,

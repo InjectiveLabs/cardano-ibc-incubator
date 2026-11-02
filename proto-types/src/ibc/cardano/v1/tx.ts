@@ -22,8 +22,8 @@ export interface BuildHostStateHeartbeatRequest {
  */
 export interface BuildHostStateHeartbeatResponse {
   /**
-   * False when an ordinary IBC transaction or heartbeat has already refreshed
-   * HostState in the current epoch.
+   * False before the epoch midpoint or when HostState was already refreshed
+   * in the current epoch.
    */
   heartbeat_required: boolean;
   current_epoch: bigint;
@@ -33,6 +33,10 @@ export interface BuildHostStateHeartbeatResponse {
    * unsigned Cardano transaction CBOR encoded as UTF-8 hex.
    */
   unsigned_tx?: Any;
+  /**
+   * Suggested delay until the next check. Hermes retries failed attempts sooner.
+   */
+  next_check_delay_ms: bigint;
 }
 /**
  * @name MsgPrunePacketHistory
@@ -86,6 +90,31 @@ export interface SubmitSignedTxRequest {
   description: string;
 }
 /**
+ * TendermintUpdateTxChain carries one dependency-ordered transaction phase.
+ * A phase contains tree-neutral session transactions or one final client and
+ * HostState update.
+ * @name TendermintUpdateTxChain
+ * @package ibc.cardano.v1
+ * @see proto type: ibc.cardano.v1.TendermintUpdateTxChain
+ */
+export interface TendermintUpdateTxChain {
+  /**
+   * Envelope version. The only currently supported value is 1.
+   */
+  version: number;
+  /**
+   * Unsigned Cardano transaction bodies, CBOR-encoded as UTF-8 hex, in
+   * dependency order. The protocol limit is 100 entries.
+   */
+  unsigned_tx_cbor: string[];
+  /**
+   * True when the last tree-neutral transaction is a confirmed phase boundary.
+   * Hermes must rebuild and continue the original MsgUpdateClient after either
+   * verification reaches a Complete session or session cleanup finishes.
+   */
+  rebuild_after_submission: boolean;
+}
+/**
  * SubmitSignedTxResponse contains the result of submitting a signed transaction.
  * @name SubmitSignedTxResponse
  * @package ibc.cardano.v1
@@ -117,6 +146,11 @@ export interface ObserveTxRequest {
    * Blake2b-256 hash of the Cardano transaction body, encoded as 64 hex digits.
    */
   tx_hash: string;
+  /**
+   * Allows observation of a confirmed transaction that intentionally has no
+   * HostState update, such as a first-seen voucher trace-registration prelude.
+   */
+  allow_untracked: boolean;
 }
 /**
  * ObserveTxResponse contains the confirmed inclusion height and IBC events.
@@ -157,6 +191,49 @@ export interface Event {
 export interface EventAttribute {
   key: string;
   value: string;
+}
+/**
+ * @name BuildPacketBatchRequest
+ * @package ibc.cardano.v1
+ * @see proto type: ibc.cardano.v1.BuildPacketBatchRequest
+ */
+export interface BuildPacketBatchRequest {
+  signer: string;
+  port_id: string;
+  channel_id: string;
+  intent_tx_hash: string;
+  /**
+   * Already available successful acknowledgements. Empty selects funded sends.
+   */
+  acknowledgements: Uint8Array[];
+}
+/**
+ * @name BuildPacketBatchResponse
+ * @package ibc.cardano.v1
+ * @see proto type: ibc.cardano.v1.BuildPacketBatchResponse
+ */
+export interface BuildPacketBatchResponse {
+  stage: string;
+  unsigned_tx?: Any;
+  intent_tx_hashes: string[];
+  included_tx_hash: string;
+}
+/**
+ * @name CompactPacketBalancesRequest
+ * @package ibc.cardano.v1
+ * @see proto type: ibc.cardano.v1.CompactPacketBalancesRequest
+ */
+export interface CompactPacketBalancesRequest {
+  signer: string;
+  port_id: string;
+  channel_id: string;
+  left_lane: number;
+  right_lane: number;
+  /**
+   * Optional full denominations to retain on the left. Other keys move right.
+   * When empty, the builder divides the net balances in canonical key order.
+   */
+  left_denoms: string[];
 }
 function createBaseBuildHostStateHeartbeatRequest(): BuildHostStateHeartbeatRequest {
   return {
@@ -220,6 +297,7 @@ function createBaseBuildHostStateHeartbeatResponse(): BuildHostStateHeartbeatRes
     current_epoch: BigInt(0),
     host_state_epoch: BigInt(0),
     unsigned_tx: undefined,
+    next_check_delay_ms: BigInt(0),
   };
 }
 /**
@@ -245,6 +323,9 @@ export const BuildHostStateHeartbeatResponse = {
     if (message.unsigned_tx !== undefined) {
       Any.encode(message.unsigned_tx, writer.uint32(34).fork()).ldelim();
     }
+    if (message.next_check_delay_ms !== BigInt(0)) {
+      writer.uint32(40).uint64(message.next_check_delay_ms);
+    }
     return writer;
   },
   decode(input: BinaryReader | Uint8Array, length?: number): BuildHostStateHeartbeatResponse {
@@ -266,6 +347,9 @@ export const BuildHostStateHeartbeatResponse = {
         case 4:
           message.unsigned_tx = Any.decode(reader, reader.uint32());
           break;
+        case 5:
+          message.next_check_delay_ms = reader.uint64();
+          break;
         default:
           reader.skipType(tag & 7);
           break;
@@ -279,6 +363,8 @@ export const BuildHostStateHeartbeatResponse = {
     if (isSet(object.current_epoch)) obj.current_epoch = BigInt(object.current_epoch.toString());
     if (isSet(object.host_state_epoch)) obj.host_state_epoch = BigInt(object.host_state_epoch.toString());
     if (isSet(object.unsigned_tx)) obj.unsigned_tx = Any.fromJSON(object.unsigned_tx);
+    if (isSet(object.next_check_delay_ms))
+      obj.next_check_delay_ms = BigInt(object.next_check_delay_ms.toString());
     return obj;
   },
   toJSON(message: BuildHostStateHeartbeatResponse): unknown {
@@ -290,6 +376,8 @@ export const BuildHostStateHeartbeatResponse = {
       (obj.host_state_epoch = (message.host_state_epoch || BigInt(0)).toString());
     message.unsigned_tx !== undefined &&
       (obj.unsigned_tx = message.unsigned_tx ? Any.toJSON(message.unsigned_tx) : undefined);
+    message.next_check_delay_ms !== undefined &&
+      (obj.next_check_delay_ms = (message.next_check_delay_ms || BigInt(0)).toString());
     return obj;
   },
   fromPartial<I extends Exact<DeepPartial<BuildHostStateHeartbeatResponse>, I>>(
@@ -305,6 +393,9 @@ export const BuildHostStateHeartbeatResponse = {
     }
     if (object.unsigned_tx !== undefined && object.unsigned_tx !== null) {
       message.unsigned_tx = Any.fromPartial(object.unsigned_tx);
+    }
+    if (object.next_check_delay_ms !== undefined && object.next_check_delay_ms !== null) {
+      message.next_check_delay_ms = BigInt(object.next_check_delay_ms.toString());
     }
     return message;
   },
@@ -537,6 +628,87 @@ export const SubmitSignedTxRequest = {
     return message;
   },
 };
+function createBaseTendermintUpdateTxChain(): TendermintUpdateTxChain {
+  return {
+    version: 0,
+    unsigned_tx_cbor: [],
+    rebuild_after_submission: false,
+  };
+}
+/**
+ * TendermintUpdateTxChain carries one dependency-ordered transaction phase.
+ * A phase contains tree-neutral session transactions or one final client and
+ * HostState update.
+ * @name TendermintUpdateTxChain
+ * @package ibc.cardano.v1
+ * @see proto type: ibc.cardano.v1.TendermintUpdateTxChain
+ */
+export const TendermintUpdateTxChain = {
+  typeUrl: "/ibc.cardano.v1.TendermintUpdateTxChain",
+  encode(message: TendermintUpdateTxChain, writer: BinaryWriter = BinaryWriter.create()): BinaryWriter {
+    if (message.version !== 0) {
+      writer.uint32(8).uint32(message.version);
+    }
+    for (const v of message.unsigned_tx_cbor) {
+      writer.uint32(18).string(v!);
+    }
+    if (message.rebuild_after_submission === true) {
+      writer.uint32(24).bool(message.rebuild_after_submission);
+    }
+    return writer;
+  },
+  decode(input: BinaryReader | Uint8Array, length?: number): TendermintUpdateTxChain {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    let end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseTendermintUpdateTxChain();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1:
+          message.version = reader.uint32();
+          break;
+        case 2:
+          message.unsigned_tx_cbor.push(reader.string());
+          break;
+        case 3:
+          message.rebuild_after_submission = reader.bool();
+          break;
+        default:
+          reader.skipType(tag & 7);
+          break;
+      }
+    }
+    return message;
+  },
+  fromJSON(object: any): TendermintUpdateTxChain {
+    const obj = createBaseTendermintUpdateTxChain();
+    if (isSet(object.version)) obj.version = Number(object.version);
+    if (Array.isArray(object?.unsigned_tx_cbor))
+      obj.unsigned_tx_cbor = object.unsigned_tx_cbor.map((e: any) => String(e));
+    if (isSet(object.rebuild_after_submission))
+      obj.rebuild_after_submission = Boolean(object.rebuild_after_submission);
+    return obj;
+  },
+  toJSON(message: TendermintUpdateTxChain): unknown {
+    const obj: any = {};
+    message.version !== undefined && (obj.version = Math.round(message.version));
+    if (message.unsigned_tx_cbor) {
+      obj.unsigned_tx_cbor = message.unsigned_tx_cbor.map((e) => e);
+    } else {
+      obj.unsigned_tx_cbor = [];
+    }
+    message.rebuild_after_submission !== undefined &&
+      (obj.rebuild_after_submission = message.rebuild_after_submission);
+    return obj;
+  },
+  fromPartial<I extends Exact<DeepPartial<TendermintUpdateTxChain>, I>>(object: I): TendermintUpdateTxChain {
+    const message = createBaseTendermintUpdateTxChain();
+    message.version = object.version ?? 0;
+    message.unsigned_tx_cbor = object.unsigned_tx_cbor?.map((e) => e) || [];
+    message.rebuild_after_submission = object.rebuild_after_submission ?? false;
+    return message;
+  },
+};
 function createBaseSubmitSignedTxResponse(): SubmitSignedTxResponse {
   return {
     tx_hash: "",
@@ -616,6 +788,7 @@ export const SubmitSignedTxResponse = {
 function createBaseObserveTxRequest(): ObserveTxRequest {
   return {
     tx_hash: "",
+    allow_untracked: false,
   };
 }
 /**
@@ -631,6 +804,9 @@ export const ObserveTxRequest = {
     if (message.tx_hash !== "") {
       writer.uint32(10).string(message.tx_hash);
     }
+    if (message.allow_untracked === true) {
+      writer.uint32(16).bool(message.allow_untracked);
+    }
     return writer;
   },
   decode(input: BinaryReader | Uint8Array, length?: number): ObserveTxRequest {
@@ -643,6 +819,9 @@ export const ObserveTxRequest = {
         case 1:
           message.tx_hash = reader.string();
           break;
+        case 2:
+          message.allow_untracked = reader.bool();
+          break;
         default:
           reader.skipType(tag & 7);
           break;
@@ -653,16 +832,19 @@ export const ObserveTxRequest = {
   fromJSON(object: any): ObserveTxRequest {
     const obj = createBaseObserveTxRequest();
     if (isSet(object.tx_hash)) obj.tx_hash = String(object.tx_hash);
+    if (isSet(object.allow_untracked)) obj.allow_untracked = Boolean(object.allow_untracked);
     return obj;
   },
   toJSON(message: ObserveTxRequest): unknown {
     const obj: any = {};
     message.tx_hash !== undefined && (obj.tx_hash = message.tx_hash);
+    message.allow_untracked !== undefined && (obj.allow_untracked = message.allow_untracked);
     return obj;
   },
   fromPartial<I extends Exact<DeepPartial<ObserveTxRequest>, I>>(object: I): ObserveTxRequest {
     const message = createBaseObserveTxRequest();
     message.tx_hash = object.tx_hash ?? "";
+    message.allow_untracked = object.allow_untracked ?? false;
     return message;
   },
 };
@@ -868,6 +1050,302 @@ export const EventAttribute = {
     const message = createBaseEventAttribute();
     message.key = object.key ?? "";
     message.value = object.value ?? "";
+    return message;
+  },
+};
+function createBaseBuildPacketBatchRequest(): BuildPacketBatchRequest {
+  return {
+    signer: "",
+    port_id: "",
+    channel_id: "",
+    intent_tx_hash: "",
+    acknowledgements: [],
+  };
+}
+/**
+ * @name BuildPacketBatchRequest
+ * @package ibc.cardano.v1
+ * @see proto type: ibc.cardano.v1.BuildPacketBatchRequest
+ */
+export const BuildPacketBatchRequest = {
+  typeUrl: "/ibc.cardano.v1.BuildPacketBatchRequest",
+  encode(message: BuildPacketBatchRequest, writer: BinaryWriter = BinaryWriter.create()): BinaryWriter {
+    if (message.signer !== "") {
+      writer.uint32(10).string(message.signer);
+    }
+    if (message.port_id !== "") {
+      writer.uint32(18).string(message.port_id);
+    }
+    if (message.channel_id !== "") {
+      writer.uint32(26).string(message.channel_id);
+    }
+    if (message.intent_tx_hash !== "") {
+      writer.uint32(34).string(message.intent_tx_hash);
+    }
+    for (const v of message.acknowledgements) {
+      writer.uint32(42).bytes(v!);
+    }
+    return writer;
+  },
+  decode(input: BinaryReader | Uint8Array, length?: number): BuildPacketBatchRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    let end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseBuildPacketBatchRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1:
+          message.signer = reader.string();
+          break;
+        case 2:
+          message.port_id = reader.string();
+          break;
+        case 3:
+          message.channel_id = reader.string();
+          break;
+        case 4:
+          message.intent_tx_hash = reader.string();
+          break;
+        case 5:
+          message.acknowledgements.push(reader.bytes());
+          break;
+        default:
+          reader.skipType(tag & 7);
+          break;
+      }
+    }
+    return message;
+  },
+  fromJSON(object: any): BuildPacketBatchRequest {
+    const obj = createBaseBuildPacketBatchRequest();
+    if (isSet(object.signer)) obj.signer = String(object.signer);
+    if (isSet(object.port_id)) obj.port_id = String(object.port_id);
+    if (isSet(object.channel_id)) obj.channel_id = String(object.channel_id);
+    if (isSet(object.intent_tx_hash)) obj.intent_tx_hash = String(object.intent_tx_hash);
+    if (Array.isArray(object?.acknowledgements))
+      obj.acknowledgements = object.acknowledgements.map((e: any) => bytesFromBase64(e));
+    return obj;
+  },
+  toJSON(message: BuildPacketBatchRequest): unknown {
+    const obj: any = {};
+    message.signer !== undefined && (obj.signer = message.signer);
+    message.port_id !== undefined && (obj.port_id = message.port_id);
+    message.channel_id !== undefined && (obj.channel_id = message.channel_id);
+    message.intent_tx_hash !== undefined && (obj.intent_tx_hash = message.intent_tx_hash);
+    if (message.acknowledgements) {
+      obj.acknowledgements = message.acknowledgements.map((e) =>
+        base64FromBytes(e !== undefined ? e : new Uint8Array()),
+      );
+    } else {
+      obj.acknowledgements = [];
+    }
+    return obj;
+  },
+  fromPartial<I extends Exact<DeepPartial<BuildPacketBatchRequest>, I>>(object: I): BuildPacketBatchRequest {
+    const message = createBaseBuildPacketBatchRequest();
+    message.signer = object.signer ?? "";
+    message.port_id = object.port_id ?? "";
+    message.channel_id = object.channel_id ?? "";
+    message.intent_tx_hash = object.intent_tx_hash ?? "";
+    message.acknowledgements = object.acknowledgements?.map((e) => e) || [];
+    return message;
+  },
+};
+function createBaseBuildPacketBatchResponse(): BuildPacketBatchResponse {
+  return {
+    stage: "",
+    unsigned_tx: undefined,
+    intent_tx_hashes: [],
+    included_tx_hash: "",
+  };
+}
+/**
+ * @name BuildPacketBatchResponse
+ * @package ibc.cardano.v1
+ * @see proto type: ibc.cardano.v1.BuildPacketBatchResponse
+ */
+export const BuildPacketBatchResponse = {
+  typeUrl: "/ibc.cardano.v1.BuildPacketBatchResponse",
+  encode(message: BuildPacketBatchResponse, writer: BinaryWriter = BinaryWriter.create()): BinaryWriter {
+    if (message.stage !== "") {
+      writer.uint32(10).string(message.stage);
+    }
+    if (message.unsigned_tx !== undefined) {
+      Any.encode(message.unsigned_tx, writer.uint32(18).fork()).ldelim();
+    }
+    for (const v of message.intent_tx_hashes) {
+      writer.uint32(26).string(v!);
+    }
+    if (message.included_tx_hash !== "") {
+      writer.uint32(34).string(message.included_tx_hash);
+    }
+    return writer;
+  },
+  decode(input: BinaryReader | Uint8Array, length?: number): BuildPacketBatchResponse {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    let end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseBuildPacketBatchResponse();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1:
+          message.stage = reader.string();
+          break;
+        case 2:
+          message.unsigned_tx = Any.decode(reader, reader.uint32());
+          break;
+        case 3:
+          message.intent_tx_hashes.push(reader.string());
+          break;
+        case 4:
+          message.included_tx_hash = reader.string();
+          break;
+        default:
+          reader.skipType(tag & 7);
+          break;
+      }
+    }
+    return message;
+  },
+  fromJSON(object: any): BuildPacketBatchResponse {
+    const obj = createBaseBuildPacketBatchResponse();
+    if (isSet(object.stage)) obj.stage = String(object.stage);
+    if (isSet(object.unsigned_tx)) obj.unsigned_tx = Any.fromJSON(object.unsigned_tx);
+    if (Array.isArray(object?.intent_tx_hashes))
+      obj.intent_tx_hashes = object.intent_tx_hashes.map((e: any) => String(e));
+    if (isSet(object.included_tx_hash)) obj.included_tx_hash = String(object.included_tx_hash);
+    return obj;
+  },
+  toJSON(message: BuildPacketBatchResponse): unknown {
+    const obj: any = {};
+    message.stage !== undefined && (obj.stage = message.stage);
+    message.unsigned_tx !== undefined &&
+      (obj.unsigned_tx = message.unsigned_tx ? Any.toJSON(message.unsigned_tx) : undefined);
+    if (message.intent_tx_hashes) {
+      obj.intent_tx_hashes = message.intent_tx_hashes.map((e) => e);
+    } else {
+      obj.intent_tx_hashes = [];
+    }
+    message.included_tx_hash !== undefined && (obj.included_tx_hash = message.included_tx_hash);
+    return obj;
+  },
+  fromPartial<I extends Exact<DeepPartial<BuildPacketBatchResponse>, I>>(
+    object: I,
+  ): BuildPacketBatchResponse {
+    const message = createBaseBuildPacketBatchResponse();
+    message.stage = object.stage ?? "";
+    if (object.unsigned_tx !== undefined && object.unsigned_tx !== null) {
+      message.unsigned_tx = Any.fromPartial(object.unsigned_tx);
+    }
+    message.intent_tx_hashes = object.intent_tx_hashes?.map((e) => e) || [];
+    message.included_tx_hash = object.included_tx_hash ?? "";
+    return message;
+  },
+};
+function createBaseCompactPacketBalancesRequest(): CompactPacketBalancesRequest {
+  return {
+    signer: "",
+    port_id: "",
+    channel_id: "",
+    left_lane: 0,
+    right_lane: 0,
+    left_denoms: [],
+  };
+}
+/**
+ * @name CompactPacketBalancesRequest
+ * @package ibc.cardano.v1
+ * @see proto type: ibc.cardano.v1.CompactPacketBalancesRequest
+ */
+export const CompactPacketBalancesRequest = {
+  typeUrl: "/ibc.cardano.v1.CompactPacketBalancesRequest",
+  encode(message: CompactPacketBalancesRequest, writer: BinaryWriter = BinaryWriter.create()): BinaryWriter {
+    if (message.signer !== "") {
+      writer.uint32(10).string(message.signer);
+    }
+    if (message.port_id !== "") {
+      writer.uint32(18).string(message.port_id);
+    }
+    if (message.channel_id !== "") {
+      writer.uint32(26).string(message.channel_id);
+    }
+    if (message.left_lane !== 0) {
+      writer.uint32(32).uint32(message.left_lane);
+    }
+    if (message.right_lane !== 0) {
+      writer.uint32(40).uint32(message.right_lane);
+    }
+    for (const v of message.left_denoms) {
+      writer.uint32(50).string(v!);
+    }
+    return writer;
+  },
+  decode(input: BinaryReader | Uint8Array, length?: number): CompactPacketBalancesRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    let end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseCompactPacketBalancesRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1:
+          message.signer = reader.string();
+          break;
+        case 2:
+          message.port_id = reader.string();
+          break;
+        case 3:
+          message.channel_id = reader.string();
+          break;
+        case 4:
+          message.left_lane = reader.uint32();
+          break;
+        case 5:
+          message.right_lane = reader.uint32();
+          break;
+        case 6:
+          message.left_denoms.push(reader.string());
+          break;
+        default:
+          reader.skipType(tag & 7);
+          break;
+      }
+    }
+    return message;
+  },
+  fromJSON(object: any): CompactPacketBalancesRequest {
+    const obj = createBaseCompactPacketBalancesRequest();
+    if (isSet(object.signer)) obj.signer = String(object.signer);
+    if (isSet(object.port_id)) obj.port_id = String(object.port_id);
+    if (isSet(object.channel_id)) obj.channel_id = String(object.channel_id);
+    if (isSet(object.left_lane)) obj.left_lane = Number(object.left_lane);
+    if (isSet(object.right_lane)) obj.right_lane = Number(object.right_lane);
+    if (Array.isArray(object?.left_denoms)) obj.left_denoms = object.left_denoms.map((e: any) => String(e));
+    return obj;
+  },
+  toJSON(message: CompactPacketBalancesRequest): unknown {
+    const obj: any = {};
+    message.signer !== undefined && (obj.signer = message.signer);
+    message.port_id !== undefined && (obj.port_id = message.port_id);
+    message.channel_id !== undefined && (obj.channel_id = message.channel_id);
+    message.left_lane !== undefined && (obj.left_lane = Math.round(message.left_lane));
+    message.right_lane !== undefined && (obj.right_lane = Math.round(message.right_lane));
+    if (message.left_denoms) {
+      obj.left_denoms = message.left_denoms.map((e) => e);
+    } else {
+      obj.left_denoms = [];
+    }
+    return obj;
+  },
+  fromPartial<I extends Exact<DeepPartial<CompactPacketBalancesRequest>, I>>(
+    object: I,
+  ): CompactPacketBalancesRequest {
+    const message = createBaseCompactPacketBalancesRequest();
+    message.signer = object.signer ?? "";
+    message.port_id = object.port_id ?? "";
+    message.channel_id = object.channel_id ?? "";
+    message.left_lane = object.left_lane ?? 0;
+    message.right_lane = object.right_lane ?? 0;
+    message.left_denoms = object.left_denoms?.map((e) => e) || [];
     return message;
   },
 };

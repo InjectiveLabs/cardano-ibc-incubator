@@ -3,15 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { Cbor, LazyCborArray } from '@harmoniclabs/cbor';
 import { blake2b } from '@noble/hashes/blake2b';
 import * as CML from '@dcspark/cardano-multiplatform-lib-nodejs';
-import {
-  BlockFetchClient,
-  BlockFetchNoBlocks,
-  ChainPoint,
-  HandshakeClient,
-  Multiplexer,
-} from '@harmoniclabs/ouroboros-miniprotocols-ts';
-import type { SocketLike } from '@harmoniclabs/ouroboros-miniprotocols-ts/dist/multiplexer/SocketLike';
-import { createConnection } from 'net';
+import { YaciRestClient } from '../../helpers/yaci-rest';
 import {
   HISTORY_SERVICE,
   HistoryBlock,
@@ -23,9 +15,6 @@ import { REDEEMER_TYPE } from '../../../constant';
 
 @Injectable()
 export class MiniProtocalsService {
-  private static readonly BLOCK_FETCH_MAX_ATTEMPTS = 3;
-  private static readonly BLOCK_FETCH_RETRY_DELAY_MS = 250;
-
   constructor(
     @Inject(HISTORY_SERVICE) private readonly historyService: HistoryService,
     private readonly configService: ConfigService,
@@ -76,235 +65,11 @@ export class MiniProtocalsService {
   }
 
   async fetchBlocksCbor(blocks: Array<Pick<HistoryBlock, 'hash' | 'slotNo'>>): Promise<Buffer[]> {
-    if (blocks.length === 0) {
-      return [];
-    }
-
-    let lastError: Error | null = null;
-    for (
-      let attempt = 1;
-      attempt <= MiniProtocalsService.BLOCK_FETCH_MAX_ATTEMPTS;
-      attempt += 1
-    ) {
-      try {
-        return await this.fetchBlocksCborOnce(blocks);
-      } catch (error) {
-        const normalizedError = this.normalizeFetchError(error);
-        lastError = normalizedError;
-
-        if (
-          attempt >= MiniProtocalsService.BLOCK_FETCH_MAX_ATTEMPTS ||
-          !this.isRetryableFetchError(normalizedError)
-        ) {
-          throw normalizedError;
-        }
-
-        this.logger.warn(
-          `Cardano block witness fetch attempt ${attempt}/${MiniProtocalsService.BLOCK_FETCH_MAX_ATTEMPTS} failed (${normalizedError.message}); retrying`,
-        );
-        await this.sleep(MiniProtocalsService.BLOCK_FETCH_RETRY_DELAY_MS * attempt);
-      }
-    }
-
-    throw lastError ?? new Error('Cardano block witness fetch failed');
-  }
-
-  private async fetchBlocksCborOnce(blocks: Array<Pick<HistoryBlock, 'hash' | 'slotNo'>>): Promise<Buffer[]> {
-    const yaciBlocks = await this.tryFetchBlocksCborFromYaci(blocks);
-    if (yaciBlocks) {
-      return yaciBlocks;
-    }
-
-    const host = this.configService.get<string>('cardanoChainHost');
-    const port = this.configService.get<number>('cardanoChainPort');
-    const networkMagic = this.configService.get<number>('cardanoChainNetworkMagic');
-
-    if (!host || !port || !networkMagic) {
-      throw new Error('Cardano chain host, port, and network magic must be configured for block witness fetch');
-    }
-
-    const multiplexer = new Multiplexer({
-      protocolType: 'node-to-node',
-      connect: () => {
-        const socket = createConnection({ host, port });
-        // Prevent raw socket errors from surfacing as unhandled process-level events.
-        socket.on('error', () => undefined);
-        // The library's NodeSocketLike declaration predates Node's `address(): string`
-        // overload, but a TCP Socket satisfies the runtime contract used by Multiplexer.
-        return socket as unknown as SocketLike;
-      },
-    });
-    const handshake = new HandshakeClient(multiplexer);
-    const blockFetchClient = new BlockFetchClient(multiplexer);
-
-    try {
-      await this.runWithMultiplexerError(multiplexer, () => handshake.propose(networkMagic));
-
-      const from = this.toChainPoint(blocks[0]);
-      const to = this.toChainPoint(blocks[blocks.length - 1]);
-      const response =
-        blocks.length === 1
-          ? await this.runWithMultiplexerError(multiplexer, () => blockFetchClient.request(from))
-          : await this.runWithMultiplexerError(multiplexer, () => blockFetchClient.requestRange(from, to));
-
-      if (response instanceof BlockFetchNoBlocks) {
-        throw new Error(
-          `Cardano node returned no block witness data for requested range ${blocks[0].hash}..${blocks[blocks.length - 1].hash}`,
-        );
-      }
-
-      const fetchedBlocks = Array.isArray(response) ? response : [response];
-      if (fetchedBlocks.length !== blocks.length) {
-        throw new Error(
-          `Cardano node returned ${fetchedBlocks.length} block witnesses for ${blocks.length} requested blocks`,
-        );
-      }
-
-      return fetchedBlocks.map((fetchedBlock) => Buffer.from(fetchedBlock.getBlockBytes()));
-    } catch (error) {
-      const normalizedError = this.normalizeFetchError(error);
-      this.logger.error(`Failed to fetch Cardano block witness data: ${normalizedError.message}`);
-      throw normalizedError;
-    } finally {
-      handshake.terminate();
-      multiplexer.close();
-    }
-  }
-
-  private toChainPoint(block: Pick<HistoryBlock, 'hash' | 'slotNo'>): ChainPoint {
-    return new ChainPoint({
-      blockHeader: {
-        hash: Buffer.from(block.hash, 'hex'),
-        slotNumber: block.slotNo,
-      },
-    });
-  }
-
-  private async runWithMultiplexerError<T>(
-    multiplexer: Multiplexer,
-    operation: () => Promise<T>,
-  ): Promise<T> {
-    return await new Promise<T>((resolve, reject) => {
-      let settled = false;
-
-      const cleanup = () => {
-        multiplexer.off('error', onError);
-      };
-
-      const settleResolve = (value: T) => {
-        if (settled) {
-          return;
-        }
-        settled = true;
-        cleanup();
-        resolve(value);
-      };
-
-      const settleReject = (error: unknown) => {
-        if (settled) {
-          return;
-        }
-        settled = true;
-        cleanup();
-        reject(this.normalizeFetchError(error));
-      };
-
-      const onError = (error: unknown) => {
-        settleReject(error);
-      };
-
-      multiplexer.on('error', onError);
-      operation().then(settleResolve, settleReject);
-    });
-  }
-
-  private normalizeFetchError(error: unknown): Error {
-    if (error instanceof Error) {
-      return error;
-    }
-    if (typeof error === 'string') {
-      return new Error(error);
-    }
-    return new Error(`Unknown Cardano block witness fetch failure: ${String(error)}`);
-  }
-
-  private isRetryableFetchError(error: Error): boolean {
-    const message = `${error.message} ${String((error as { data?: unknown }).data ?? '')}`.toLowerCase();
-    return (
-      message.includes('econnreset') ||
-      message.includes('socket error') ||
-      message.includes('connection reset') ||
-      message.includes('transport error') ||
-      message.includes('broken pipe')
-    );
-  }
-
-  private async sleep(ms: number): Promise<void> {
-    await new Promise((resolve) => setTimeout(resolve, ms));
-  }
-
-  private async tryFetchBlocksCborFromYaci(
-    blocks: Array<Pick<HistoryBlock, 'hash' | 'slotNo'>>,
-  ): Promise<Buffer[] | null> {
-    const yaciStoreEndpoint = this.configService.get<string>('yaciStoreEndpoint');
-    if (!yaciStoreEndpoint) {
-      return null;
-    }
-
-    const normalizedEndpoint = yaciStoreEndpoint.replace(/\/+$/, '');
+    if (blocks.length === 0) return [];
+    const rest = new YaciRestClient(this.configService.get<string>('yaciStoreEndpoint'));
     const results: Buffer[] = [];
-
-    try {
-      for (const block of blocks) {
-        const response = await fetch(
-          `${normalizedEndpoint}/api/v1/blocks/${block.hash}/cbor`,
-          {
-            headers: {
-              accept: 'application/octet-stream',
-            },
-          },
-        );
-
-        if (response.status === 404) {
-          return null;
-        }
-
-        if (!response.ok) {
-          throw new Error(
-            `Yaci block CBOR fetch failed for ${block.hash} with HTTP ${response.status}`,
-          );
-        }
-
-        const bytes = this.normalizeYaciBlockCbor(Buffer.from(await response.arrayBuffer()));
-        if (bytes.length === 0) {
-          return null;
-        }
-
-        results.push(bytes);
-      }
-
-      return results;
-    } catch (error) {
-      const normalizedError = this.normalizeFetchError(error);
-      this.logger.warn(
-        `Failed to fetch Cardano block witness data from Yaci Store (${normalizedError.message}); falling back to node-to-node block fetch`,
-      );
-      return null;
-    }
-  }
-
-  private normalizeYaciBlockCbor(bytes: Buffer): Buffer {
-    if (bytes.length < 3) {
-      return bytes;
-    }
-
-    // Yaci's /blocks/{hash}/cbor endpoint can return a two-element CBOR envelope:
-    // [blockType, rawBlockCbor]. Downstream verifiers expect the raw block bytes only.
-    if (bytes[0] === 0x82 && bytes[1] <= 0x17) {
-      return bytes.subarray(2);
-    }
-
-    return bytes;
+    for (const block of blocks) results.push(await rest.blockCbor(block.hash));
+    return results;
   }
 
   private async hydrateTransactionEvidenceFromBlockWitness(

@@ -1,6 +1,9 @@
+use ibc/client/ics_007_tendermint_client/client_datum.{ClientDatum}
 use ibc/client/ics_007_tendermint_client/client_state.{ClientState}
+use ibc/client/ics_007_tendermint_client/consensus_history.{Witness}
 use ibc/client/ics_007_tendermint_client/consensus_state.{ConsensusState}
 use ibc/client/ics_007_tendermint_client/height.{Height}
+use ibc/client/ics_007_tendermint_client/upgrade.{Upgrade}
 use ibc/core/ics_023_vector_commitments/merkle.{MerklePath, MerkleProof}
 
 pub type VerifyMembershipParams {
@@ -62,4 +65,16 @@ pub type VerifyProofRedeemer {
     memberships: List<VerifyMembershipParams>,
     non_memberships: List<VerifyNonMembershipParams>,
   }
+  VerifyClientUpgrade {
+    input: ClientDatum,
+    output: ClientDatum,
+    upgrade: Upgrade,
+  }
+}
+
+/// History is authenticated by the operation's client NFT reference. The proof
+/// marker verifies the unchanged ICS-23 payload selected by that operation.
+pub type VerifyProofEnvelope {
+  proof: VerifyProofRedeemer,
+  history_witness: Option<Witness>,
 }

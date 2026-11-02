@@ -1,15 +1,21 @@
+import { clientRegistryData } from "../client-registry.ts";
 import {
   applyDoubleCborEncoding,
   Constr,
+  credentialToAddress,
   Data,
   fromHex,
   fromText,
   Lucid,
+  PROTOCOL_PARAMETERS_DEFAULT,
   type Script,
+  SLOT_CONFIG_NETWORK,
   toHex,
   type UTxO,
+  validatorToRewardAddress,
 } from "@lucid-evolution/lucid";
 import { Emulator, generateEmulatorAccount } from "@lucid-evolution/provider";
+import { createCardanoScalusEvaluator } from "../scalus-evaluator.ts";
 import {
   buildChannelValidators,
   DeploymentIbcTree,
@@ -21,6 +27,26 @@ import {
   readValidator,
 } from "../utils.ts";
 import { HostStateDatum, HostStateRedeemer } from "../../types/index.ts";
+
+// Keep emulator transaction limits aligned with the sole local provisioner.
+const devkitParameters = new Map(
+  Deno.readTextFileSync(
+    new URL(
+      "../../../../chains/cardano/devkit/node.properties",
+      import.meta.url,
+    ),
+  ).split(/\r?\n/).filter((line) => line.includes("=")).map((line) => {
+    const [key, value] = line.split("=");
+    return [key, Number(value)] as const;
+  }),
+);
+function localLimit(name: string): number {
+  const value = devkitParameters.get(name);
+  if (value === undefined || !Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`Invalid DevKit transaction limit: ${name}`);
+  }
+  return value;
+}
 
 // These are complete, balanced transactions evaluated by Lucid's phase-two
 // evaluator. Every script witness comes from the production Aiken blueprint;
@@ -41,6 +67,10 @@ export interface ChannelParameters {
   remotePort: string;
   version: string;
   ordered: boolean;
+  clientType: string;
+  useLongClientType: boolean;
+  reverseClientRegistry: boolean;
+  reverseClientReferences: boolean;
 }
 
 export const defaultChannelParameters: ChannelParameters = {
@@ -53,13 +83,27 @@ export const defaultChannelParameters: ChannelParameters = {
   remotePort: "remote",
   version: "mock-version",
   ordered: true,
+  clientType: "07-tendermint",
+  useLongClientType: false,
+  reverseClientRegistry: false,
+  reverseClientReferences: false,
 };
 
 export type ChannelMutation =
   | "none"
   | "missing_marker"
   | "extra_marker"
-  | "wrong_marker_name";
+  | "wrong_marker_name"
+  | "host_ada_sweep"
+  | "channel_ada_sweep"
+  | "host_asset_sweep"
+  | "channel_asset_sweep"
+  | "wrong_client_script"
+  | "wrong_client_policy"
+  | "wrong_client_datum_token"
+  | "wrong_client_sequence"
+  | "proof_from_other_client"
+  | "missing_client_verifier";
 
 export const channelActions = [
   {
@@ -167,7 +211,7 @@ const proofSpecs = [
   record(leaf("00"), record([0n, 1n], 32n, 1n, 1n, "", 1n), 0n, 0n, variant(0)),
 ];
 
-async function membershipProof(key: string, value: string) {
+export async function membershipProof(key: string, value: string) {
   const makeLeaf = async (prefix: string, key: string, value: string) =>
     await sha256(
       prefix + varint(key.length / 2) + key + "20" + await sha256(value),
@@ -189,6 +233,7 @@ export async function channelFixture(
   action: ChannelAction,
   parameters: ChannelParameters = defaultChannelParameters,
   mutation: ChannelMutation = "none",
+  clock?: { time: number; slot: number },
 ) {
   const PORT = parameters.port;
   const CHANNEL = `channel-${parameters.channelSequence}`;
@@ -201,11 +246,39 @@ export async function channelFixture(
   const REMOTE_KEY = "channelEnds/ports/" + REMOTE_PORT + "/channels/" +
     REMOTE_CHANNEL;
   const account = generateEmulatorAccount({ lovelace: 1_000_000_000n });
-  const emulator = new Emulator([account]);
-  const lucid = await Lucid(emulator, "Custom");
+  const emulator = new Emulator([account], {
+    ...PROTOCOL_PARAMETERS_DEFAULT,
+    maxTxSize: localLimit("maxTxSize"),
+    maxTxExMem: BigInt(localLimit("maxTxExUnitsMem")),
+    maxTxExSteps: BigInt(localLimit("maxTxExUnitsSteps")),
+  });
+  const lucid = await Lucid(emulator, "Custom", {
+    evaluator: createCardanoScalusEvaluator(),
+  });
+  if (clock) {
+    emulator.time = clock.time;
+    emulator.slot = clock.slot;
+  }
+  if (clock) {
+    SLOT_CONFIG_NETWORK.Custom = {
+      zeroTime: clock.time - clock.slot * 1_000,
+      zeroSlot: 0,
+      slotLength: 1_000,
+    };
+  }
   lucid.selectWallet.fromSeed(account.seedPhrase);
   const now = emulator.now();
   const clientPolicy = hash("11");
+  const otherClientPolicy = hash("aa");
+  const clientScript = hash("55");
+  const otherClientScript = hash("bb");
+  const longClientType = parameters.clientType + "-0";
+  const clientType = parameters.useLongClientType
+    ? longClientType
+    : parameters.clientType;
+  const otherClientType = parameters.useLongClientType
+    ? parameters.clientType
+    : longClientType;
   const connectionPolicy = hash("22");
   const portPolicy = hash("33");
   const hostPolicy = hash("44");
@@ -214,24 +287,52 @@ export async function channelFixture(
     "verifying_proof.verify_proof.mint",
     lucid,
   );
+  // These are two independent instances of the shipped Tendermint adapter.
+  // They share a sequence and proof implementation but have different state
+  // policies and spending scripts. A different client algorithm is not mocked.
+  const registrations = [{
+    clientType,
+    implementation: "tendermint" as const,
+    mintPolicy: clientPolicy,
+    spendValidator: clientScript,
+    proofPolicy: verifyPolicy,
+  }, {
+    clientType: otherClientType,
+    implementation: "tendermint" as const,
+    mintPolicy: otherClientPolicy,
+    spendValidator: otherClientScript,
+    proofPolicy: verifyPolicy,
+  }];
+  const clients = clientRegistryData(
+    parameters.reverseClientRegistry ? registrations.reverse() : registrations,
+  );
+  // Explicit registrations must select their own verifier. A different legacy
+  // fallback catches accidental reads before resolving the connection's client.
+  const legacyProofPolicy = hash("66");
   const channelScripts = buildChannelValidators(
     lucid,
-    clientPolicy,
+    clients,
     connectionPolicy,
     portPolicy,
-    verifyPolicy,
+    legacyProofPolicy,
     hostPolicy,
+  );
+  const [shutdownScript, shutdownScriptHash] = readValidator(
+    "recover_client.recover_client.withdraw",
+    lucid,
+    [hostPolicy, legacyProofPolicy],
   );
   const [channelMint, channelPolicy] = readValidator(
     "minting_channel_stt.mint_channel_stt.mint",
     lucid,
     [
-      clientPolicy,
+      clients,
       connectionPolicy,
       portPolicy,
-      verifyPolicy,
+      legacyProofPolicy,
       channelScripts.base.hash,
       hostPolicy,
+      shutdownScriptHash,
     ],
   );
   const [moduleScript, moduleHash, moduleAddress] = readValidator(
@@ -242,7 +343,16 @@ export async function channelFixture(
   const [hostScript, , hostAddress] = readValidator(
     "host_state_stt.host_state_stt.spend",
     lucid,
-    [hostPolicy, hash("55"), hash("66"), channelScripts.base.hash],
+    [
+      hostPolicy,
+      clients,
+      hash("66"),
+      channelScripts.base.hash,
+      clientPolicy,
+      connectionPolicy,
+      channelPolicy,
+      "",
+    ],
   );
   const channelToken = record(
     channelPolicy,
@@ -260,6 +370,8 @@ export async function channelFixture(
       BigInt(parameters.clientSequence),
     ),
   );
+  const otherClientToken = record(otherClientPolicy, clientToken.fields[1]);
+  const unregisteredClientToken = record(hash("cc"), clientToken.fields[1]);
   const connectionToken = record(
     connectionPolicy,
     await generateTokenName(
@@ -315,6 +427,11 @@ export async function channelFixture(
     ZERO_HEIGHT,
     HEIGHT,
     proofSpecs,
+    [],
+  );
+  const otherClientState = record(
+    fromText("otherchain-1"),
+    ...clientState.fields.slice(1),
   );
   const consensus = record(
     BigInt(now) * 1_000_000n,
@@ -328,11 +445,21 @@ export async function channelFixture(
       new Map([[HEIGHT, 0n]]),
       new Map([[HEIGHT, 0n]]),
     ),
-    clientToken,
+    mutation === "wrong_client_datum_token"
+      ? otherClientToken
+      : mutation === "wrong_client_policy"
+      ? unregisteredClientToken
+      : clientToken,
+    "00".repeat(32),
   );
   const connectionDatum = record(
     record(
-      fromText(`07-tendermint-${parameters.clientSequence}`),
+      fromText(
+        `${clientType}-${
+          parameters.clientSequence +
+          (mutation === "wrong_client_sequence" ? 1 : 0)
+        }`,
+      ),
       [record(fromText("1"), [
         fromText("ORDER_ORDERED"),
         fromText("ORDER_UNORDERED"),
@@ -347,10 +474,52 @@ export async function channelFixture(
     ),
     connectionToken,
   );
-  const client = seed(account.address, {
-    lovelace: 5_000_000n,
-    [tokenUnit(clientToken)]: 1n,
-  }, encode(clientDatum));
+  const otherClientDatum = record(
+    record(
+      otherClientState,
+      new Map([[HEIGHT, consensus]]),
+      new Map([[HEIGHT, 0n]]),
+      new Map([[HEIGHT, 0n]]),
+    ),
+    otherClientToken,
+    "00".repeat(32),
+  );
+  const seedClient = () =>
+    seed(
+      credentialToAddress("Custom", {
+        type: "Script",
+        hash: mutation === "wrong_client_script"
+          ? otherClientScript
+          : clientScript,
+      }),
+      {
+        lovelace: 5_000_000n,
+        [
+          tokenUnit(
+            mutation === "wrong_client_policy"
+              ? unregisteredClientToken
+              : clientToken,
+          )
+        ]: 1n,
+      },
+      encode(clientDatum),
+    );
+  const seedOtherClient = () =>
+    seed(
+      credentialToAddress("Custom", {
+        type: "Script",
+        hash: otherClientScript,
+      }),
+      { lovelace: 5_000_000n, [tokenUnit(otherClientToken)]: 1n },
+      encode(otherClientDatum),
+    );
+  // Change the output indices too. Lucid sorts reference inputs before execution.
+  const [client, otherClient] = parameters.reverseClientReferences
+    ? (() => {
+      const other = seedOtherClient();
+      return [seedClient(), other];
+    })()
+    : [seedClient(), seedOtherClient()];
   const connection = seed(account.address, {
     lovelace: 5_000_000n,
     [tokenUnit(connectionToken)]: 1n,
@@ -366,6 +535,7 @@ export async function channelFixture(
       ),
       [fromText(CONNECTION)],
       fromText(VERSION),
+      0n,
     );
   const channelDatum = (state: number) =>
     record(
@@ -379,6 +549,8 @@ export async function channelFixture(
         new Map(),
         ZERO_HEIGHT,
         ZERO_HEIGHT,
+        // No upgrade has started.
+        record(variant(1), variant(1), 0n),
       ),
       fromText(PORT),
       channelToken,
@@ -424,6 +596,10 @@ export async function channelFixture(
         module_token: moduleToken,
       }]]),
       shutdown: "Active",
+      live_clients: 1n,
+      live_connections: 1n,
+      live_channels: isCreate ? 0n : 1n,
+      last_heartbeat_time: 0n,
     },
   };
   const newHostDatum: HostStateDatum = {
@@ -434,11 +610,20 @@ export async function channelFixture(
       ibc_state_root: await tree.getRoot(),
       next_channel_sequence: BigInt(parameters.channelSequence) + 1n,
     },
+    control: {
+      ...hostDatum.control,
+      live_channels: hostDatum.control.live_channels + (isCreate ? 1n : 0n),
+    },
   };
+  const unrelatedAsset = hash("fe") + fromText("reserve");
   const host = seed(hostAddress, {
     lovelace: 10_000_000n,
     [hostPolicy + hostToken.name]: 1n,
+    ...(mutation === "host_asset_sweep" ? { [unrelatedAsset]: 7n } : {}),
   }, Data.to(hostDatum, HostStateDatum));
+  const hostOutputAssets = { ...host.assets };
+  if (mutation === "host_ada_sweep") hostOutputAssets.lovelace = 5_000_000n;
+  if (mutation === "host_asset_sweep") delete hostOutputAssets[unrelatedAsset];
   const module = seed(moduleAddress, {
     lovelace: 10_000_000n,
     [portPolicy + portToken.name]: 1n,
@@ -459,6 +644,7 @@ export async function channelFixture(
     .readFrom([
       connection,
       client,
+      otherClient,
       reference(hostScript),
       reference(moduleScript),
     ])
@@ -470,7 +656,7 @@ export async function channelFixture(
     .pay.ToContract(hostAddress, {
       kind: "inline",
       value: Data.to(newHostDatum, HostStateDatum),
-    }, host.assets)
+    }, hostOutputAssets)
     .pay.ToContract(
       moduleAddress,
       { kind: "inline", value: module.datum! },
@@ -479,7 +665,10 @@ export async function channelFixture(
     .pay.ToContract(channelScripts.base.address, {
       kind: "inline",
       value: encode(channelDatum(action.after)),
-    }, { lovelace: 10_000_000n, [tokenUnit(channelToken)]: 1n })
+    }, {
+      lovelace: mutation === "channel_ada_sweep" ? 5_000_000n : 10_000_000n,
+      [tokenUnit(channelToken)]: 1n,
+    })
     .validFrom(now).validTo(now + 60_000);
 
   if (isCreate) {
@@ -493,6 +682,7 @@ export async function channelFixture(
     const channel = seed(channelScripts.base.address, {
       lovelace: 10_000_000n,
       [tokenUnit(channelToken)]: 1n,
+      ...(mutation === "channel_asset_sweep" ? { [unrelatedAsset]: 7n } : {}),
     }, encode(channelDatum(action.before)));
     const redeemer = action.name === "ChanOpenAck"
       ? variant(0, fromText(VERSION), membership.proof, HEIGHT)
@@ -500,7 +690,8 @@ export async function channelFixture(
       ? variant(1, membership.proof, HEIGHT)
       : action.name === "ChanCloseInit"
       ? variant(6)
-      : variant(7, membership.proof, HEIGHT);
+      // The closed counterparty never upgraded.
+      : variant(7, membership.proof, HEIGHT, 0n);
     const operation = channelScripts.referredScripts[action.policy];
     tx = tx.readFrom([
       reference(channelScripts.base.script),
@@ -517,10 +708,10 @@ export async function channelFixture(
       );
     }
   }
-  if (action.proofState !== 0) {
+  if (action.proofState !== 0 && mutation !== "missing_client_verifier") {
     const verifyRedeemer = variant(
       0,
-      clientState,
+      mutation === "proof_from_other_client" ? otherClientState : clientState,
       consensus,
       HEIGHT,
       0n,
@@ -533,7 +724,7 @@ export async function channelFixture(
     );
     tx = tx.readFrom([reference(verifyScript)]).mintAssets({
       [verifyPolicy]: 1n,
-    }, encode(verifyRedeemer));
+    }, encode(record(verifyRedeemer, variant(1))));
   }
   return {
     tx,
@@ -542,8 +733,40 @@ export async function channelFixture(
     channelToken,
     expectedChannelDatum: channelDatum(action.after),
     channelScripts,
+    channelMint: {
+      script: channelMint.script,
+      scriptHash: channelPolicy,
+      refUtxo: reference(channelMint),
+    },
+    shutdownScript: {
+      script: shutdownScript.script,
+      scriptHash: shutdownScriptHash,
+      address: validatorToRewardAddress("Custom", shutdownScript),
+      refUtxo: reference(shutdownScript),
+    },
     seed,
     reference,
     account,
+    packetContext: {
+      clientState,
+      consensus,
+      clientDatum,
+      client,
+      connection,
+      hostDatum,
+      host,
+      hostScript,
+      hostAddress,
+      verifyScript,
+      verifyPolicy,
+      channelDatum,
+      module,
+      moduleScript,
+      moduleAddress,
+      portToken,
+      moduleToken,
+      hostPolicy,
+      shutdownScriptHash,
+    },
   };
 }

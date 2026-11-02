@@ -6,8 +6,8 @@ values, modeled networks, and clean-state requirement.
 
 `caribic` is a local CLI used to bootstrap, run, and validate the Cardano <-> IBC bridge demo environment in this repo. For those familiar with Hermes, caribic cli also wraps that interface with equivalent commands that allow manual interaction with the relayer. The expected workflow is that keys would be addded to hermes via caribic, i.e, either you can enter via I/O when prompted, or refer to a mnemonic file as prompted, but there is no need to manually configure hermes. 
 
-> [!WARNING]
-> Mithril setup is deprecated, disabled, and not maintained. `caribic start --with-mithril` and `caribic start mithril` now fail fast; use the default stake-weighted-stability light-client mode.
+> [!NOTE]
+> `caribic start network` also starts a Mithril aggregator and two Mithril signers for the local network. A new network's clock is fast-forwarded through its first five epochs, so Mithril has certified the stake a client bootstraps from when startup returns. Public networks use the public Mithril aggregators and run no Mithril containers.
 
 ## Build and run
 
@@ -18,9 +18,24 @@ cargo install --path .
 ```
 ## Commands overview
 
+### Local Cardano network
+
+`caribic start` uses Yaci DevKit to seed five producers in genesis. Docker Compose and Python 3.9+ are required.
+Epochs retain 5,000 one-second slots (83 minutes 20 seconds). Seeding the pools avoids waiting for registration to activate.
+Fresh network startup took about 2½ minutes with cached images on a 3-CPU, 4-GiB Docker VM. Image downloads and bridge deployment add time.
+
+DevKit supplies the genesis templates and key-generation scripts. As Cardano versions change we can adopt upstream provisioning fixes instead of maintaining those pieces ourselves. Caribic adds the five-producer configuration and handles funding and bridge connections.
+
+To migrate or reset, run `caribic stop` followed by `caribic start --clean`. Recreate IBC routes and reset the paired Cosmos fixture with `--chain-flag stateful=false`. `caribic stop network` retains the chain.
+
+Use `caribic devkit status` to inspect the network and `caribic devkit test` to check payments and block proofs. The diagnostic requires Node 22+.
+Set port overrides in `chains/cardano/devkit/.env` using [`.env.example`](../chains/cardano/devkit/.env.example). Exported endpoints and reports live in `.caribic/devkit/`.
+
+Local pairing currently supports Cosmos `v8-classic`. Other profiles need clock integration and the Osmosis UI is skipped. Full IBC round-trip validation is still pending.
+
 ### `caribic check`
 
-Verifies Docker, Aiken, Deno, Go, and the native Hermes build toolchain on Linux. It does not currently probe Node.js or Rust/Cargo.
+Verifies Docker, Docker Compose, Python, Aiken, Deno, Go, and the native Hermes build toolchain on Linux. It does not currently probe Node.js or Rust/Cargo.
 
 ### `caribic install`
 
@@ -34,11 +49,11 @@ caribic install
 
 Starts services. Run `caribic --help` to see an actively maintained exhaustive list of targets and commands.
 
-- **Targets**: `all`, `network`, `bridge`, `gateway`, `dapp`, `relayer`; `mithril` is retained only to return the deprecation error.
+- **Targets**: `all`, `network`, `bridge`, `gateway`, `dapp`, `relayer`
 
 With no target, `caribic start` behaves like `caribic start all`: it starts the
 network and bridge stack (including Gateway and Hermes), then starts the IBC
-Swap dapp after those dependencies are ready.
+Swap dapp after those dependencies are ready. Local DevKit startup currently skips the dapp.
 
 Examples:
 
@@ -58,10 +73,10 @@ caribic chain start --chain cosmos --network v10-v2
 Public-testnet Yaci checkpoint note:
 - `caribic start --network preprod` and `caribic start --network preview` require Yaci to start from an explicit recent checkpoint, not genesis.
 - Before generating it, copy `cardano/gateway/.env.example` to `cardano/gateway/.env` and configure an external raw relay plus Kupo and Ogmios for the selected network. The official raw relay is `preprod-node.play.dev.cardano.org:3001` for Preprod or `preview-node.play.dev.cardano.org:3001` for Preview; use matching-network Kupo/Ogmios endpoints.
-- Generate and persist a checkpoint before deploying bridge contracts:
+- Generate and persist a checkpoint before deploying bridge contracts. The command picks the block 2161 below the tip, one past the 2160-block rollback limit, so the checkpoint is final but only about half a day old. Pass `--depth` to go further back.
 
 ```bash
-caribic yaci-checkpoint --network preprod --epochs-back 2 --write-env
+caribic yaci-checkpoint --network preprod --write-env
 caribic start network --network preprod
 # Replace preprod with preview for Cardano Preview.
 ```
@@ -76,7 +91,7 @@ Injective startup note:
 
 Cosmos compatibility-profile note:
 
-- `v8-classic` and `v10-classic` are pinned local simd chains supported by direct Cardano route setup and the token-swap compatibility demo.
+- `v8-classic` and `v10-classic` are pinned local simd chains supported by direct Cardano route setup and the token-transfer compatibility demo.
 - `v10-v2` is selectable and runnable, but Cardano/Hermes IBC v2 route and transfer testing is intentionally deferred.
 - A start recreates deterministic genesis by default; pass `--chain-flag stateful=true` to retain `~/.caribic/cosmos-profiles/<profile>`.
 - Full profile metadata and endpoints are documented in [`chains/cosmos/README.md`](../chains/cosmos/README.md).
@@ -91,7 +106,7 @@ Hermes config note:
 
 Stops services. With no target, it behaves like `all`.
 
-- **Targets**: `all`, `network`, `bridge`, `dapp`, `demo`, `gateway`, `relayer`, `mithril`
+- **Targets**: `all`, `network`, `bridge`, `dapp`, `demo`, `gateway`, `relayer`
 
 Examples:
 
@@ -120,7 +135,7 @@ caribic chain stop --chain injective --network local
 
 ### `caribic health-check [--service <name>]`
 
-Checks whether key services appear to be up (gateway, cardano, postgres, Yaci, Kupo, Ogmios, Hermes, Osmosis, Redis, cheqd, and Injective). Deprecated Mithril services are not part of the maintained aggregate health check. Use this before running tests if you are unsure about your current state.
+Checks whether key services appear to be up (gateway, cardano, postgres, Yaci, Kupo, Ogmios, Hermes, Osmosis, Redis, cheqd, and Injective). `caribic devkit test` checks the local Mithril aggregator and signers. Use this before running tests if you are unsure about your current state.
 
 ```bash
 caribic health-check
@@ -155,36 +170,40 @@ caribic create-connection --a-chain cardano-devnet --b-chain localosmosis
 caribic create-channel --a-chain cardano-devnet --b-chain localosmosis --a-port transfer --b-port transfer
 ```
 
-### `caribic demo token-swap`
+### `caribic demo token-transfer`
 
-`caribic demo token-swap` prepares direct Cardano-to-target transfer routes and runs the selected local demo against those direct channel ids.
+`caribic demo token-transfer` prepares direct Cardano-to-Cosmos or Cardano-to-Injective routes and runs token transfers against those channel ids. It defaults to Cosmos `v8-classic`. The Injective demo sends a Cardano mock token to Injective and independently sends funded INJ to Cardano.
 
 The Cosmos selector supports the currently testable Classic profiles:
 
 ```bash
 caribic setup route --from cardano --to cosmos --to-network v8-classic
-caribic demo token-swap --chain cosmos --network v8-classic
+caribic demo token-transfer --chain cosmos --network v8-classic
 
 caribic setup route --from cardano --to cosmos --to-network v10-classic
-caribic demo token-swap --chain cosmos --network v10-classic
+caribic demo token-transfer --chain cosmos --network v10-classic
 ```
 
 Selecting `v10-v2` is recognized but returns an explicit deferred-testing
 error until the Cardano/Hermes IBC v2 workflow is implemented and ready to
 exercise.
 
+`CARIBIC_TOKEN_TRANSFER_AMOUNT` sets the outgoing Cardano token amount in base units. It defaults to `12345`.
+
+### `caribic demo token-swap`
+
+`caribic demo token-swap --chain osmosis --network local` creates an Osmosis pool and swap contracts, exchanges the bridged Cardano token for OSMO and transfers the result to Cardano. It requires a compatible Cardano runtime. The current local DevKit fixture supports only the Cosmos `v8-classic` transfer demo.
+
 If your machine is slower, tune retry windows in `caribic/config/default-config.json` (or whichever file you pass via `--config`).
 
 Operator-facing retry/timeout tuning is configurable in one place: `caribic/config/default-config.json` by default.
-For example:
+The shipped Gateway health-check defaults are:
 
 ```json
 {
   "health": {
-    "cosmos_max_retries": 60,
-    "cosmos_retry_interval_ms": 10000,
-    "gateway_max_retries": 180,
-    "gateway_retry_interval_ms": 2000
+    "gateway_max_retries": 60,
+    "gateway_retry_interval_ms": 1000
   }
 }
 ```
@@ -266,6 +285,12 @@ local value is `315360000`), recreate the Gateway app with
 `docker compose -f cardano/gateway/docker-compose.yml up -d --force-recreate app`,
 and run `caribic start relayer --network local` before continuing.
 
+### Local v8 staged verification checks
+
+Run `caribic test --light-client challenge-recovery --chain cosmos --network v8-classic` for signed receipt-backed challenges, two-account upload interference and authorized recovery. Run `caribic test --light-client deadline-ordering --chain cosmos --network v8-classic` for committed activation/challenge ordering and host interruption.
+
+These tests use isolated SDK applications with a controlled host clock. They exercise the only supported snapshot format. The former inline-format process and software-upgrade fixtures have been removed. These checks do not certify host software upgrades or public-chain inclusion timing.
+
 ### What the numbered suite tests
 
 The legacy numbered suite is ordered and will **skip** later tests if prerequisites are not met, for example if no direct channel exists or if a known limitation is hit.
@@ -322,9 +347,13 @@ deno run --allow-net --allow-read --allow-write --allow-env caribic/tools/provis
 
 ### 1. Understand the managed public-network services
 
-For preprod and preview, Caribic never starts its local `cardano-node`, Kupo, Ogmios, or Ogmios proxy services, regardless of the local-devnet service switches in `default-config.json`. It manages only Postgres and the Yaci history follower; Yaci and the Gateway's block-witness fetch use the external raw relay configured by `CARDANO_CHAIN_HOST`, while transaction building and submission use the external Kupo/Ogmios endpoints.
+For preprod and preview, Caribic never starts its local `cardano-node`, Kupo, Ogmios, or Ogmios proxy services, regardless of local network configuration. It manages only Postgres and the Yaci history follower; Yaci and the Gateway's block-witness fetch use the external raw relay configured by `CARDANO_CHAIN_HOST`, while transaction building and submission use the external Kupo/Ogmios endpoints.
 
 The built-in profiles carry the correct chain identities and protocol magic (`1` for preprod and `2` for preview), so no custom Caribic config is needed. Rebuild the CLI with `cargo install --path caribic --force` after changing branches.
+
+Preview is the only bundled bridge deployment. The obsolete Preprod manifest, handler and cost report have been removed. The Preprod profile's default artifact paths are output locations for a fresh deployment; joining an existing Preprod bridge requires supplying a compatible manifest with history-bootstrap metadata.
+
+To run a relayer for an existing deployment, set the selected network profile's `bridge_manifest_path` to that deployment's trusted public manifest and use `caribic start relayer --network preprod` (or `preview`). Relayer startup requires the manifest, signing key and configured endpoints; it does not require `handler.json`. Hermes snapshots the manifest and uses it for independent signing checks. This command starts the relayer against an already configured Gateway; it does not deploy contracts or synchronize the Gateway's history. Configure the Gateway and history services separately for the same deployment. Public manifests must include the verified `history` replay checkpoint and HostState creation output. Caribic uses that deployment checkpoint even when a recent checkpoint remains in the environment.
 
 ### 2. Configure the preprod endpoints in the gateway env
 
@@ -349,22 +378,31 @@ For Preview, use `preview-node.play.dev.cardano.org:3001`, Preview Kupo/Ogmios e
 
 **Where the Demeter API keys go:** the unauthenticated host forms shown above require separate `KUPO_API_KEY` and `OGMIOS_API_KEY` values. Caribic and the Gateway authenticate Kupo's base host with the `dmtr-api-key` header; for Ogmios HTTP JSON-RPC they derive Demeter's authenticated `<ogmios-api-key>.<base-host>` URL because header authentication on the base host can time out. Hermes uses the same split for its independent signing checks. If either configured endpoint already uses its matching key-in-hostname form, Caribic does not also create or pass a header-key file for it. Non-Demeter providers follow their own authentication rules. You may instead export `CARIBIC_CARDANO_NETWORK=preprod` together with `CARIBIC_KUPO_API_KEY` / `CARIBIC_OGMIOS_API_KEY` before `caribic start`; the network marker is mandatory for process overrides so stale Preprod values cannot cross into Preview. If you later run the swap dapp (step 8), configured key values remain server-only and are passed there as `IBC_SWAP_KUPO_API_KEY` / `IBC_SWAP_OGMIOS_API_KEY`.
 
-**Where the Koios API key goes:** for paid/rate-limited Koios access, set `CARDANO_KOIOS_API_KEY=<token>` in `cardano/gateway/.env`. The `yaci-checkpoint --network ...` command also accepts `CARIBIC_KOIOS_API_KEY`, `CARDANO_KOIOS_API_KEY`, or `KOIOS_API_KEY` directly; when those process overrides are consumed by `caribic start`, accompany them with `CARIBIC_CARDANO_NETWORK=preprod` or `preview`. Caribic uses the token for checkpoint queries, while Gateway uses it for epoch-params and pool-registration-history queries.
+**Where the Blockfrost project id goes:** set `CARDANO_BLOCKFROST_PROJECT_ID=<id>` in `cardano/gateway/.env`. The `yaci-checkpoint --network ...` command also accepts `CARIBIC_BLOCKFROST_PROJECT_ID`, `CARDANO_BLOCKFROST_PROJECT_ID`, or `BLOCKFROST_PROJECT_ID` from the process environment. When using a process override with `caribic start`, set `CARIBIC_CARDANO_NETWORK=preprod` or `preview` too so credentials cannot cross networks. Caribic uses the project id for checkpoint queries, while Gateway uses it for epoch and pool history.
 
 ### 3. Resolve and persist a Yaci checkpoint
 
-Preprod history must sync from a recent checkpoint, never from genesis:
+Preprod history must sync from a recent checkpoint, never from genesis. By default this is the block 2161 below the tip:
 
 ```bash
-caribic yaci-checkpoint --network preprod --epochs-back 2 --write-env
+caribic yaci-checkpoint --network preprod --write-env
 ```
 
 ### 4. Start the preprod runtime and deploy the bridge
 
 ```bash
 export DEPLOYER_SK=$(cat ~/.caribic/preprod-deployer.sk)   # or your own funded preprod signing key
+# For unattended deployment, set DEPLOYER_BACKUP_PAYMENT_KEY_HASH to the backup operator's payment key hash.
 caribic start --network preprod
 ```
+
+Before a new deployment, Caribic prompts for a backup operator's 56-character hexadecimal payment key hash unless `DEPLOYER_BACKUP_PAYMENT_KEY_HASH` is set. This must belong to a different operator than the deployer. For upgradeable deployments this records a nominee for governance to approve. It does not grant the nominee authority. Legacy deployments retain the direct single-key backup path.
+
+Local, preprod and preview deployments can skip the backup with a warning. Unattended runs without the environment variable also continue with a warning. Reusing an existing public deployment does not prompt or change its backup. The shared deployment planner rejects mainnet deployments without a backup operator. Caribic does not yet support a mainnet runtime.
+
+On an upgradeable deployment, use `caribic deployer nominate-deployer --handler <handler.json> --signers <governor-key-hashes> --expires-at <milliseconds> --out <approval.json>` to export a governance approval transaction. The configured backup is the default nominee. Pass `--successor <payment-key-hash>` to propose someone else. The existing governance quorum must sign the exact exported body. Set the operational Ogmios/Kupo environment and use `--wallet-address` for unsigned export, or `MIGRATION_EXECUTOR_SK` with `--submit` for a locally signed transaction. `--submit` does not collect signatures from other governors.
+
+After the on-chain activation delay, run `caribic deployer graduate-deployer --handler <handler.json> --submit` with a funded executor. Neither the deployer nor the governors need to sign this execution. `caribic deployer inspect --handler <handler.json>` shows the approval and its time bounds. Governance can cancel a pending approval with `caribic deployer cancel`. See [deployer graduation](../docs/state-preserving-redeployment.md#deployer-graduation) for authority and compatibility rules.
 
 This starts postgres and the Yaci history services, deploys the IBC validators to preprod (artifacts exported to `manifests/preprod/`), starts the Gateway (gRPC on 5001), Hermes daemon, and IBC Swap dapp, and injects the `injective-888` chain block (public sentry endpoints) into `~/.hermes/config.toml`. Verify with:
 
@@ -373,6 +411,12 @@ caribic health-check
 ```
 
 A successful deploy is cached via the artifacts in `manifests/preprod/`; set `CARIBIC_FORCE_PREPROD_DEPLOY=1` to force a redeploy.
+
+For legacy deployments only, the backup hash is baked into the deployed HostState validator. It cannot be
+added or changed later. The named backup wallet can take over at any time by
+setting `DEPLOYER_SK` to its signing key and running
+`cardano/offchain/scripts/shutdown-deployment.ts claim-backup` using the
+deployment's `handler.json`.
 
 ### 5. Add the Injective testnet relayer key
 
@@ -400,10 +444,10 @@ This creates the `08-cardano-probabilistic` client on Injective testnet and the 
 ### 7. Exercise the route
 
 ```bash
-caribic demo token-swap --chain injective --network testnet
+caribic demo token-transfer --chain injective --network testnet
 ```
 
-On Injective this runs the direct token-transfer legs (Cardano → Injective and back). A DEX-style swap leg currently exists only for Osmosis (via the `crosschain_swaps` wasm contract).
+This sends a Cardano mock token to Injective and independently sends funded INJ to Cardano. Use `token-swap` only for the Osmosis workflow that executes an exchange.
 
 ### 8. Run the swap dapp against preprod + Injective testnet
 
@@ -461,29 +505,17 @@ Channels and denom traces are discovered at runtime through the planner and the 
 
 ### Keeping the route alive
 
-The Injective-side Cardano client can only be updated with headers whose size and gas grow with the update gap (~4.6–8KB and ~85k gas per preprod block), and update targets must be blocks containing a HostState transaction. In practice this means:
+This guidance applies to the October 16, 2026 release: [cardano-probabilistic-light-client-v8 `v0.1.8`](../cosmos/cardano-probabilistic-light-client-v8/README.md) or [cardano-probabilistic-light-client-v10 `v0.1.5`](../cosmos/cardano-probabilistic-light-client-v10/README.md), both using [cardano-probabilistic-light-client-core `v0.1.6`](../cosmos/cardano-probabilistic-light-client-core/README.md). The destination chain's application must include the matching adapter and core. Build Caribic, Gateway and Hermes from the same release checkout, including its pinned `relayer` submodule. Updating a Gateway or Hermes image does not update the destination application or migrate existing client state. See the adapter's [v8 porting notes](../cosmos/cardano-probabilistic-light-client-v8/PORTING.md) or [v10 porting notes](../cosmos/cardano-probabilistic-light-client-v10/PORTING.md) before upgrading an existing deployment.
 
-- The tracked Cardano Hermes profile sets `host_state_heartbeat_interval = '60s'`. Once per poll Hermes asks the Gateway whether the current Cardano epoch already contains a HostState transaction; if not, it submits a root-preserving heartbeat that spends and recreates HostState to provide an epoch anchor. Ordinary IBC transactions satisfy the same check, so this produces at most one proactive heartbeat per otherwise idle epoch, not one transaction per minute. Heartbeats require the HostState deployment authority, and concurrent authorized relayers are safe because only one transaction can consume the current HostState UTxO; losing attempts retry from fresh Gateway state on the next poll.
+For this release, the Hermes daemon automatically advances verified Cardano checkpoints before the client expires. Keep `mode.clients.enabled = true` and `mode.clients.refresh = true` in the Hermes configuration. The [tracked configuration](config/hermes-config.example.toml) already enables both. The old twenty-minute `hermes update client` shell loop is no longer required. Older application and relayer versions do not gain this behavior from a configuration change alone.
 
-- The Hermes daemon does NOT keep this client fresh on its own: its refresh policy triggers near the trusting-period threshold (days), which suits ordinary Tendermint clients but not one whose update cost grows per block of gap. Run an explicit refresh loop while the route is up, for example:
+Client expiry uses `latest_checkpoint_timestamp`, the authenticated Cardano block time of the latest committed checkpoint. A rootless checkpoint advances verified history without requiring a HostState transaction or creating a new IBC proof root. An old HostState transaction therefore does not by itself expire the client. Checkpoint maintenance uses bounded observation transactions rather than one transaction containing the entire update gap. See the [checkpoint rules](../docs/probabilistic-light-client.md#header).
 
-  ```bash
-  while true; do
-    hermes update client --host-chain injective-888 --client <08-cardano-probabilistic-N>
-    sleep 1200
-  done
-  ```
+Fresh proof heights still require a HostState transaction. The tracked Cardano profile sets `host_state_heartbeat_interval = '60s'` as the heartbeat retry interval. Gateway schedules a heartbeat after six hours without an ordinary HostState transaction. With the matching wire-version-5 Cardano validators, any funded payment-key signer can submit one without the deployment authority. Hermes follows Gateway's suggested delay and rechecks hourly for rollbacks. Once confirmed and relayed, the heartbeat makes the unchanged IBC root available at a fresh Cardano height. Existing validators retain their old heartbeat rules. See the [heartbeat requirements](../docs/probabilistic-light-client.md#permissionless-hoststate-heartbeats).
 
-  Catch-up updates outgrow the transport limits quickly. In the July 24, 2026 failure documented in [#552](https://github.com/cardano-foundation/cardano-ibc-incubator/issues/552), an update spanning Cardano heights 4,970,800 to 4,971,057 encoded to 3,073,891 bytes — below Injective's 4,194,304-byte (4 MiB) consensus block limit, but rejected by the tested public nodes because it exceeded their effective 1,048,576-byte per-transaction mempool limit (a 541-block gap has produced a 4.27MB update, beyond even the consensus cap). The amount of downtime before this happens varies with witness sizes and available HostState anchors. Once the client is genuinely expired, a compatible active substitute can recover the original client ID through governance and preserve the existing route; see the [recovery runbook](../docs/probabilistic-client-recovery.md). If no compatible substitute can be built, recovery still requires a new client, connection, and channel (`caribic setup route` reuses an existing channel, so a rebuild currently requires driving `hermes create client` / `create connection` / `create channel` manually). Stuck packets refund via timeout proofs on Cardano, which only need the Cardano-side Tendermint client.
-- Anything that pauses the host pauses the refresh loop: laptop sleep, a stopped Gateway container, or a crashed relayer all have the same effect. On macOS, run `caffeinate -dims` while testing, or host the Gateway + Yaci + Hermes stack on an always-on machine for multi-day use.
-- The tracked Hermes profile for `injective-888` uses `max_tx_size = 1000000` and `max_gas = 75000000`, matching Injective's current per-transaction gas ceiling; the older defaults (~205KB / 15M gas) reject even routine ~100-block refresh updates.
+Gateway defaults to and requires at least a 48-hour trusting period in probabilistic mode. Keep the daemon and its Gateway and history services running with funded signing accounts. Laptop sleep or stopped services interrupt maintenance and do not extend the Cardano trusting period. Monitor the committed client status and `latest_checkpoint_timestamp` to confirm renewal. Uploading evidence or proposing an epoch table alone does not renew it.
 
-What survives a spin-down: the contract deployment (`manifests/preprod/`), all keys, the Yaci history volume, and — within its 10-day trusting period — the Cardano-side Tendermint client, which catches up with a single header regardless of gap. What does not: the Injective-side client, and with it the connection and channel. To restart after downtime:
-
-1. `caribic start --network preprod` (reuses the deployment) and wait until `/health/ready` reports `ready`.
-2. `hermes update client --host-chain cardano-preprod --client <07-tendermint-N>` — this revalidates the reusable client and mints a fresh HostState anchor. Wait for `proofHeight` to advance to it (~8 minutes). New clients anchor at the latest HostState tx block, so skipping this step creates the Injective-side client hours in the past, where no reachable update target exists.
-3. `hermes create client --host-chain injective-888 --reference-chain cardano-preprod`, then `hermes create connection` (reusing the Cardano-side client) and `hermes create channel` (`caribic setup route` reuses the existing dead channel, so the rebuild needs the explicit Hermes commands).
-4. Restart the relayer daemon before testing.
+After downtime, run `caribic start --network preprod` and wait until `/health/ready` reports `ready`. Check both clients' status before changing the route. If both remain active, reuse the existing clients, connection and channel while Hermes resumes maintenance. If the Injective-side Cardano client has expired or frozen, ordinary updates cannot revive it. A compatible active substitute can recover the same client ID through governance while preserving the route, escrow and voucher denominations. Follow the [recovery runbook](../docs/probabilistic-client-recovery.md). Create a replacement route only when compatible recovery is unavailable. A stale HostState transaction alone is not a reason to rebuild it.
 
 ### Troubleshooting
 
@@ -493,3 +525,5 @@ What survives a spin-down: the contract deployment (`manifests/preprod/`), all k
 - `NotFound` account errors on Injective mean the relayer address is unfunded.
 - Hermes errors like `unknown header type: /ibc.lightclients.probabilistic.v1.ProbabilisticHeader` mean the compiled relayer binary is older than the `relayer/` submodule checkout — rebuild it with `cd relayer && cargo build --release --bin hermes`. (Hermes reports errors on stdout, so caribic may show such failures with an empty message.)
 - If client creation on Injective fails with an unsupported client type, re-check the `allowed_clients` query at the top of this section.
+
+`caribic test --light-client deadline-ordering --chain cosmos --network v8-classic` checks activation and challenge ordering against committed blocks in isolated SDK applications. The host clock is controlled so the full six-hour window and interruption rules are exercised without a six-hour wall-clock run. The old inline-format process fixture has been removed.

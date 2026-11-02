@@ -1,13 +1,16 @@
+import { fundsReceived } from '@/utils/transferReceipt';
+import { CardanoIntentProgress } from '@/components/CardanoIntentProgress';
+import type { FundedIntent, IntentStatus } from '@/utils/cardanoIntent';
 import type { ReactNode } from 'react';
 import { useContext, useEffect, useState } from 'react';
 import Image from 'next/image';
 
-import { Box, Text } from '@chakra-ui/react';
+import { Box, Button, Text } from '@chakra-ui/react';
 import { COLOR } from '@/styles/color';
 import RightArrowIcon from '@/assets/icons/Arrow-right.svg';
 import TimerIcon from '@/assets/icons/timer.svg';
 import TransferContext from '@/contexts/TransferContext';
-import { formatTokenSymbol } from '@/utils/string';
+import { TokenAmountUnit, TokenLabel } from '@/components/TokenLabel';
 import { IBC_SWAP_MODE, dappApiPath } from '@/configs/runtime';
 import {
   runtimeChainLabel,
@@ -32,6 +35,7 @@ import {
 } from './index.style';
 
 type TransferResultProps = {
+  intent?: FundedIntent;
   // eslint-disable-next-line no-unused-vars
   setIsSubmitted: (isSubmitted: boolean) => void;
   resetLastTxData: () => void;
@@ -269,6 +273,7 @@ const buildRouteHopProgress = (params: {
 };
 
 export const TransferResult = ({
+  intent,
   setIsSubmitted,
   estReceiveAmount,
   estTime,
@@ -279,13 +284,19 @@ export const TransferResult = ({
 }: TransferResultProps) => {
   const { handleReset, fromNetwork, toNetwork, selectedToken, sendAmount } =
     useContext(TransferContext);
+  const [intentStatus, setIntentStatus] = useState<IntentStatus>();
+  const includedIntentTx =
+    intentStatus?.stage === 'sent' ? intentStatus.packetTxHash : undefined;
+  const packetTxHash = intent ? includedIntentTx : lastTxHash;
   const [elapsedSeconds, setElapsedSeconds] = useState(() =>
     getElapsedSecondsSince(submittedAt),
   );
   const [transferStatus, setTransferStatus] =
     useState<TransferStatusResponse | null>(null);
   const [transferStatusError, setTransferStatusError] = useState('');
-  const transferTerminal = isTerminalTransferStatus(transferStatus?.status);
+  const transferTerminal =
+    intentStatus?.stage === 'cancelled' ||
+    isTerminalTransferStatus(transferStatus?.status);
 
   useEffect(() => {
     if (transferTerminal) return undefined;
@@ -310,7 +321,8 @@ export const TransferResult = ({
   useEffect(() => {
     const sourceChainId = fromNetwork.networkId;
     const destinationChainId = toNetwork.networkId;
-    if (!lastTxHash || !sourceChainId || !destinationChainId) {
+    if (!packetTxHash || !sourceChainId || !destinationChainId) {
+      setTransferStatus(null);
       return undefined;
     }
 
@@ -318,7 +330,13 @@ export const TransferResult = ({
     const fetchTransferStatus = async () => {
       // Poll through the Next API so the browser never talks directly to chain REST endpoints.
       const params = new URLSearchParams({
-        sourceTxHash: lastTxHash,
+        sourceTxHash: packetTxHash,
+        ...(intentStatus?.packetSequence
+          ? {
+              packetSequence: intentStatus.packetSequence,
+              sourceChannel: intent?.channel || '',
+            }
+          : {}),
         sourceChainId,
         destinationChainId,
       });
@@ -369,7 +387,13 @@ export const TransferResult = ({
       cancelled = true;
       window.clearInterval(interval);
     };
-  }, [fromNetwork.networkId, lastTxHash, toNetwork.networkId]);
+  }, [
+    fromNetwork.networkId,
+    packetTxHash,
+    toNetwork.networkId,
+    intentStatus?.packetSequence,
+    intent?.channel,
+  ]);
 
   // Fall back to local route config until the live status endpoint returns the canonical route.
   const routeChainIds = transferStatus?.routeChainIds.length
@@ -393,7 +417,7 @@ export const TransferResult = ({
           index > 0
             ? packets.find((packet) => packet.index === index - 1)
             : undefined,
-        sourceTxHash: index === 0 ? lastTxHash : undefined,
+        sourceTxHash: index === 0 ? packetTxHash : undefined,
       }),
     );
 
@@ -402,6 +426,19 @@ export const TransferResult = ({
     handleReset();
     setIsSubmitted(false);
   };
+
+  if (intent && intentStatus?.stage === 'cancelled') {
+    return (
+      <StyledWrapContainer>
+        <Box p={4}>
+          <CardanoIntentProgress intent={intent} onStatus={setIntentStatus} />
+          <Button mt={4} onClick={handleBackToTransfer}>
+            Start another transfer
+          </Button>
+        </Box>
+      </StyledWrapContainer>
+    );
+  }
 
   return (
     <StyledWrapContainer>
@@ -413,6 +450,9 @@ export const TransferResult = ({
         }}
       >
         <Box display="inline-grid" gap={4} position="relative" pt={4}>
+          {intent && (
+            <CardanoIntentProgress intent={intent} onStatus={setIntentStatus} />
+          )}
           <StyledTimerBox>
             <Image width={32} height={32} src={TimerIcon} alt="timer icon" />
           </StyledTimerBox>
@@ -423,7 +463,9 @@ export const TransferResult = ({
               fontSize={20}
               lineHeight="28px"
             >
-              IBC Transfer in Progress
+              {fundsReceived(transferStatus)
+                ? 'Funds received'
+                : 'IBC Transfer in Progress'}
             </Text>
             <Text
               textAlign="center"
@@ -432,8 +474,9 @@ export const TransferResult = ({
               lineHeight="18px"
               color={COLOR.neutral_2}
             >
-              Source transaction submitted. The transfer is now waiting on
-              relayer and destination-chain processing.
+              {intent && !packetTxHash
+                ? 'Funding your request does not send a packet or complete the transfer.'
+                : 'Packet sent. Waiting for destination-chain processing.'}
             </Text>
           </Box>
           <Box
@@ -457,10 +500,11 @@ export const TransferResult = ({
                 fontSize={16}
                 lineHeight="22px"
               >
-                {sendAmount}{' '}
-                {formatTokenSymbol(selectedToken.tokenSymbol || '')}/
-                {fromNetwork.networkPrettyName}
+                {sendAmount}
+                <TokenAmountUnit token={selectedToken} />{' '}
+                <TokenLabel token={selectedToken} />
               </Text>
+              <Text fontSize={14}>{fromNetwork.networkPrettyName}</Text>
             </StyledTransferFromToBox>
             <StyledSwitchNetwork
               style={{ borderRadius: '100%', cursor: 'auto' }}
@@ -485,9 +529,15 @@ export const TransferResult = ({
                 fontSize={16}
                 lineHeight="22px"
               >
-                {estReceiveAmount}{' '}
-                {formatTokenSymbol(selectedToken.tokenSymbol || '')}/
                 {toNetwork.networkPrettyName}
+              </Text>
+              <Text fontSize={14}>
+                Estimated amount: {estReceiveAmount}
+                <TokenAmountUnit token={selectedToken} />
+              </Text>
+              <Text fontSize={12} color={COLOR.neutral_3}>
+                Amount in source asset units. The denomination trace can change
+                on arrival.
               </Text>
             </StyledTransferFromToBox>
           </Box>

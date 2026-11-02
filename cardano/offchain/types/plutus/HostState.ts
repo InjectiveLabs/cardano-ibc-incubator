@@ -51,6 +51,10 @@ export const HostState = HostStateSchema as unknown as HostState;
 export const HostStateControlSchema = Data.Object({
   port_registry: Data.Map(Data.Bytes(), ModuleRegistrationSchema),
   shutdown: ShutdownStateSchema,
+  live_clients: Data.Integer(),
+  live_connections: Data.Integer(),
+  live_channels: Data.Integer(),
+  last_heartbeat_time: Data.Integer(),
 });
 
 export type HostStateControl = Data.Static<typeof HostStateControlSchema>;

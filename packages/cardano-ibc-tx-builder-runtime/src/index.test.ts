@@ -1,14 +1,15 @@
-import { describe, it } from 'node:test';
-import assert from 'node:assert/strict';
-import * as LucidImporter from '@lucid-evolution/lucid';
-import { AsyncMutex } from './asyncMutex';
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import * as LucidImporter from "@lucid-evolution/lucid";
+import { AsyncMutex } from "./asyncMutex";
 import {
   decodeAcknowledgement,
   encodeAcknowledgement,
   type Acknowledgement,
-} from './acknowledgementCodec';
-import { transferEscrowShardTokenName } from './index';
-import { LucidIbcAdapter } from './lucidIbcAdapter';
+} from "./acknowledgementCodec";
+import { transferEscrowShardTokenName } from "./index";
+import { LucidIbcAdapter } from "./lucidIbcAdapter";
+
 
 function deferred<T = void>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -231,6 +232,10 @@ describe('IBC module and textual-port codecs', () => {
       control: {
         port_registry: new Map([[portId, registration]]),
         shutdown: 'Active',
+        live_clients: 0n,
+        live_connections: 0n,
+        live_channels: 0n,
+        last_heartbeat_time: 0n,
       },
     };
 

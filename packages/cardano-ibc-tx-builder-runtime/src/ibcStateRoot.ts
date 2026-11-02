@@ -1,12 +1,16 @@
 import type { UTxO } from '@lucid-evolution/lucid';
 import { ICS23MerkleTree } from './ics23MerkleTree';
+import { channelSchemas } from './channelDatum';
+import { publicClientCommitmentValues } from './plutusSerialise';
 
 export type IbcTreeDeployment = Readonly<{
   network: string;
   hostStateNFT: Readonly<{ policyId: string; name: string }>;
+  clientPolicyId?: string;
 }>;
 
-export type IbcTreeUtxo = Pick<UTxO, 'datum' | 'assets' | 'txHash' | 'outputIndex'>;
+export type IbcTreeUtxo = Pick<UTxO, 'datum' | 'assets' | 'txHash' | 'outputIndex'> &
+  Partial<Pick<UTxO, 'address'>>;
 
 export type IbcTreeHostStateRef = Readonly<Pick<UTxO, 'txHash' | 'outputIndex'>>;
 
@@ -38,8 +42,12 @@ export interface IbcTreeKupoService {
 
 export interface IbcTreeLucidService {
   readonly LucidImporter: typeof import('@lucid-evolution/lucid');
-  findUtxoAtHostStateNFT(): Promise<IbcTreeUtxo | undefined>;
-  decodeDatum<T>(encodedDatum: string, type: 'host_state' | 'client' | 'connection' | 'channel'): Promise<T>;
+  consensusHistoryRecords?(client: IbcTreeUtxo): Promise<Array<{ datum: ConsensusStateDatumLike; consensusValue: string; archived: boolean }>>;
+  findUtxoAtHostStateNFT(restriction?: bigint): Promise<IbcTreeUtxo | undefined>;
+  decodeDatum<T>(
+    encodedDatum: string,
+    type: 'host_state' | 'client' | 'consensus_state' | 'connection' | 'channel',
+  ): Promise<T>;
 }
 
 type HostStateDatumLike = {
@@ -53,6 +61,18 @@ type ClientDatumLike = {
     clientState: unknown;
     consensusStates?: Map<ConsensusHeight, unknown> | Record<string, unknown>;
   };
+  token?: AuthTokenLike;
+  history_root?: string;
+};
+
+type AuthTokenLike = { policyId: string; name: string };
+type HeightLike = { revisionNumber: bigint; revisionHeight: bigint };
+type ConsensusStateDatumLike = {
+  clientToken: AuthTokenLike;
+  height: HeightLike;
+  consensusState: unknown;
+  processedTime: bigint;
+  processedHeight: bigint;
 };
 
 type ConnectionDatumLike = { state: unknown };
@@ -73,12 +93,21 @@ type ChannelStateLike = {
     revisionNumber: bigint;
     revisionHeight: bigint;
   };
+  upgrade?: any;
 };
 
 type ChannelDatumLike = {
   state: ChannelStateLike;
   port: string;
 };
+
+function normalizeHex(value: string): string {
+  return value.toLowerCase();
+}
+
+function utxoLabel(utxo: IbcTreeUtxo): string {
+  return `${utxo.txHash}#${utxo.outputIndex}`;
+}
 
 export type StateRootResult = {
   newRoot: string;
@@ -117,6 +146,12 @@ export interface BindPortStateRootResult extends StateRootResult {
 
 export interface UpdateChannelStateRootResult extends StateRootResult {
   channelSiblings: string[];
+}
+
+export interface UpgradeChannelStateRootResult extends StateRootResult {
+  channelSiblings: string[];
+  upgradeSiblings: string[];
+  errorReceiptSiblings: string[];
 }
 
 export interface UpdateClientStateRootResult extends StateRootResult {
@@ -174,6 +209,7 @@ export async function encodeClientStateValue(
     frozenHeight: HeightSchema,
     latestHeight: HeightSchema,
     proofSpecs: Data.Array(ProofSpecSchema),
+    upgradePath: Data.Array(Data.Bytes()),
   });
 
   // Match Aiken cbor.serialise, including indefinite-length arrays.
@@ -243,25 +279,71 @@ export async function encodeChannelEndValue(
     Data.Literal('TryOpen'),
     Data.Literal('Open'),
     Data.Literal('Close'),
-  ]);
-  const OrderSchema = Data.Enum([
-    Data.Literal('None'),
-    Data.Literal('Unordered'),
-    Data.Literal('Ordered'),
+    Data.Literal('Flushing'),
+    Data.Literal('FlushComplete'),
   ]);
   const ChannelCounterpartySchema = Data.Object({
     port_id: Data.Bytes(),
     channel_id: Data.Bytes(),
   });
-  const ChannelSchema = Data.Object({
+  const fields = {
     state: StateSchema,
-    ordering: OrderSchema,
+    ordering: channelOrderSchema(Lucid),
     counterparty: ChannelCounterpartySchema,
     connection_hops: Data.Array(Data.Bytes()),
     version: Data.Bytes(),
-  });
+  };
+  // Channel upgrades append upgrade_sequence. Channels without it keep the
+  // five-field encoding that existing deployments committed.
+  const ChannelSchema =
+    channelEnd.upgrade_sequence === undefined
+      ? Data.Object(fields)
+      : Data.Object({ ...fields, upgrade_sequence: Data.Integer() });
 
   return Data.to(channelEnd, ChannelSchema as any);
+}
+
+// Committed under channelUpgrades/upgrades/ports/{port}/channels/{channel}.
+export async function encodeChannelUpgradeValue(
+  upgrade: any,
+  Lucid: typeof import('@lucid-evolution/lucid'),
+): Promise<string> {
+  return Lucid.Data.to(upgrade, channelSchemas(Lucid).Upgrade as any);
+}
+
+// Committed under channelUpgrades/upgradeError/ports/{port}/channels/{channel}.
+export async function encodeChannelUpgradeErrorValue(
+  receipt: any,
+  Lucid: typeof import('@lucid-evolution/lucid'),
+): Promise<string> {
+  return Lucid.Data.to(receipt, channelSchemas(Lucid).ErrorReceipt as any);
+}
+
+/**
+ * The committed upgrade and error-receipt values of a channel's upgrade state.
+ * An absent record commits the empty value, which removes its key.
+ */
+export async function encodeChannelUpgradeRecords(
+  upgrade: any,
+  Lucid: typeof import('@lucid-evolution/lucid'),
+): Promise<{ upgrade: Buffer; errorReceipt: Buffer }> {
+  return {
+    upgrade: upgrade?.pending
+      ? Buffer.from(await encodeChannelUpgradeValue(upgrade.pending.upgrade, Lucid), 'hex')
+      : Buffer.alloc(0),
+    errorReceipt: upgrade?.error_receipt
+      ? Buffer.from(await encodeChannelUpgradeErrorValue(upgrade.error_receipt, Lucid), 'hex')
+      : Buffer.alloc(0),
+  };
+}
+
+function channelOrderSchema(Lucid: typeof import('@lucid-evolution/lucid')) {
+  const { Data } = Lucid;
+  return Data.Enum([
+    Data.Literal('None'),
+    Data.Literal('Unordered'),
+    Data.Literal('Ordered'),
+  ]);
 }
 
 export async function encodeModuleRegistration(
@@ -302,6 +384,7 @@ export class IbcTreeStateStore {
         policyId: deployment.hostStateNFT.policyId,
         name: deployment.hostStateNFT.name,
       }),
+      ...(deployment.clientPolicyId ? { clientPolicyId: deployment.clientPolicyId } : {}),
     });
   }
 
@@ -347,7 +430,9 @@ export class IbcTreeStateStore {
     hostState: IbcTreeHostStateRef;
     datum: HostStateDatumLike;
   }> {
-    const utxo = await this.lucidService.findUtxoAtHostStateNFT();
+    // Tree alignment authenticates the live deployment but does not authorize an
+    // operation. The caller applies its traffic, client, or heartbeat restriction.
+    const utxo = await this.lucidService.findUtxoAtHostStateNFT(0n);
     if (!utxo?.datum) throw new Error('HostState UTXO has no datum');
     const hostState = this.copyHostState(utxo);
     const datum = await this.lucidService.decodeDatum<HostStateDatumLike>(utxo.datum, 'host_state');
@@ -579,6 +664,8 @@ export class IbcTreeStateStore {
       }
     }
 
+    const clientIdsByTokenUnit = new Map<string, string>();
+    const consensusPaths = new Set<string>();
     const clientUtxos = await kupoService.queryAllClientUtxos();
     for (const clientUtxo of clientUtxos) {
       if (!clientUtxo.datum) {
@@ -586,21 +673,77 @@ export class IbcTreeStateStore {
       }
 
       const clientDatum = await lucidService.decodeDatum<ClientDatumLike>(clientUtxo.datum, 'client');
-      const clientUnit = Object.keys(clientUtxo.assets || {}).find((unit) => unit !== 'lovelace');
+      const clientUnit = Object.keys(clientUtxo.assets || {}).find((unit) =>
+        unit !== 'lovelace' &&
+        (!this.deployment.clientPolicyId ||
+          normalizeHex(unit).startsWith(normalizeHex(this.deployment.clientPolicyId))),
+      );
       if (!clientUnit || clientUnit.length < 56 + 48 + 2) {
         continue;
       }
 
+      if (this.deployment.clientPolicyId) {
+        const expectedPolicy = normalizeHex(this.deployment.clientPolicyId);
+        const clientPolicyUnits = Object.keys(clientUtxo.assets || {}).filter(
+          (unit) => unit !== 'lovelace' && normalizeHex(unit).startsWith(expectedPolicy),
+        );
+        const datumUnit = clientDatum.token
+          ? normalizeHex(clientDatum.token.policyId + clientDatum.token.name)
+          : undefined;
+        if (
+          clientPolicyUnits.length !== 1 ||
+          clientUtxo.assets[clientUnit] !== 1n ||
+          !datumUnit ||
+          datumUnit !== normalizeHex(clientUnit)
+        ) {
+          throw new Error(`Client UTxO ${utxoLabel(clientUtxo)} failed authentication during tree rebuild`);
+        }
+      }
+
       const tokenName = clientUnit.slice(56);
       const postfixHex = tokenName.slice(48);
-      const clientSequence = BigInt(Buffer.from(postfixHex, 'hex').toString('utf8'));
+      const clientSequenceText = Buffer.from(postfixHex, 'hex').toString('utf8');
+      if (!/^\d+$/.test(clientSequenceText)) {
+        if (this.deployment.clientPolicyId) {
+          throw new Error(`Client UTxO ${utxoLabel(clientUtxo)} has an invalid sequence token`);
+        }
+        continue;
+      }
+      const clientSequence = BigInt(clientSequenceText);
       const clientId = `07-tendermint-${clientSequence.toString()}`;
+      const normalizedClientUnit = normalizeHex(clientUnit);
+      if (clientIdsByTokenUnit.has(normalizedClientUnit)) {
+        throw new Error(`Duplicate client authentication token ${clientUnit} during tree rebuild`);
+      }
+      clientIdsByTokenUnit.set(normalizedClientUnit, clientId);
 
       const clientStateValue = Buffer.from(
-        await encodeClientStateValue(clientDatum.state.clientState, lucidService.LucidImporter),
+        this.deployment.clientPolicyId
+          ? publicClientCommitmentValues(clientUtxo.datum).clientValue
+          : await encodeClientStateValue(clientDatum.state.clientState, lucidService.LucidImporter),
         'hex',
       );
       tree.set(`clients/${clientId}/clientState`, clientStateValue);
+
+      if (this.deployment.clientPolicyId) {
+        if (!/^[0-9a-f]{64}$/.test(clientDatum.history_root ?? '') || !lucidService.consensusHistoryRecords) {
+          throw new Error('Proof-backed consensus history requires a valid client root and historical chain reader');
+        }
+        const records = await lucidService.consensusHistoryRecords(clientUtxo);
+        if (records.length === 0) throw new Error(`No consensus records recovered for '${clientId}'`);
+        for (const { datum: record, consensusValue } of records) {
+          if (normalizeHex(record.clientToken.policyId + record.clientToken.name) !== normalizedClientUnit ||
+            record.height.revisionNumber < 0n || record.height.revisionHeight <= 0n ||
+            !/^(?:[0-9a-f]{2})+$/.test(consensusValue)) {
+            throw new Error(`Invalid recovered consensus record for '${clientId}'`);
+          }
+          const path = `clients/${clientId}/consensusStates/${record.height.revisionNumber}-${record.height.revisionHeight}`;
+          if (consensusPaths.has(path)) throw new Error(`Duplicate consensus state path '${path}' during tree rebuild`);
+          tree.set(path, Buffer.from(consensusValue, 'hex'));
+          consensusPaths.add(path);
+        }
+        continue;
+      }
 
       const consensusStates = clientDatum.state.consensusStates;
       const entries = consensusStates instanceof Map
@@ -609,13 +752,18 @@ export class IbcTreeStateStore {
 
       for (const [heightKey, consensusState] of entries) {
         const heightStr = typeof heightKey === 'object' && heightKey !== null
-          ? `${(heightKey as { revisionHeight?: bigint | number }).revisionHeight || 0}`
+          ? `${(heightKey as { revisionNumber?: bigint | number }).revisionNumber || 0}-${(heightKey as { revisionHeight?: bigint | number }).revisionHeight || 0}`
           : String(heightKey);
+        const consensusPath = `clients/${clientId}/consensusStates/${heightStr}`;
+        if (consensusPaths.has(consensusPath)) {
+          throw new Error(`Duplicate consensus state path '${consensusPath}' during tree rebuild`);
+        }
         const consensusValue = Buffer.from(
           await encodeConsensusStateValue(consensusState, lucidService.LucidImporter),
           'hex',
         );
-        tree.set(`clients/${clientId}/consensusStates/${heightStr}`, consensusValue);
+        tree.set(consensusPath, consensusValue);
+        consensusPaths.add(consensusPath);
       }
     }
 
@@ -681,6 +829,12 @@ export class IbcTreeStateStore {
         'hex',
       );
       tree.set(`channelEnds/ports/${portId}/channels/${channelId}`, channelValue);
+      const upgradeRecords = await encodeChannelUpgradeRecords(
+        channelDatum.state.upgrade,
+        lucidService.LucidImporter,
+      );
+      tree.set(`channelUpgrades/upgrades/ports/${portId}/channels/${channelId}`, upgradeRecords.upgrade);
+      tree.set(`channelUpgrades/upgradeError/ports/${portId}/channels/${channelId}`, upgradeRecords.errorReceipt);
 
       const { Data } = lucidService.LucidImporter;
       tree.set(
@@ -770,6 +924,9 @@ export class IbcTreeStateStore {
         }
       | undefined,
   ): UpdateClientStateRootResult {
+    if (removedConsensusHeights.length !== 0) {
+      throw new Error('UpdateClient cannot remove consensus history');
+    }
     const version = this.version;
     const speculativeTree = this.getClonedTreeFromRoot(oldRoot);
 
@@ -783,24 +940,8 @@ export class IbcTreeStateStore {
     const clientStateSiblings = speculativeTree.getSiblings(clientPath).map((h) => h.toString('hex'));
     speculativeTree.set(clientPath, newClientStateValue);
 
-    // 2) Consensus state deletions (in the order provided by the caller).
+    // Archiving a tip changes its UTxO location, not its commitment leaf.
     const removedConsensusStateSiblings: string[][] = [];
-    for (const height of removedConsensusHeights) {
-      const heightStr = String(height);
-      const consensusPath = `clients/${clientId}/consensusStates/${heightStr}`;
-
-      if (!speculativeTree.get(consensusPath)) {
-        throw new Error(
-          `UpdateClient root update expects existing consensusState at '${consensusPath}', but it was not found in the tree`,
-        );
-      }
-
-      const siblings = speculativeTree.getSiblings(consensusPath).map((h) => h.toString('hex'));
-      removedConsensusStateSiblings.push(siblings);
-
-      // Deletion is modeled as "set to empty", which collapses back to the empty hash on-chain.
-      speculativeTree.set(consensusPath, Buffer.alloc(0));
-    }
 
     // 3) Optional consensus state insertion (exactly one for normal UpdateClient, none for misbehaviour).
     let consensusStateSiblings: string[] = [];
@@ -902,6 +1043,56 @@ export class IbcTreeStateStore {
     return {
       ...this.preparePublication(speculativeTree, version),
       channelSiblings,
+    };
+  }
+
+  /**
+   * Witnesses for an UpgradeChannel step: the channel end, upgrade and error
+   * receipt keys are updated in that order. Unchanged keys take no witness.
+   */
+  computeRootWithUpgradeChannelUpdate(
+    oldRoot: string,
+    portId: string,
+    channelId: string,
+    values: {
+      oldChannel: Buffer;
+      newChannel: Buffer;
+      oldUpgrade: Buffer;
+      newUpgrade: Buffer;
+      oldErrorReceipt: Buffer;
+      newErrorReceipt: Buffer;
+    },
+  ): UpgradeChannelStateRootResult {
+    const version = this.version;
+    const speculativeTree = this.getClonedTreeFromRoot(oldRoot);
+    const update = (path: string, oldValue: Buffer, newValue: Buffer): string[] => {
+      if (oldValue.equals(newValue)) {
+        return [];
+      }
+      const siblings = speculativeTree.getSiblings(path).map((h) => h.toString('hex'));
+      speculativeTree.set(path, newValue);
+      return siblings;
+    };
+    const channelSiblings = update(
+      `channelEnds/ports/${portId}/channels/${channelId}`,
+      values.oldChannel,
+      values.newChannel,
+    );
+    const upgradeSiblings = update(
+      `channelUpgrades/upgrades/ports/${portId}/channels/${channelId}`,
+      values.oldUpgrade,
+      values.newUpgrade,
+    );
+    const errorReceiptSiblings = update(
+      `channelUpgrades/upgradeError/ports/${portId}/channels/${channelId}`,
+      values.oldErrorReceipt,
+      values.newErrorReceipt,
+    );
+    return {
+      ...this.preparePublication(speculativeTree, version),
+      channelSiblings,
+      upgradeSiblings,
+      errorReceiptSiblings,
     };
   }
 

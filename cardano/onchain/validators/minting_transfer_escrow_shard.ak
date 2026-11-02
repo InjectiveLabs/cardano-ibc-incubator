@@ -4,9 +4,10 @@ use aiken/primitive/bytearray
 use aiken/primitive/int
 use cardano/assets.{PolicyId, quantity_of, tokens}
 use cardano/transaction.{InlineDatum, Input, NoDatum, Output, Transaction}
+use ibc/apps/transfer/shutdown as transfer_shutdown
 use ibc/apps/transfer/transfer_escrow_shard
 use ibc/apps/transfer/transfer_escrow_shard_redeemer.{
-  CreateEscrowShard, TransferEscrowShardRedeemer,
+  CreateEscrowShard, ReclaimEscrowShard, TransferEscrowShardRedeemer,
 }
 use ibc/apps/transfer/types/escrow_datum.{TransferEscrowDatum}
 use ibc/apps/transfer/types/fungible_token_packet_data.{FungibleTokenPacketData}
@@ -15,30 +16,55 @@ use ibc/apps/transfer/types/transfer_module_datum.{
 }
 use ibc/auth.{AuthToken}
 use ibc/core/ics_025_handler_interface/ibc_state_commitment
-use ibc/utils/string as string_utils
+use ibc/encoding/hex
 use ibc/utils/validator_utils
 
-validator mint_transfer_escrow_shard(transfer_port_token: AuthToken) {
+validator mint_transfer_escrow_shard(
+  transfer_port_token: AuthToken,
+  host_state_nft_policy_id: PolicyId,
+) {
   mint(
     redeemer: TransferEscrowShardRedeemer,
     transfer_escrow_shard_policy_id: PolicyId,
     transaction: Transaction,
   ) {
-    let Transaction { inputs, outputs, mint, .. } = transaction
-
-    let CreateEscrowShard { channel_id, denom, data, registry_siblings } =
-      redeemer
-    validate_create_escrow_shard(
-      inputs,
-      outputs,
-      mint,
-      transfer_escrow_shard_policy_id,
-      transfer_port_token,
-      channel_id,
-      denom,
-      data,
-      registry_siblings,
-    )
+    when redeemer is {
+      ReclaimEscrowShard { channel_id, denom, registry_siblings } -> {
+        expect [root_input] =
+          list.filter(
+            transaction.inputs,
+            fn(input) {
+              auth.contain_auth_token(input.output, transfer_port_token)
+            },
+          )
+        transfer_shutdown.reclaim_escrow(
+          transaction,
+          root_input.output_reference,
+          host_state_nft_policy_id,
+          transfer_port_token,
+          transfer_escrow_shard_policy_id,
+          channel_id,
+          denom,
+          registry_siblings,
+        )
+      }
+      CreateEscrowShard { .. } -> {
+        let Transaction { inputs, outputs, mint, .. } = transaction
+        expect CreateEscrowShard { channel_id, denom, data, registry_siblings } =
+          redeemer
+        validate_create_escrow_shard(
+          inputs,
+          outputs,
+          mint,
+          transfer_escrow_shard_policy_id,
+          transfer_port_token,
+          channel_id,
+          denom,
+          data,
+          registry_siblings,
+        )
+      }
+    }
   }
 
   else(_) {
@@ -62,7 +88,7 @@ fn validate_create_escrow_shard(
   expect fungible_token_packet_data.validate_basic(data)
 
   // Native escrow denoms are encoded Cardano token units.
-  expect Some(escrowed_token_unit) = string_utils.hex_string_to_bytes(denom)
+  expect Some(escrowed_token_unit) = hex.decode(denom)
   let (escrowed_token_policy_id, escrowed_token_name) =
     validator_utils.extract_token_unit(escrowed_token_unit)
   expect Some(transfer_amount) = int.from_utf8(data.amount)
@@ -117,7 +143,11 @@ fn validate_create_escrow_shard(
         |> dict.insert(shard_token_name, 1)
     ),
     // The datum must match the shard NFT derivation inputs.
-    datum == TransferEscrowDatum { channel_id, denom },
+    datum == TransferEscrowDatum {
+      channel_id,
+      denom,
+      escrowed_amount: transfer_amount,
+    },
     escrow_shard_value_is_canonical(
       created_output,
       transfer_escrow_shard_policy_id,
@@ -155,6 +185,7 @@ fn transfer_module_registry_transition(
       NoDatum ->
         TransferModuleDatum {
           escrow_shard_registry_root: empty_escrow_shard_registry_root,
+          outstanding_voucher_obligation: 0,
         }
       InlineDatum(raw) -> {
         expect decoded: TransferModuleDatum = raw
@@ -168,6 +199,8 @@ fn transfer_module_registry_transition(
     bytearray.length(old_datum.escrow_shard_registry_root) == ibc_state_commitment.hash_size_bytes
   expect
     bytearray.length(new_datum.escrow_shard_registry_root) == ibc_state_commitment.hash_size_bytes
+  expect
+    old_datum.outstanding_voucher_obligation == new_datum.outstanding_voucher_obligation
 
   (
     module_state_input,

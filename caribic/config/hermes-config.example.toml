@@ -64,6 +64,11 @@ id = 'cardano-devnet'
 # Gateway gRPC endpoint - this is your NestJS Gateway
 # Note: Gateway gRPC listens on port 5001; its HTTP/REST server defaults to 8000.
 gateway_url = 'http://localhost:5001'
+
+# Funded batches can await inclusion on independent channels at the same time.
+# Use 1 for serial execution. Each channel still has one batch in flight.
+packet_executor_concurrency = 4
+# Keep enough separate ADA inputs for fees and collateral. Busy inputs back off.
 # Plaintext is accepted only for localhost/loopback endpoints. Remote Gateways
 # must use an https:// URL. Public certificate authorities use native trust roots;
 # set this only when the Gateway certificate is issued by a private CA.
@@ -106,10 +111,10 @@ max_total_protocol_output_lovelace = 50000000
 max_wallet_lovelace_top_up = 5000000
 max_validity_interval_slots = 3600
 
-# Poll for a HostState heartbeat once a minute. The Gateway only builds a
-# transaction when no ordinary IBC transition has created an anchor in the
-# current Cardano epoch, so this does not produce one transaction per poll.
-# The configured Cardano key must match the HostState deployment authority.
+# Any funded Cardano signer may submit a root-preserving heartbeat.
+# Gateway waits six hours after the latest HostState transaction. The contract
+# enforces a separate six-hour heartbeat cooldown. This is the retry interval,
+# not the heartbeat cadence. Hermes also rechecks hourly for rollbacks.
 host_state_heartbeat_interval = '60s'
 
 # Cardano network ID (1 = mainnet, 0 = testnet)
@@ -139,15 +144,12 @@ max_block_time = '20000ms'
 clock_drift = '5s'
 
 # When Hermes submits a Cardano transaction via the Gateway, the Gateway reports
-# the Cardano inclusion block number. Hermes waits until the active Gateway
-# light-client mode accepts that height before continuing the handshake or relay.
-#
-# These field names are retained for configuration compatibility with the retired
-# Mithril mode. In the default stake-weighted-stability mode they control the
-# accepted-height wait. The height is a Cardano block number, not a slot number.
-mithril_certification_timeout = '30m'
-mithril_poll_interval = '5s'
-mithril_wait_log_interval = '30s'
+# the Cardano inclusion block number. Hermes waits until the Gateway accepts that
+# height before continuing the handshake or relay. The height is a Cardano block
+# number, not a slot number.
+accepted_height_timeout = '30m'
+accepted_height_poll_interval = '5s'
+accepted_height_wait_log_interval = '30s'
 
 # Trust threshold for client updates (2/3 = 0.66)
 trust_threshold = { numerator = '2', denominator = '3' }

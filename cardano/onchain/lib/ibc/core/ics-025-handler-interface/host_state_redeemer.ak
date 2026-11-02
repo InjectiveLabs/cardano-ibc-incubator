@@ -33,15 +33,6 @@ pub type HostStateRedeemer {
     // For updates that do not add a consensus state (e.g., misbehaviour), this should
     // be an empty list.
     consensus_state_siblings: List<ByteArray>,
-    // Sibling hashes for consensus state deletions.
-    //
-    // The spend_client validator may prune or expire old consensus states.
-    // Each removed consensus state is a deletion in the commitment tree.
-    //
-    // This is a list-of-lists:
-    // - outer list: one entry per removed consensus state (in input order)
-    // - inner list: the `merkle_depth_bits` sibling hashes for that key update
-    removed_consensus_state_siblings: List<List<ByteArray>>,
   }
   UpdateConnection {
     // Sibling hashes for the `connections/{id}` key update.
@@ -76,7 +67,17 @@ pub type HostStateRedeemer {
   }
   FinalizeShutdown
   // Re-create the HostState UTxO without changing the IBC commitment. This
-  // provides one proof anchor per Cardano epoch when no ordinary IBC state
+  // provides fresh proof anchors during quiet periods when no ordinary IBC state
   // transition occurs.
   Heartbeat
+  // Remove the authenticated transfer registration only while atomically
+  // reclaiming a drained transfer root. Its absence is the terminal on-chain
+  // authorization required by FinalizeShutdown.
+  AuthorizeFinalization
+  RetireState { kind: Int, token_name: ByteArray }
+  // The single backup named in the deployed HostState script may claim the
+  // deployer role. No replacement key is supplied by the transaction.
+  ClaimBackup
+  // A channel-upgrade step. Its operation validates the root transition.
+  UpgradeChannel
 }

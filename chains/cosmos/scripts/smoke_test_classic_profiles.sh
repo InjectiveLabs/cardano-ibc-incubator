@@ -117,14 +117,15 @@ test_profile() {
   jq -e '
     (.allowed_clients | index("07-tendermint")) != null
       and (.allowed_clients | index("08-cardano-probabilistic")) != null
+      and (.allowed_clients | index("09-localhost")) != null
   ' >/dev/null <<<"$client_params"
 
   local consensus_params
   consensus_params="$(curl --max-time 5 -fsS \
     "http://127.0.0.1:${rpc_port}/consensus_params")"
   jq -e '
-    .result.consensus_params.block.max_bytes == "4194304"
-      and .result.consensus_params.block.max_gas == "150000000"
+    .result.consensus_params.block.max_bytes == "16777216"
+      and .result.consensus_params.block.max_gas == "600000000"
       and .result.consensus_params.evidence.max_age_num_blocks == "100000"
       and .result.consensus_params.evidence.max_age_duration == "172800000000000"
       and .result.consensus_params.evidence.max_bytes == "1048576"
@@ -146,8 +147,8 @@ test_profile() {
   generated_config="$(docker compose -p "$project_name" -f "$compose_file" \
     --profile "$profile" exec -T "$profile" \
     cat /var/lib/simd/config/config.toml)"
-  grep -q '^max_tx_bytes = 1048576$' <<<"$generated_config"
-  grep -q '^max_body_bytes = 4000000$' <<<"$generated_config"
+  grep -q '^max_tx_bytes = 12582912$' <<<"$generated_config"
+  grep -q '^max_body_bytes = 20000000$' <<<"$generated_config"
 
   local governance_params
   governance_params="$(docker compose -p "$project_name" -f "$compose_file" \

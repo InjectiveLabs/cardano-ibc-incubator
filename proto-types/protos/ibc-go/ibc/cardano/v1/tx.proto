@@ -10,14 +10,20 @@ option go_package = "github.com/cosmos/ibc-go/v7/modules/cardano/types";
 // CardanoMsg defines the Cardano-specific transaction submission service.
 // This service is used by the Hermes relayer to submit signed Cardano transactions.
 service CardanoMsg {
+  // Initializes channel lanes or builds the next bounded batch from included intents.
+  rpc BuildPacketBatch(BuildPacketBatchRequest) returns (BuildPacketBatchResponse);
+
+  // Reclaims or redistributes bounded accounting capacity across two packet lanes.
+  rpc CompactPacketBalances(CompactPacketBalancesRequest) returns (MsgPrunePacketHistoryResponse);
+
   // BuildHostStateHeartbeat builds a HostState-only transaction when the
   // current Cardano epoch does not yet contain a HostState anchor.
   rpc BuildHostStateHeartbeat(BuildHostStateHeartbeatRequest) returns (BuildHostStateHeartbeatResponse);
 
-  // PrunePacketHistory builds a Cardano transaction which removes finalized
-  // destination packet history: the receipt and acknowledgement on unordered
-  // channels, or only the acknowledgement on ordered channels. Safety is
-  // authorized by a counterparty proof that the source commitment is absent.
+  // PrunePacketHistory removes finalized history from legacy inline channels.
+  // ICS-20 packet lanes retain history permanently and transfer-port requests
+  // are rejected. A counterparty commitment-absence proof authorizes legacy
+  // receipt and acknowledgement removal.
   rpc PrunePacketHistory(MsgPrunePacketHistory) returns (MsgPrunePacketHistoryResponse);
 
   // SubmitSignedTx submits a signed Cardano transaction.
@@ -35,8 +41,8 @@ message BuildHostStateHeartbeatRequest {
 }
 
 message BuildHostStateHeartbeatResponse {
-  // False when an ordinary IBC transaction or heartbeat has already refreshed
-  // HostState in the current epoch.
+  // False before the epoch midpoint or when HostState was already refreshed
+  // in the current epoch.
   bool heartbeat_required = 1;
 
   uint64 current_epoch = 2;
@@ -45,6 +51,8 @@ message BuildHostStateHeartbeatResponse {
   // Present only when heartbeat_required is true. The value contains the
   // unsigned Cardano transaction CBOR encoded as UTF-8 hex.
   google.protobuf.Any unsigned_tx = 4;
+  // Suggested delay until the next check. Hermes retries failed attempts sooner.
+  uint64 next_check_delay_ms = 5;
 }
 
 message MsgPrunePacketHistory {
@@ -75,6 +83,24 @@ message SubmitSignedTxRequest {
   
   // Optional description for logging/debugging.
   string description = 2;
+
+}
+
+// TendermintUpdateTxChain carries one dependency-ordered transaction phase.
+// A phase contains tree-neutral session transactions or one final client and
+// HostState update.
+message TendermintUpdateTxChain {
+  // Envelope version. The only currently supported value is 1.
+  uint32 version = 1;
+
+  // Unsigned Cardano transaction bodies, CBOR-encoded as UTF-8 hex, in
+  // dependency order. The protocol limit is 100 entries.
+  repeated string unsigned_tx_cbor = 2;
+
+  // True when the last tree-neutral transaction is a confirmed phase boundary.
+  // Hermes must rebuild and continue the original MsgUpdateClient after either
+  // verification reaches a Complete session or session cleanup finishes.
+  bool rebuild_after_submission = 3;
 }
 
 // SubmitSignedTxResponse contains the result of submitting a signed transaction.
@@ -94,6 +120,10 @@ message SubmitSignedTxResponse {
 message ObserveTxRequest {
   // Blake2b-256 hash of the Cardano transaction body, encoded as 64 hex digits.
   string tx_hash = 1;
+
+  // Allows observation of a confirmed transaction that intentionally has no
+  // HostState update, such as a first-seen voucher trace-registration prelude.
+  bool allow_untracked = 2;
 }
 
 // ObserveTxResponse contains the confirmed inclusion height and IBC events.
@@ -118,4 +148,30 @@ message Event {
 message EventAttribute {
   string key = 1;
   string value = 2;
+}
+
+message BuildPacketBatchRequest {
+  string signer = 1;
+  string port_id = 2;
+  string channel_id = 3;
+  string intent_tx_hash = 4;
+  // Already available successful acknowledgements. Empty selects funded sends.
+  repeated bytes acknowledgements = 5;
+}
+message BuildPacketBatchResponse {
+  string stage = 1;
+  google.protobuf.Any unsigned_tx = 2;
+  repeated string intent_tx_hashes = 3;
+  string included_tx_hash = 4;
+}
+
+message CompactPacketBalancesRequest {
+  string signer = 1;
+  string port_id = 2;
+  string channel_id = 3;
+  uint32 left_lane = 4;
+  uint32 right_lane = 5;
+  // Optional full denominations to retain on the left. Other keys move right.
+  // When empty, the builder divides the net balances in canonical key order.
+  repeated string left_denoms = 6;
 }

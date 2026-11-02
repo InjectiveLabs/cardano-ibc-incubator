@@ -1,0 +1,1781 @@
+import { assert, assertEquals, assertRejects } from "@std/assert";
+import {
+  applyDoubleCborEncoding,
+  CML,
+  Constr,
+  Data,
+  fromText,
+  getAddressDetails,
+  Lucid,
+  type Script,
+  type TxSignBuilder,
+  type UTxO,
+  utxoToCore,
+  validatorToRewardAddress,
+  walletFromSeed,
+} from "@lucid-evolution/lucid";
+import {
+  Emulator,
+  generateEmulatorAccount,
+  generateEmulatorAccountFromPrivateKey,
+} from "@lucid-evolution/provider";
+import { withClientRecoveryApproval } from "../../../packages/cardano-ibc-tx-builder-runtime/src/migrationRuntime.ts";
+import { DeploymentIbcTree } from "../src/deployment.ts";
+import { generateTokenName, readValidator } from "../src/utils.ts";
+import {
+  DEPLOYMENT_PLAN_FIXTURE,
+  loadDeploymentPlan,
+  loadStagedTendermintValidators,
+} from "../src/deployment-plan.ts";
+import { submitHistorySession } from "./consensus-history-staged-fixture.ts";
+import {
+  bech32Address,
+  Registry,
+  RegistryRedeemer,
+} from "../types/plutus/Migration.ts";
+import {
+  buildMigrationTransaction,
+  readRegistry,
+} from "../src/migration-transactions.ts";
+import { HostStateDatum, HostStateRedeemer } from "../types/index.ts";
+import {
+  ConsensusHistoryRecovery,
+  type HistorySource,
+  type HistoryTransaction,
+} from "../src/consensus_history_recovery.ts";
+import { historyPacketFixture } from "./consensus-history-packet-fixture.ts";
+import { serialisePlutusData } from "../src/plutus_serialise.ts";
+import { createCardanoScalusEvaluator } from "../src/scalus-evaluator.ts";
+import {
+  consensusHistoryKey,
+  encodeConsensusHistoryRecord,
+  recordFromConstr,
+} from "../src/consensus_history_commitment.ts";
+import adjacentFixture from "./fixtures/tendermint-adjacent.json" with {
+  type: "json",
+};
+
+import parameters from "./fixtures/mainnet-protocol-parameters.json" with {
+  type: "json",
+};
+
+const MAX_BYTES = parameters.maxTxSize;
+const MAX_MEMORY = BigInt(parameters.maxTxExMem);
+const MAX_STEPS = BigInt(parameters.maxTxExSteps);
+const MAX_STAGED_REFERENCE_BYTES = 61_500;
+const HOST_POLICY = "11".repeat(28);
+const HOST_NAME = fromText("ibc_host_state");
+const TRUSTING_PERIOD = 120_000_000_000n;
+const adjacentRedeemer = Data.from(
+  adjacentFixture.spend_client_redeemer_cbor,
+) as Constr<Data>;
+const adjacentHeader =
+  ((adjacentRedeemer.fields[0] as Constr<Data>).fields[0]) as Constr<Data>;
+const adjacentTmHeader =
+  ((adjacentHeader.fields[0] as Constr<Data>).fields[0]) as Constr<Data>;
+const proofSpecs = [[33n, 4n, 12n], [32n, 1n, 1n]].map(([size, min, max]) =>
+  new Constr(0, [
+    new Constr(0, [1n, 0n, 1n, 1n, "00"]),
+    new Constr(0, [[0n, 1n], size, min, max, "", 1n]),
+    0n,
+    0n,
+    new Constr(0, []),
+  ])
+);
+const consensus = (time: bigint) =>
+  new Constr(0, [time, "22".repeat(32), new Constr(0, ["33".repeat(32)])]);
+
+async function fixture(
+  historyCount: number,
+  recovery = false,
+  unexpired = false,
+  normalUpdate = false,
+  createClient = false,
+  canonicalEncoding = true,
+  packetRecovery = false,
+  outputCanonicalEncoding = canonicalEncoding,
+  captureSignerFixture?: (value: Record<string, unknown>) => void,
+  initialConsensusBytes?: { root: string; nextValidatorsHash: string },
+  stagedMode?: "adjacent" | "non-adjacent",
+  governedRecovery = false,
+) {
+  const trustingPeriod = governedRecovery
+    ? 7n * 86_400_000_000_000n
+    : stagedMode
+    ? 600_000_000_000n
+    : TRUSTING_PERIOD;
+  const encodeStored = (value: Data) =>
+    Data.to<Data>(value, undefined, { canonical: canonicalEncoding });
+  const encodePublic = (value: Data) =>
+    serialisePlutusData(encodeStored(value));
+  const encodeOutput = (value: Data) =>
+    Data.to<Data>(value, undefined, { canonical: outputCanonicalEncoding });
+  const account = captureSignerFixture
+    ? generateEmulatorAccountFromPrivateKey({ lovelace: 1_000_000_000n })
+    : generateEmulatorAccount({ lovelace: 1_000_000_000n });
+  const governors = governedRecovery
+    ? [
+      generateEmulatorAccount({ lovelace: 1_000_000_000n }),
+      generateEmulatorAccount({ lovelace: 1_000_000_000n }),
+    ]
+    : [];
+  const executor = governedRecovery
+    ? generateEmulatorAccount({ lovelace: 1_000_000_000n })
+    : account;
+  const emulator = new Emulator([
+    account,
+    ...governors,
+    ...(governedRecovery ? [executor] : []),
+  ]);
+  if (normalUpdate) {
+    emulator.time = adjacentFixture.recommended_emulator_time_ms;
+  }
+  const consensusKey = (n: bigint, revision = normalUpdate ? 1n : 0n) =>
+    `clients/07-tendermint-0/consensusStates/${revision}-${n}`;
+  const height = (n: bigint) => new Constr(0, [normalUpdate ? 1n : 0n, n]);
+  Object.assign(emulator.protocolParameters, {
+    maxTxSize: MAX_BYTES,
+    maxTxExMem: MAX_MEMORY,
+    maxTxExSteps: MAX_STEPS,
+    coinsPerUtxoByte: BigInt(parameters.coinsPerUtxoByte),
+    minFeeA: parameters.minFeeA,
+    minFeeB: parameters.minFeeB,
+    priceMem: parameters.priceMem,
+    priceStep: parameters.priceStep,
+    minFeeRefScriptCostPerByte: parameters.minFeeRefScriptCostPerByte,
+  });
+  emulator.protocolParameters.costModels.PlutusV3 =
+    parameters.plutusV3CostModel;
+  const lucid = await Lucid(emulator, "Preprod", {
+    evaluator: createCardanoScalusEvaluator(),
+  });
+  if (captureSignerFixture) {
+    lucid.selectWallet.fromPrivateKey(account.privateKey);
+  } else lucid.selectWallet.fromSeed(account.seedPhrase);
+  const governorKeys = governors.map((entry) =>
+    getAddressDetails(entry.address).paymentCredential!.hash
+  );
+  const governedPlan = governedRecovery
+    ? await loadDeploymentPlan(lucid, {
+      ...DEPLOYMENT_PLAN_FIXTURE,
+      deployerPaymentKeyHash:
+        getAddressDetails(account.address).paymentCredential!.hash,
+      benchmarkVoucherEnabled: false,
+      migration: {
+        registryNonce: { transaction_id: "99".repeat(32), output_index: 0n },
+        governance: {
+          signers: governorKeys,
+          quorum: 2n,
+          delay_ms: 86_400_000n,
+        },
+        emergency: { signers: ["ee".repeat(28)], quorum: 1n },
+      },
+    })
+    : undefined;
+  const hostPolicy = governedPlan?.hostNft.hash ?? HOST_POLICY;
+
+  const dummy = "44".repeat(28);
+  const applyBytes = (title: string, params: string[]) =>
+    readValidator(
+      title,
+      lucid,
+      params,
+      Data.Tuple(params.map(() => Data.Bytes())) as unknown as string[],
+    );
+  const [recoveryScript, recoveryHash] = governedPlan
+    ? [governedPlan.recoverClient.script, governedPlan.recoverClient.hash]
+    : applyBytes(
+      "recover_client.recover_client.withdraw",
+      [hostPolicy, "00".repeat(28)],
+    );
+  const staged = stagedMode || governedRecovery
+    ? loadStagedTendermintValidators(lucid, hostPolicy, recoveryHash)
+    : undefined;
+  const [clientScript, clientHash, clientAddress] = governedPlan
+    ? [
+      governedPlan.spendClient.script,
+      governedPlan.spendClient.hash,
+      governedPlan.spendClient.address,
+    ]
+    : staged
+    ? [
+      staged.clientSpend.validator,
+      staged.clientSpend.scriptHash,
+      staged.clientSpend.address,
+    ]
+    : readValidator(
+      "spending_client.spend_client.spend",
+      lucid,
+      [hostPolicy, new Constr(1, [recoveryHash])],
+    );
+  const [clientPolicy, clientPolicyId] = governedPlan
+    ? [governedPlan.mintClient.script, governedPlan.mintClient.hash]
+    : applyBytes(
+      "minting_client_stt.mint_client_stt.mint",
+      [clientHash, hostPolicy],
+    );
+  const packet = packetRecovery
+    ? await historyPacketFixture(lucid, hostPolicy, HOST_NAME, clientPolicyId)
+    : undefined;
+  const [hostScript, hostHash, hostAddress] = governedPlan
+    ? [
+      governedPlan.hostState.script,
+      governedPlan.hostState.hash,
+      governedPlan.hostState.address,
+    ]
+    : applyBytes(
+      "host_state_stt.host_state_stt.spend",
+      [
+        hostPolicy,
+        clientHash,
+        dummy,
+        packet?.channelHash ?? dummy,
+        clientPolicyId,
+        packet?.connectionPolicy ?? dummy,
+        packet?.channelPolicy ?? dummy,
+        "",
+      ],
+    );
+  const rewardAddress = validatorToRewardAddress("Preprod", recoveryScript);
+  const updateRewardAddress = staged
+    ? validatorToRewardAddress("Preprod", staged.updateClient.validator)
+    : rewardAddress;
+  if (recovery || normalUpdate) {
+    const registration = await lucid.newTx().register.Stake(rewardAddress)
+      .complete();
+    await (await registration.sign.withWallet().complete()).submit();
+    emulator.awaitBlock();
+  }
+  const clientName = await generateTokenName(
+    { policy_id: hostPolicy, name: HOST_NAME },
+    fromText("ibc_client"),
+    0n,
+  );
+  const clientToken = new Constr(0, [clientPolicyId, clientName]);
+  if (staged && (recovery || normalUpdate)) {
+    const registration = await lucid.newTx().register.Stake(updateRewardAddress)
+      .complete();
+    await registration.sign.withWallet().complete().then((tx) => tx.submit());
+    emulator.awaitBlock();
+  }
+  const latestHeight = normalUpdate && historyCount === 0
+    ? stagedMode === "non-adjacent" ? 1n : 2n
+    : BigInt(historyCount + 1);
+  const now = emulator.now();
+  const nowNs = BigInt(now) * 1_000_000n;
+  const initialProcessedTime = createClient ? nowNs + 30_000_000_000n : nowNs;
+  const initialProcessedHeight = createClient
+    ? initialProcessedTime / 4_000_000_000n
+    : 1n;
+  const oldConsensus = consensus(
+    nowNs - (unexpired ? trustingPeriod / 2n : 2n * trustingPeriod),
+  );
+  const latestConsensus = normalUpdate
+    ? new Constr(0, [
+      BigInt(adjacentFixture.trusted_timestamp_override_ns),
+      adjacentTmHeader.fields[7],
+      new Constr(0, [packet?.root ?? "33".repeat(32)]),
+    ])
+    : recovery
+    ? oldConsensus
+    : consensus(nowNs - 1_000_000_000n);
+  if (initialConsensusBytes) {
+    latestConsensus.fields[1] = initialConsensusBytes.nextValidatorsHash;
+    latestConsensus.fields[2] = new Constr(0, [initialConsensusBytes.root]);
+  }
+  const clientState = new Constr(0, [
+    fromText(normalUpdate ? "testchain2-1" : "chain-0"),
+    new Constr(0, [1n, 3n]),
+    trustingPeriod,
+    2n * trustingPeriod,
+    1_000_000_000n,
+    governedRecovery ? height(1n) : new Constr(0, [0n, 0n]),
+    height(latestHeight),
+    proofSpecs,
+    [],
+  ]);
+  const clientDatum = new Constr<Data>(0, [
+    new Constr(0, [
+      clientState,
+      new Map([[height(latestHeight), latestConsensus]]),
+      new Map([[height(latestHeight), initialProcessedTime]]),
+      new Map([[height(latestHeight), initialProcessedHeight]]),
+    ]),
+    clientToken,
+  ]);
+  let nextRef = 1;
+  function seed(
+    address: string,
+    assets: Record<string, bigint>,
+    datum?: string,
+    scriptRef?: Script,
+  ): UTxO {
+    const utxo: UTxO = {
+      txHash: (nextRef++).toString(16).padStart(64, "0"),
+      outputIndex: 0,
+      address,
+      assets: {
+        lovelace: captureSignerFixture ? 5_000_000n : 30_000_000n,
+        ...assets,
+      },
+      datum,
+      scriptRef: scriptRef
+        ? { ...scriptRef, script: applyDoubleCborEncoding(scriptRef.script) }
+        : undefined,
+    };
+    emulator.ledger[utxo.txHash + utxo.outputIndex] = { utxo, spent: false };
+    return utxo;
+  }
+  let client = seed(
+    clientAddress,
+    { [clientPolicyId + clientName]: 1n },
+    encodeStored(clientDatum),
+  );
+  const governedRegistry = governedPlan
+    ? seed(governedPlan.implementationRegistry!.address, {
+      [
+        governedPlan.registry!.token.policy_id +
+        governedPlan.registry!.token.name
+      ]: 1n,
+    }, Data.to(governedPlan.registry!, Registry))
+    : undefined;
+  const registryReference = governedPlan
+    ? seed(
+      bech32Address(
+        "Preprod",
+        governedPlan.registry!.identity.reference_holder,
+      ),
+      {},
+      Data.void(),
+      governedPlan.implementationRegistry!.script,
+    )
+    : undefined;
+  if (governedPlan) {
+    // Existing bridge state is seeded. Approval and recovery execute real scripts.
+    seed(
+      bech32Address(
+        "Preprod",
+        governedPlan.registry!.identity.reference_holder,
+      ),
+      {},
+      Data.void(),
+      governedPlan.governanceAuthority!.script,
+    );
+    const registered = await lucid.newTx().register.Stake(
+      validatorToRewardAddress(
+        "Preprod",
+        governedPlan.governanceAuthority!.script,
+      ),
+    ).complete();
+    await (await registered.sign.withWallet().complete()).submit();
+    emulator.awaitBlock();
+    lucid.clearUTxOOverride();
+  }
+  const references = [hostScript, clientPolicy, recoveryScript].map((script) =>
+    seed(account.address, {}, Data.void(), script)
+  );
+  const updateReference = staged
+    ? seed(account.address, {}, Data.void(), staged.updateClient.validator)
+    : references[2];
+  const sessionReferences = staged
+    ? [staged.sessionMint.validator, staged.sessionSpend.validator].map((
+      script,
+    ) => seed(account.address, {}, Data.void(), script))
+    : [];
+  function signerEvidence(
+    name: "update" | "recovery",
+    completed: TxSignBuilder,
+    clientReference: UTxO,
+  ) {
+    if (!captureSignerFixture) return undefined;
+    const outRef = (utxo: UTxO) => ({
+      tx_hash: utxo.txHash,
+      output_index: utxo.outputIndex,
+    });
+    const resolve = (inputs: CML.TransactionInputList | undefined) => {
+      const result = [];
+      for (let index = 0; index < (inputs?.len() ?? 0); index++) {
+        const input = inputs!.get(index);
+        const txHash = input.transaction_id().to_hex();
+        const outputIndex = Number(input.index());
+        // Trusted test-chain state, never values supplied by the candidate.
+        const entry = emulator.ledger[txHash + outputIndex];
+        assert(entry && !entry.spent);
+        const utxo = entry.utxo;
+        result.push({
+          ...outRef(utxo),
+          address: CML.Address.from_bech32(utxo.address).to_hex(),
+          lovelace: utxo.assets.lovelace.toString(),
+          assets: Object.entries(utxo.assets).filter(([unit]) =>
+            unit !== "lovelace"
+          ).map(([unit, quantity]) => ({
+            policy_id: unit.slice(0, 56),
+            asset_name: unit.slice(56),
+            quantity: quantity.toString(),
+          })),
+        });
+      }
+      return result;
+    };
+    const body = completed.toTransaction().body();
+    const regular = resolve(body.inputs());
+    const collateral = resolve(body.collateral_inputs());
+    const regularRefs = new Set(
+      regular.map((input) => `${input.tx_hash}#${input.output_index}`),
+    );
+    // Keep these fixtures exercising Lucid's natural selection. CIP-40 allows
+    // an input to fund the successful transaction and also provide collateral.
+    assert(
+      collateral.some((input) =>
+        regularRefs.has(`${input.tx_hash}#${input.output_index}`)
+      ),
+    );
+    return {
+      name,
+      unsigned_tx_cbor: completed.toCBOR(),
+      signer_address: account.address,
+      operation: `/ibc.core.client.v1.Msg${
+        name === "update" ? "Update" : "Recover"
+      }Client`,
+      client_id: "07-tendermint-0",
+      ...(name === "recovery"
+        ? { substitute_client_id: "07-tendermint-1" }
+        : {}),
+      manifest: {
+        consensus_history_format: "proof-backed-v1",
+        validators: {
+          host_state_stt: {
+            address: hostAddress,
+            script_hash: hostHash,
+            ref_utxo: outRef(references[0]),
+          },
+          spend_client: {
+            address: clientAddress,
+            script_hash: clientHash,
+            ref_utxo: outRef(clientReference),
+          },
+          recover_client: {
+            script_hash: recoveryHash,
+            ref_utxo: outRef(references[2]),
+          },
+          mint_client_stt: {
+            script_hash: clientPolicyId,
+            ref_utxo: outRef(references[1]),
+          },
+        },
+        host_state_nft: { policy_id: hostPolicy, token_name: HOST_NAME },
+      },
+      resolved_inputs: {
+        regular,
+        collateral,
+        reference: resolve(body.reference_inputs()),
+      },
+    };
+  }
+  let tree = new DeploymentIbcTree();
+  tree.set("clients/07-tendermint-0/clientState", encodePublic(clientState));
+  tree.set(consensusKey(latestHeight), encodePublic(latestConsensus));
+  let historyTree = new DeploymentIbcTree();
+  const histories: Constr<Data>[] = [];
+  for (let n = 1n; n <= BigInt(historyCount); n++) {
+    const historicalConsensus = normalUpdate && n === 2n
+      ? latestConsensus
+      : oldConsensus;
+    const record = new Constr(0, [
+      clientToken,
+      height(n),
+      historicalConsensus,
+      historicalConsensus.fields[0],
+      n,
+    ]);
+    const parsed = recordFromConstr(record);
+    historyTree.set(
+      consensusHistoryKey(parsed.clientToken, parsed.height),
+      encodeConsensusHistoryRecord(parsed),
+    );
+    histories.push(record);
+    tree.set(consensusKey(n), encodePublic(historicalConsensus));
+  }
+  clientDatum.fields.push(await historyTree.getRoot());
+  client.datum = encodeStored(clientDatum);
+  packet?.seed(seed, account.address);
+  packet?.publicLeaves(tree);
+  const transactions: HistoryTransaction[] = [];
+  const retain = (txHash: string, cbor: string) =>
+    transactions.push({
+      txHash,
+      cbor,
+      blockHash: emulator.blockHeight.toString(16).padStart(64, "0"),
+      blockHeight: emulator.blockHeight,
+      slot: emulator.slot,
+      transactionIndex: 0,
+    });
+  let bootstrap = { txHash: client.txHash, outputIndex: client.outputIndex };
+  const signer = getAddressDetails(account.address).paymentCredential!.hash;
+  let hostDatum: HostStateDatum = {
+    state: {
+      version: 0n,
+      ibc_state_root: await tree.getRoot(),
+      next_client_sequence: 1n,
+      next_connection_sequence: 0n,
+      next_channel_sequence: 0n,
+      bound_port: [],
+      last_update_time: BigInt(now),
+    },
+    nft_policy: hostPolicy,
+    deployer: signer,
+    control: {
+      port_registry: new Map(),
+      shutdown: "Active",
+      live_clients: createClient ? 0n : 1n,
+      live_connections: 0n,
+      live_channels: 0n,
+      last_heartbeat_time: 0n,
+    },
+  };
+  let host = seed(
+    hostAddress,
+    { [hostPolicy + HOST_NAME]: 1n },
+    Data.to(hostDatum, HostStateDatum, { canonical: true }),
+  );
+
+  if (createClient) {
+    assertEquals(historyCount, 0);
+    // Only the HostState NFT is seeded. The deployed client policy creates the
+    // client NFT and the HostState script publishes its first public leaves.
+    delete emulator.ledger[client.txHash + client.outputIndex];
+    const initialTree = new DeploymentIbcTree();
+    packet?.publicLeaves(initialTree);
+    const initialRoot = await initialTree.getRoot();
+    const clientSiblings = await initialTree.getSiblings(
+      "clients/07-tendermint-0/clientState",
+    );
+    initialTree.set(
+      "clients/07-tendermint-0/clientState",
+      encodePublic(clientState),
+    );
+    const consensusSiblings = await initialTree.getSiblings(
+      consensusKey(latestHeight),
+    );
+    host.datum = Data.to(
+      {
+        ...hostDatum,
+        state: {
+          ...hostDatum.state,
+          next_client_sequence: 0n,
+          ibc_state_root: initialRoot,
+        },
+      },
+      HostStateDatum,
+      { canonical: true },
+    );
+    hostDatum = {
+      ...hostDatum,
+      state: { ...hostDatum.state, version: 1n },
+      control: { ...hostDatum.control, live_clients: 1n },
+    };
+    const created = await lucid.newTx().readFrom([references[0], references[1]])
+      .collectFrom(
+        [host],
+        Data.to(
+          {
+            CreateClient: {
+              client_state_siblings: clientSiblings,
+              consensus_state_siblings: consensusSiblings,
+            },
+          },
+          HostStateRedeemer,
+          { canonical: true },
+        ),
+      )
+      .mintAssets(
+        { [clientPolicyId + clientName]: 1n },
+        encodeStored(new Constr(0, [])),
+      )
+      .pay.ToContract(clientAddress, {
+        kind: "inline",
+        value: encodeStored(clientDatum),
+      }, { [clientPolicyId + clientName]: 1n, lovelace: 30_000_000n })
+      .pay.ToContract(hostAddress, {
+        kind: "inline",
+        value: Data.to(hostDatum, HostStateDatum, { canonical: true }),
+      }, host.assets)
+      .validFrom(now).validTo(now + 30_000).complete({ localUPLCEval: true });
+    const signed = await created.sign.withWallet().complete();
+    assert(signed.toCBOR().length / 2 <= MAX_BYTES - 750);
+    assertEquals(await signed.submit(), signed.toHash());
+    emulator.awaitBlock();
+    client = await lucid.utxoByUnit(clientPolicyId + clientName);
+    host = await lucid.utxoByUnit(hostPolicy + HOST_NAME);
+    bootstrap = { txHash: client.txHash, outputIndex: client.outputIndex };
+    retain(signed.toHash(), signed.toCBOR());
+  }
+
+  async function recover(
+    mutation?: "missing-history" | "changed-metadata" | "wrong-root",
+    preserveReserve = false,
+  ) {
+    // Main preserves the complete state inventory across a client transition.
+    if (preserveReserve) {
+      client.assets["55".repeat(28) + fromText("reserve")] = 7n;
+    }
+    const substituteHeight = latestHeight + 1n;
+    const substituteName = await generateTokenName(
+      { policy_id: hostPolicy, name: HOST_NAME },
+      fromText("ibc_client"),
+      1n,
+    );
+    const substituteToken = new Constr(0, [clientPolicyId, substituteName]);
+    const substituteState = new Constr(0, [
+      ...clientState.fields.slice(0, 5),
+      new Constr(0, [0n, 0n]),
+      height(substituteHeight),
+      proofSpecs,
+      [],
+    ]);
+    const substituteConsensus = consensus(nowNs - 1_000_000_000n);
+    const nextClientState = new Constr(0, [
+      substituteState,
+      new Map([[height(substituteHeight), substituteConsensus]]),
+      new Map([[height(substituteHeight), nowNs]]),
+      new Map([[height(substituteHeight), 1n]]),
+    ]);
+    const substitute = seed(
+      clientAddress,
+      {
+        [clientPolicyId + substituteName]: 1n,
+      },
+      encodeStored(
+        new Constr(0, [nextClientState, substituteToken, "00".repeat(32)]),
+      ),
+    );
+    tree.set(
+      "clients/07-tendermint-1/clientState",
+      encodePublic(substituteState),
+    );
+    tree.set(
+      `clients/07-tendermint-1/consensusStates/0-${substituteHeight}`,
+      encodePublic(substituteConsensus),
+    );
+    hostDatum = {
+      ...hostDatum,
+      state: {
+        ...hostDatum.state,
+        next_client_sequence: 2n,
+        ibc_state_root: await tree.getRoot(),
+      },
+    };
+    host.datum = Data.to(hostDatum, HostStateDatum, { canonical: true });
+    const clientSiblings = await tree.getSiblings(
+      "clients/07-tendermint-0/clientState",
+    );
+    tree.set(
+      "clients/07-tendermint-0/clientState",
+      encodePublic(substituteState),
+    );
+    const consensusSiblings = await tree.getSiblings(
+      consensusKey(substituteHeight),
+    );
+    tree.set(consensusKey(substituteHeight), encodePublic(substituteConsensus));
+    const nextHost = {
+      ...hostDatum,
+      state: {
+        ...hostDatum.state,
+        version: hostDatum.state.version + 1n,
+        ibc_state_root: mutation === "wrong-root"
+          ? hostDatum.state.ibc_state_root
+          : await tree.getRoot(),
+      },
+    };
+    const archived = new Constr(0, [
+      clientToken,
+      height(latestHeight),
+      latestConsensus,
+      initialProcessedTime + (mutation === "changed-metadata" ? 1n : 0n),
+      initialProcessedHeight,
+    ]);
+    const archivedRecord = recordFromConstr(archived);
+    const archivedKey = consensusHistoryKey(
+      archivedRecord.clientToken,
+      archivedRecord.height,
+    );
+    const historySiblings = await historyTree.getSiblings(archivedKey);
+    historyTree.set(archivedKey, encodeConsensusHistoryRecord(archivedRecord));
+    const nextHistoryRoot = await historyTree.getRoot();
+    const recoveryReferences = [clientScript].map((script) =>
+      seed(account.address, {}, Data.void(), script)
+    );
+    const recoveryBuilder = (
+      requiredSigner = governedRecovery
+        ? getAddressDetails(executor.address).paymentCredential!.hash
+        : signer,
+    ) =>
+      lucid.newTx().readFrom([
+        substitute,
+        references[0],
+        references[2],
+        ...recoveryReferences,
+      ])
+        .collectFrom(
+          [host],
+          Data.to(
+            {
+              UpdateClient: {
+                client_state_siblings: clientSiblings,
+                consensus_state_siblings: consensusSiblings,
+              },
+            },
+            HostStateRedeemer,
+            { canonical: true },
+          ),
+        )
+        .collectFrom(
+          [client],
+          encodeStored(
+            new Constr(staged ? 2 : 1, [substituteToken, historySiblings]),
+          ),
+        )
+        .withdraw(
+          rewardAddress,
+          0n,
+          encodeStored(new Constr(0, [clientToken, substituteToken])),
+        )
+        .pay.ToContract(clientAddress, {
+          kind: "inline",
+          value: encodeOutput(
+            new Constr(0, [
+              nextClientState,
+              clientToken,
+              mutation === "missing-history"
+                ? clientDatum.fields[2]
+                : nextHistoryRoot,
+            ]),
+          ),
+        }, client.assets)
+        .pay.ToContract(hostAddress, {
+          kind: "inline",
+          value: Data.to(nextHost, HostStateDatum, { canonical: true }),
+        }, host.assets)
+        .validFrom(governedRecovery ? emulator.now() : now).validTo(
+          (governedRecovery ? emulator.now() : now) + 30_000,
+        )
+        .addSignerKey(requiredSigner);
+
+    const attachApproval = (registry: UTxO, requiredSigner?: string) =>
+      recoveryBuilder(requiredSigner).readFrom([registryReference!])
+        .collectFrom(
+          [registry],
+          Data.to("ExecuteClientRecovery", RegistryRedeemer),
+        )
+        .pay.ToContract(registry.address, {
+          kind: "inline",
+          value: Data.to({
+            ...readRegistry(
+              registry,
+              governedPlan!.registry!.token.policy_id +
+                governedPlan!.registry!.token.name,
+            ),
+            phase: "Ready",
+          }, Registry),
+        }, registry.assets);
+    let builder = recoveryBuilder();
+    if (governedPlan) {
+      const registryUnit = governedPlan.registry!.token.policy_id +
+        governedPlan.registry!.token.name;
+      const proposal: RegistryRedeemer = {
+        Propose: {
+          proposal: {
+            RecoverClient: {
+              nonce: 1n,
+              source_generation: 1n,
+              subject_token: { policy_id: clientPolicyId, name: clientName },
+              substitute_token: {
+                policy_id: clientPolicyId,
+                name: substituteName,
+              },
+            },
+          },
+          expires_at: BigInt(emulator.now() + 3 * 86_400_000),
+        },
+      };
+      // The outgoing deployer cannot execute recovery without quorum approval.
+      await assertRejects(() =>
+        attachApproval(governedRegistry!, signer).complete({
+          localUPLCEval: true,
+        })
+      );
+      lucid.selectWallet.fromSeed(governors[0].seedPhrase);
+      lucid.clearUTxOOverride();
+      const approval = await buildMigrationTransaction(lucid, registryUnit, {
+        registry: governedRegistry!,
+        registryReference: registryReference!,
+        signers: governorKeys,
+        validFrom: emulator.now(),
+        validTo: emulator.now() + 30_000,
+      }, proposal);
+      const approved =
+        await (await approval.tx.complete({ localUPLCEval: true })).sign
+          .withWallet()
+          .sign.withPrivateKey(
+            walletFromSeed(governors[1].seedPhrase, { network: "Preprod" })
+              .paymentKey,
+          ).complete();
+      await approved.submit();
+      emulator.awaitBlock();
+      lucid.selectWallet.fromSeed(executor.seedPhrase);
+      lucid.clearUTxOOverride();
+      const registry = await lucid.utxoByUnit(registryUnit);
+      await assertRejects(() =>
+        attachApproval(registry).complete({ localUPLCEval: true })
+      );
+      emulator.awaitSlot(86_432);
+      builder = await withClientRecoveryApproval(
+        lucid,
+        recoveryBuilder(),
+        {
+          deploymentMode: "upgradeable",
+          hostStateNFT: { policyId: hostPolicy, name: HOST_NAME },
+          migration: {
+            profile: "cardano-ibc-compatible-v5",
+            registryUnit,
+            registryAddress: governedPlan.implementationRegistry!.address,
+            generation: "1",
+            compatibility: governedPlan.registry!.current.compatibility,
+            originalAddresses: governedPlan.registry!.current.addresses.map((
+              address,
+            ) => bech32Address("Preprod", address)),
+          },
+          validators: {
+            hostStateStt: { address: hostAddress },
+            spendClient: { address: clientAddress },
+            spendConnection: { address: governedPlan.spendConnection.address },
+            spendChannel: {
+              address: governedPlan.spendingChannel.base.address,
+            },
+            spendTransferModule: {
+              address: governedPlan.spendTransferModule.address,
+            },
+            mintClientStt: { scriptHash: clientPolicyId },
+            mintConnectionStt: { scriptHash: governedPlan.mintConnection.hash },
+            mintChannelStt: { scriptHash: governedPlan.mintChannel.hash },
+            mintTransferEscrowShard: {
+              scriptHash: governedPlan.mintTransferEscrowShard.hash,
+            },
+          },
+          modules: {
+            transfer: { address: governedPlan.spendTransferModule.address },
+          },
+        },
+        clientPolicyId + clientName,
+        clientPolicyId + substituteName,
+        emulator.now(),
+        emulator.now() + 30_000,
+      );
+    }
+    const completed = await builder.complete({ localUPLCEval: true });
+    const signerFixture = signerEvidence(
+      "recovery",
+      completed,
+      recoveryReferences[0],
+    );
+    const signed = await completed.sign.withWallet().complete();
+    const units = CML.compute_total_ex_units(
+      signed.toTransaction().witness_set().redeemers()!,
+    );
+    const bytes = signed.toCBOR().length / 2;
+    assert(bytes <= MAX_BYTES - 750, `recovery uses ${bytes} signed bytes`);
+    assert(
+      units.mem() <= MAX_MEMORY * 95n / 100n,
+      `recovery uses ${units.mem()} memory units`,
+    );
+    assert(
+      units.steps() <= MAX_STEPS * 95n / 100n,
+      `recovery uses ${units.steps()} CPU steps`,
+    );
+    assertEquals(await signed.submit(), signed.toHash());
+    emulator.awaitBlock();
+    if (governedPlan) {
+      const registryUnit = governedPlan.registry!.token.policy_id +
+        governedPlan.registry!.token.name;
+      assertEquals(
+        readRegistry(await lucid.utxoByUnit(registryUnit), registryUnit).phase,
+        "Ready",
+      );
+      await assertRejects(() => signed.submit());
+    }
+    assertEquals(signed.toTransaction().body().mint(), undefined);
+    if (signerFixture) captureSignerFixture!(signerFixture);
+    assertEquals(
+      (await lucid.utxoByUnit(clientPolicyId + clientName)).datum,
+      encodeOutput(
+        new Constr(0, [nextClientState, clientToken, nextHistoryRoot]),
+      ),
+    );
+    if (preserveReserve) {
+      assertEquals(
+        (await lucid.utxoByUnit(clientPolicyId + clientName))
+          .assets["55".repeat(28) + fromText("reserve")],
+        7n,
+      );
+    }
+    return {
+      operation: "recovery",
+      historyCount,
+      bytes,
+      memory: Number(units.mem()),
+      steps: Number(units.steps()),
+    };
+  }
+  async function update(
+    wrongProcessingTime = false,
+    forgedSessionPlan = false,
+  ) {
+    const session = staged
+      ? await submitHistorySession({
+        lucid,
+        emulator,
+        scripts: staged,
+        references: sessionReferences,
+        clientToken,
+        trustedHeight: height(latestHeight),
+        trustedConsensus: latestConsensus,
+        clientState,
+        header: adjacentHeader,
+        owner: signer,
+      })
+      : undefined;
+    if (forgedSessionPlan) {
+      assert(session);
+      const receipt = Data.from(session.utxo.datum!) as Constr<Data>;
+      const plan = receipt.fields[2] as Constr<Data>;
+      const commit = plan.fields[7] as Constr<Data>;
+      (commit.fields[2] as Constr<Data>).fields[0] = "ff".repeat(32);
+      // Deliberately corrupt authenticated fixture state. The policy's final
+      // burn must reject it even though the lighter spending checks delegate
+      // immutable plan validation to that policy.
+      session.utxo.datum = Data.to(receipt);
+      emulator.ledger[session.utxo.txHash + session.utxo.outputIndex].utxo
+        .datum = session.utxo.datum;
+    }
+    const updateNow = emulator.now();
+    const updateValidToNs = BigInt(updateNow + 30_000) * 1_000_000n;
+    const newHeight = adjacentTmHeader.fields[2] as bigint;
+    const newConsensus = new Constr(0, [
+      adjacentTmHeader.fields[3],
+      adjacentTmHeader.fields[8],
+      new Constr(0, [adjacentTmHeader.fields[10]]),
+    ]);
+    const newState = new Constr(0, [
+      ...clientState.fields.slice(0, 6),
+      height(newHeight),
+      proofSpecs,
+      [],
+    ]);
+    const nextClient = new Constr<Data>(0, [
+      new Constr(0, [
+        newState,
+        new Map([[height(newHeight), newConsensus]]),
+        new Map([[
+          height(newHeight),
+          updateValidToNs + (wrongProcessingTime ? 1n : 0n),
+        ]]),
+        new Map([[height(newHeight), updateValidToNs / 4_000_000_000n]]),
+      ]),
+      clientToken,
+    ]);
+    const clientSiblings = await tree.getSiblings(
+      "clients/07-tendermint-0/clientState",
+    );
+    tree.set("clients/07-tendermint-0/clientState", encodePublic(newState));
+    const consensusSiblings = await tree.getSiblings(consensusKey(newHeight));
+    tree.set(consensusKey(newHeight), encodePublic(newConsensus));
+    const nextHost = {
+      ...hostDatum,
+      state: {
+        ...hostDatum.state,
+        version: hostDatum.state.version + 1n,
+        ibc_state_root: await tree.getRoot(),
+      },
+    };
+    const archived = new Constr(0, [
+      clientToken,
+      height(latestHeight),
+      latestConsensus,
+      initialProcessedTime,
+      initialProcessedHeight,
+    ]);
+    const archivedRecord = recordFromConstr(archived);
+    const archivedKey = consensusHistoryKey(
+      archivedRecord.clientToken,
+      archivedRecord.height,
+    );
+    const historySiblings = await historyTree.getSiblings(archivedKey);
+    historyTree.set(archivedKey, encodeConsensusHistoryRecord(archivedRecord));
+    const nextHistoryRoot = await historyTree.getRoot();
+    nextClient.fields.push(nextHistoryRoot);
+    const clientReference = seed(
+      account.address,
+      {},
+      Data.void(),
+      clientScript,
+    );
+    let builder = lucid.newTx().readFrom([
+      references[0],
+      updateReference,
+      clientReference,
+    ])
+      .collectFrom(
+        [host],
+        Data.to(
+          {
+            UpdateClient: {
+              client_state_siblings: clientSiblings,
+              consensus_state_siblings: consensusSiblings,
+            },
+          },
+          HostStateRedeemer,
+          { canonical: true },
+        ),
+      )
+      .collectFrom(
+        [client],
+        encodeStored(
+          new Constr(0, [
+            session?.token ?? adjacentRedeemer.fields[0],
+            [],
+            historySiblings,
+          ]),
+        ),
+      )
+      .withdraw(
+        updateRewardAddress,
+        0n,
+        encodeStored(new Constr(staged ? 4 : 1, [clientToken])),
+      )
+      .pay.ToContract(clientAddress, {
+        kind: "inline",
+        value: encodeOutput(nextClient),
+      }, client.assets)
+      .pay.ToContract(hostAddress, {
+        kind: "inline",
+        value: Data.to(nextHost, HostStateDatum, { canonical: true }),
+      }, host.assets)
+      .validFrom(updateNow).validTo(updateNow + 30_000);
+    if (session) builder = session.finalize(builder);
+    const completed = await builder.complete({
+      localUPLCEval: true,
+    });
+    const signerFixture = signerEvidence("update", completed, clientReference);
+    const signed = await completed.sign.withWallet().complete();
+    const units = CML.compute_total_ex_units(
+      signed.toTransaction().witness_set().redeemers()!,
+    );
+    let referencedScriptBytes = 0;
+    const referenceInputs = signed.toTransaction().body().reference_inputs();
+    for (
+      let index = 0;
+      referenceInputs && index < referenceInputs.len();
+      index++
+    ) {
+      const ref = referenceInputs.get(index);
+      const entry =
+        emulator.ledger[ref.transaction_id().to_hex() + Number(ref.index())];
+      assert(entry);
+      const script = utxoToCore(entry.utxo).output().script_ref()
+        ?.as_plutus_v3();
+      if (script) referencedScriptBytes += script.to_raw_bytes().length;
+    }
+    if (session && !governedPlan) {
+      assert(
+        referencedScriptBytes <= MAX_STAGED_REFERENCE_BYTES,
+        `finalization references ${referencedScriptBytes} script bytes`,
+      );
+    }
+    const bytes = signed.toCBOR().length / 2;
+    assert(bytes <= MAX_BYTES - 750, `update uses ${bytes} signed bytes`);
+    assert(
+      units.mem() <= MAX_MEMORY * 95n / 100n,
+      `update uses ${units.mem()} memory units`,
+    );
+    assert(
+      units.steps() <= MAX_STEPS * 95n / 100n,
+      `update uses ${units.steps()} CPU steps`,
+    );
+    assertEquals(await signed.submit(), signed.toHash());
+    emulator.awaitBlock();
+    retain(signed.toHash(), signed.toCBOR());
+    if (signerFixture) captureSignerFixture!(signerFixture);
+    if (session) {
+      assert(signed.toTransaction().body().mint());
+      assertEquals(
+        (await lucid.utxosAt(staged!.sessionSpend.address)).length,
+        0,
+      );
+      console.log(
+        JSON.stringify({ stagedMode, sessions: session.measurements }),
+      );
+    } else assertEquals(signed.toTransaction().body().mint(), undefined);
+    assertEquals(
+      (await lucid.utxoByUnit(clientPolicyId + clientName)).datum,
+      encodeOutput(nextClient),
+    );
+    if (session) {
+      return {
+        operation: `staged ${stagedMode} update`,
+        bytes,
+        referencedScriptBytes,
+        fee: Number(signed.toTransaction().body().fee()),
+        memory: Number(units.mem()),
+        steps: Number(units.steps()),
+      };
+    }
+    // Replaying the same valid header must not be accepted as misbehaviour.
+    const frozenState = new Constr(0, [
+      ...newState.fields.slice(0, 5),
+      new Constr(0, [0n, 1n]),
+      ...newState.fields.slice(6),
+    ]);
+    const frozenClient = new Constr(0, [
+      new Constr(0, [
+        frozenState,
+        ...(nextClient.fields[0] as Constr<Data>).fields.slice(1),
+      ]),
+      clientToken,
+      nextClient.fields[2],
+    ]);
+    const freezeSiblings = await tree.getSiblings(
+      "clients/07-tendermint-0/clientState",
+    );
+    tree.set("clients/07-tendermint-0/clientState", encodePublic(frozenState));
+    const frozenHost = {
+      ...nextHost,
+      state: {
+        ...nextHost.state,
+        version: nextHost.state.version + 1n,
+        ibc_state_root: await tree.getRoot(),
+      },
+    };
+    const replay = lucid.newTx().readFrom([
+      references[0],
+      references[2],
+      clientReference,
+    ])
+      .collectFrom(
+        [await lucid.utxoByUnit(hostPolicy + HOST_NAME)],
+        Data.to(
+          {
+            UpdateClient: {
+              client_state_siblings: freezeSiblings,
+              consensus_state_siblings: [],
+            },
+          },
+          HostStateRedeemer,
+          { canonical: true },
+        ),
+      )
+      .collectFrom(
+        [await lucid.utxoByUnit(clientPolicyId + clientName)],
+        encodeStored(
+          new Constr(0, [adjacentRedeemer.fields[0], [
+            new Constr(0, [
+              archived,
+              await historyTree.getSiblings(archivedKey),
+            ]),
+          ], []]),
+        ),
+      )
+      .withdraw(rewardAddress, 0n, encodeStored(new Constr(1, [clientToken])))
+      .pay.ToContract(clientAddress, {
+        kind: "inline",
+        value: encodeOutput(frozenClient),
+      }, client.assets)
+      .pay.ToContract(hostAddress, {
+        kind: "inline",
+        value: Data.to(frozenHost, HostStateDatum, { canonical: true }),
+      }, host.assets)
+      .validFrom(emulator.now()).validTo(emulator.now() + 30_000);
+    await assertRejects(() => replay.complete({ localUPLCEval: true }));
+    return {
+      operation: "four-validator update",
+      bytes,
+      memory: Number(units.mem()),
+      steps: Number(units.steps()),
+    };
+  }
+  async function freezeConflictingHeader(wrongWitness = false) {
+    const session = staged
+      ? await submitHistorySession({
+        lucid,
+        emulator,
+        scripts: staged,
+        references: sessionReferences,
+        clientToken,
+        trustedHeight: histories[1].fields[1] as Constr<Data>,
+        trustedConsensus: histories[1].fields[2] as Constr<Data>,
+        clientState,
+        header: adjacentHeader,
+        owner: signer,
+      })
+      : undefined;
+    const freezeNow = emulator.now();
+    const frozenState = new Constr(0, [
+      ...clientState.fields.slice(0, 5),
+      new Constr(0, [0n, 1n]),
+      ...clientState.fields.slice(6),
+    ]);
+    const frozenClient = new Constr(0, [
+      new Constr(0, [
+        frozenState,
+        ...(clientDatum.fields[0] as Constr<Data>).fields.slice(1),
+      ]),
+      clientToken,
+      clientDatum.fields[2],
+    ]);
+    const siblings = await tree.getSiblings(
+      "clients/07-tendermint-0/clientState",
+    );
+    tree.set("clients/07-tendermint-0/clientState", encodePublic(frozenState));
+    const frozenHost = {
+      ...hostDatum,
+      state: {
+        ...hostDatum.state,
+        version: hostDatum.state.version + 1n,
+        ibc_state_root: await tree.getRoot(),
+      },
+    };
+    const clientReference = seed(
+      account.address,
+      {},
+      Data.void(),
+      clientScript,
+    );
+    let builder = lucid.newTx().readFrom([
+      references[0],
+      updateReference,
+      clientReference,
+    ])
+      .collectFrom(
+        [host],
+        Data.to(
+          {
+            UpdateClient: {
+              client_state_siblings: siblings,
+              consensus_state_siblings: [],
+            },
+          },
+          HostStateRedeemer,
+          { canonical: true },
+        ),
+      )
+      .collectFrom(
+        [client],
+        encodeStored(
+          new Constr(0, [
+            session?.token ?? adjacentRedeemer.fields[0],
+            [
+              new Constr(0, [
+                wrongWitness
+                  ? new Constr(0, [...histories[1].fields.slice(0, 3), 1n, 1n])
+                  : histories[1],
+                await historyTree.getSiblings(
+                  consensusHistoryKey(
+                    recordFromConstr(histories[1]).clientToken,
+                    recordFromConstr(histories[1]).height,
+                  ),
+                ),
+              ]),
+            ],
+            [],
+          ]),
+        ),
+      )
+      .withdraw(
+        updateRewardAddress,
+        0n,
+        encodeStored(new Constr(staged ? 4 : 1, [clientToken])),
+      )
+      .pay.ToContract(clientAddress, {
+        kind: "inline",
+        value: encodeOutput(frozenClient),
+      }, client.assets)
+      .pay.ToContract(hostAddress, {
+        kind: "inline",
+        value: Data.to(frozenHost, HostStateDatum, { canonical: true }),
+      }, host.assets)
+      .validFrom(freezeNow).validTo(freezeNow + 30_000);
+    if (session) builder = session.finalize(builder);
+    const completed = await builder.complete({ localUPLCEval: true });
+    const signed = await completed.sign.withWallet().complete();
+    const units = CML.compute_total_ex_units(
+      signed.toTransaction().witness_set().redeemers()!,
+    );
+    assert(signed.toCBOR().length / 2 <= MAX_BYTES - 750);
+    assert(units.mem() <= MAX_MEMORY * 95n / 100n);
+    assert(units.steps() <= MAX_STEPS * 95n / 100n);
+    assertEquals(await signed.submit(), signed.toHash());
+    emulator.awaitBlock();
+    assertEquals(
+      (await lucid.utxoByUnit(clientPolicyId + clientName)).datum,
+      encodeOutput(frozenClient),
+    );
+  }
+  return {
+    recover,
+    update,
+    freezeConflictingHeader,
+    lucid,
+    histories,
+    client,
+    tree,
+    async coldRecoverCreation() {
+      assert(createClient);
+      const recovered = new ConsensusHistoryRecovery(":memory:", {
+        clientToken: { policyId: clientPolicyId, name: clientName },
+        stateAddress: clientAddress,
+        bootstrap,
+      });
+      try {
+        await recovered.recover({
+          async *transactions() {
+            for (const tx of transactions) yield tx;
+          },
+          currentState: () => lucid.utxoByUnit(clientPolicyId + clientName),
+        });
+        const rebuilt = new DeploymentIbcTree();
+        rebuilt.set(
+          "clients/07-tendermint-0/clientState",
+          recovered.current().clientValue,
+        );
+        for await (const entry of recovered.records()) {
+          rebuilt.set(
+            consensusKey(
+              entry.record.height.revisionHeight,
+              entry.record.height.revisionNumber,
+            ),
+            entry.consensusValue,
+          );
+        }
+        const liveHost = await lucid.utxoByUnit(hostPolicy + HOST_NAME);
+        assertEquals(
+          await rebuilt.getRoot(),
+          Data.from(liveHost.datum!, HostStateDatum).state.ibc_state_root,
+        );
+        assertEquals(
+          recovered.current().record.consensusState.root,
+          initialConsensusBytes!.root,
+        );
+        assertEquals(
+          recovered.current().record.consensusState.nextValidatorsHash,
+          initialConsensusBytes!.nextValidatorsHash,
+        );
+      } finally {
+        recovered.close();
+      }
+    },
+    async coldRecoverAndAcknowledge() {
+      assert(packet && createClient);
+      const directory = await Deno.makeTempDir({
+        prefix: "ibc-production-history-",
+      });
+      const dbPath = `${directory}/history.sqlite`;
+      const deployment = {
+        layout: "production" as const,
+        clientToken: { policyId: clientPolicyId, name: clientName },
+        stateAddress: clientAddress,
+        bootstrap,
+      };
+      // The emulator does not retain blocks. This source keeps only CBOR of
+      // successfully submitted transactions, with explicitly simulated points.
+      const source: HistorySource = {
+        async *transactions(after) {
+          const start = after
+            ? transactions.findIndex((tx) => tx.txHash === after.txHash)
+            : 0;
+          assert(start >= 0);
+          for (const tx of transactions.slice(start)) yield tx;
+        },
+        currentState: () => lucid.utxoByUnit(clientPolicyId + clientName),
+      };
+      let recovered = new ConsensusHistoryRecovery(dbPath, deployment);
+      try {
+        await recovered.recover(source);
+        recovered.close();
+        for (
+          const name of [
+            "history.sqlite",
+            "history.sqlite-wal",
+            "history.sqlite-shm",
+          ]
+        ) {
+          await Deno.remove(`${directory}/${name}`).catch((error) => {
+            if (!(error instanceof Deno.errors.NotFound)) throw error;
+          });
+        }
+        // Discard both tree caches and every supplied historical record.
+        historyTree = new DeploymentIbcTree();
+        tree = new DeploymentIbcTree();
+        histories.length = 0;
+        recovered = new ConsensusHistoryRecovery(dbPath, deployment);
+        const report = await recovered.recover(source);
+        const live = await source.currentState();
+        assertEquals(report.transactions, 2);
+        assertEquals(
+          report.root,
+          (Data.from(live.datum!) as Constr<Data>).fields[2],
+        );
+        assertEquals(recovered.current().utxo.txHash, live.txHash);
+        assertEquals(recovered.current().utxo.outputIndex, live.outputIndex);
+        tree.set(
+          "clients/07-tendermint-0/clientState",
+          recovered.current().clientValue,
+        );
+        for await (const entry of recovered.records()) {
+          tree.set(
+            consensusKey(
+              entry.record.height.revisionHeight,
+              entry.record.height.revisionNumber,
+            ),
+            entry.consensusValue,
+          );
+        }
+        packet.publicLeaves(tree);
+        const liveHost = await lucid.utxoByUnit(hostPolicy + HOST_NAME);
+        assertEquals(
+          await tree.getRoot(),
+          Data.from(liveHost.datum!, HostStateDatum).state.ibc_state_root,
+        );
+        const witness = recovered.witness(deployment.clientToken, {
+          revisionNumber: 1n,
+          revisionHeight: 2n,
+        });
+        const result = await packet.acknowledge(
+          live,
+          liveHost,
+          witness,
+          emulator.now(),
+        );
+        emulator.awaitBlock();
+        await packet.assertAcknowledged();
+        assertEquals(
+          (await lucid.utxoByUnit(clientPolicyId + clientName)).datum,
+          live.datum,
+        );
+        return { ...result, recoveryMilliseconds: report.milliseconds };
+      } finally {
+        recovered.close();
+        await Deno.remove(directory, { recursive: true });
+      }
+    },
+  };
+}
+
+Deno.test("signed staged clients finalize adjacent and unchanged-set updates", async () => {
+  for (const mode of ["adjacent", "non-adjacent"] as const) {
+    const context = await fixture(
+      0,
+      false,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true,
+      undefined,
+      undefined,
+      mode,
+    );
+    console.log(JSON.stringify(await context.update()));
+  }
+});
+
+Deno.test("signed staged finalization rejects a forged immutable session plan", async () => {
+  const context = await fixture(
+    0,
+    false,
+    false,
+    true,
+    true,
+    true,
+    false,
+    true,
+    undefined,
+    undefined,
+    "adjacent",
+  );
+  await assertRejects(() => context.update(false, true));
+});
+
+Deno.test("signed staged recovery stays bounded across 1, 100 and 10000 historical checkpoints", async () => {
+  const sizes: number[] = [];
+  for (const count of [1, 100, 10_000]) {
+    const context = await fixture(
+      count,
+      true,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      undefined,
+      undefined,
+      "non-adjacent",
+    );
+    const result = await context.recover();
+    console.log(JSON.stringify(result));
+    sizes.push(result.bytes);
+  }
+  assert(Math.max(...sizes) - Math.min(...sizes) < 100);
+});
+
+Deno.test("signed staged finalization rejects forged metadata and recovery roots", async () => {
+  for (
+    const mutation of [
+      "missing-history",
+      "changed-metadata",
+      "wrong-root",
+    ] as const
+  ) {
+    const context = await fixture(
+      1,
+      true,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      undefined,
+      undefined,
+      "non-adjacent",
+    );
+    await assertRejects(() => context.recover(mutation));
+  }
+  const context = await fixture(
+    0,
+    false,
+    false,
+    true,
+    true,
+    true,
+    false,
+    true,
+    undefined,
+    undefined,
+    "adjacent",
+  );
+  await assertRejects(() => context.update(true));
+});
+
+Deno.test("signed staged conflict freezes with an authenticated historical witness", async () => {
+  for (const wrongWitness of [true, false]) {
+    const context = await fixture(
+      2,
+      false,
+      false,
+      true,
+      false,
+      true,
+      false,
+      false,
+      undefined,
+      undefined,
+      "adjacent",
+    );
+    if (wrongWitness) {
+      await assertRejects(() => context.freezeConflictingHeader(true));
+    } else await context.freezeConflictingHeader();
+  }
+});
+
+Deno.test("signed staged update uses an old checkpoint after deleting both history caches", async () => {
+  const context = await fixture(
+    0,
+    false,
+    false,
+    true,
+    true,
+    true,
+    true,
+    true,
+    undefined,
+    undefined,
+    "adjacent",
+  );
+  console.log(JSON.stringify(await context.update()));
+  console.log(JSON.stringify(await context.coldRecoverAndAcknowledge()));
+});
+
+Deno.test("cold recovery retains consensus bytes accepted by signed client creation", async () => {
+  for (
+    const initialConsensusBytes of [
+      { root: "33", nextValidatorsHash: "22".repeat(32) },
+      { root: "33".repeat(64), nextValidatorsHash: "22".repeat(32) },
+      { root: "33".repeat(65), nextValidatorsHash: "22".repeat(32) },
+      { root: "33".repeat(32), nextValidatorsHash: "" },
+      { root: "", nextValidatorsHash: "22" },
+    ]
+  ) {
+    const context = await fixture(
+      0,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      true,
+      undefined,
+      initialConsensusBytes,
+      "adjacent",
+    );
+    await context.coldRecoverCreation();
+  }
+});
+
+Deno.test("signed production recovery stays bounded at 1, 100 and 10000 historical records", async () => {
+  const sizes: number[] = [];
+  for (const count of [1, 100, 10_000]) {
+    const result = await (await fixture(count, true)).recover();
+    console.log(JSON.stringify(result));
+    sizes.push(result.bytes);
+  }
+  assert(
+    Math.max(...sizes) - Math.min(...sizes) < 100,
+    "history growth must not grow recovery transactions beyond bounded proofs",
+  );
+});
+
+Deno.test("signed recovery preserves an unrelated asset already held by the client", async () => {
+  await (await fixture(1, true)).recover(undefined, true);
+});
+
+Deno.test("signed recovery rejects unchanged history roots, changed metadata and wrong public roots", async () => {
+  for (
+    const mutation of [
+      "missing-history",
+      "changed-metadata",
+      "wrong-root",
+    ] as const
+  ) {
+    await assertRejects(() =>
+      fixture(1, true).then((context) => context.recover(mutation))
+    );
+  }
+});
+
+Deno.test("a signed four-validator header update commits its previous tip without minting", async () => {
+  console.log(
+    JSON.stringify(await (await fixture(1, false, false, true)).update()),
+  );
+});
+
+Deno.test("production client mint and header update publish bounded state without archive outputs", async () => {
+  for (const canonical of [true, false]) {
+    console.log(
+      JSON.stringify(
+        await (await fixture(
+          0,
+          false,
+          false,
+          true,
+          true,
+          canonical,
+          false,
+          !canonical,
+        )).update(),
+      ),
+    );
+  }
+});
+
+Deno.test("a signed header update cannot forge its new processing metadata", async () => {
+  const context = await fixture(1, false, false, true);
+  await assertRejects(() => context.update(true));
+});
+
+Deno.test("a signed conflicting header freezes a client using its authenticated historical trusted height", async () => {
+  // The trusted live height3 checkpoint differs from the valid signed height3
+  // header. Its height2 trust anchor is an committed history witness.
+  await (await fixture(2, false, false, true, false, true, false, false))
+    .freezeConflictingHeader();
+});
+
+Deno.test("client recovery accepts equivalent input and output CBOR container encodings", async () => {
+  await (await fixture(1, true, false, false, false, true, false, false))
+    .recover();
+});
+
+Deno.test("a production packet uses an old consensus state after deleting all local history", async () => {
+  const context = await fixture(0, false, false, true, true, true, true, false);
+  console.log(JSON.stringify(await context.update()));
+  console.log(JSON.stringify(await context.coldRecoverAndAcknowledge()));
+});
+
+// Regenerate the Hermes policy fixtures with:
+// IBC_HERMES_SIGNER_FIXTURE=/absolute/output.json deno task test:consensus-history --filter="export Hermes"
+// Only accepted transactions are exported. No private keys or script bodies.
+const signerFixturePath = Deno.env.get("IBC_HERMES_SIGNER_FIXTURE");
+Deno.test({
+  name: "export Hermes signer fixtures from accepted production transactions",
+  ignore: !signerFixturePath,
+  async fn() {
+    const cases: Record<string, unknown>[] = [];
+    const capture = (value: Record<string, unknown>) => cases.push(value);
+    await (await fixture(
+      1,
+      false,
+      false,
+      true,
+      false,
+      true,
+      false,
+      false,
+      capture,
+    ))
+      .update();
+    await (await fixture(
+      1,
+      true,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      capture,
+    ))
+      .recover();
+    assertEquals(cases.length, 2);
+    await Deno.writeTextFile(
+      signerFixturePath!,
+      JSON.stringify(
+        {
+          source:
+            "cardano-ibc-incubator/cardano/offchain/scripts/consensus-history.test.ts",
+          cases,
+        },
+        null,
+        2,
+      ) + "\n",
+    );
+  },
+});
+
+Deno.test("signed registry quorum unfreezes a client after its delay and consumes the approval", async () => {
+  const context = await fixture(
+    1,
+    true,
+    true,
+    false,
+    false,
+    true,
+    false,
+    true,
+    undefined,
+    undefined,
+    undefined,
+    true,
+  );
+  console.log(JSON.stringify(await context.recover()));
+});

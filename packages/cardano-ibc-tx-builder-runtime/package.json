@@ -15,18 +15,38 @@
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
+    "./yaciRest": { "types": "./dist/yaciRest.d.ts", "default": "./dist/yaciRest.js" },
+    "./yaciRestHistory": { "types": "./dist/yaciRestHistory.d.ts", "default": "./dist/yaciRestHistory.js" },
+    "./consensusHistoryRest": { "types": "./dist/consensusHistoryRest.d.ts", "default": "./dist/consensusHistoryRest.js" },
+    "./packetLaneTransactions": { "types": "./dist/packetLaneTransactions.d.ts", "default": "./dist/packetLaneTransactions.js" },
     ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" },
     "./ics23MerkleTree": { "types": "./dist/ics23MerkleTree.d.ts", "default": "./dist/ics23MerkleTree.js" },
     "./ibcStateRoot": { "types": "./dist/ibcStateRoot.d.ts", "default": "./dist/ibcStateRoot.js" },
-    "./transferEscrowShard": { "types": "./dist/transferEscrowShard.d.ts", "default": "./dist/transferEscrowShard.js" },
-    "./sendPacketEscrow": { "types": "./dist/sendPacketEscrow.d.ts", "default": "./dist/sendPacketEscrow.js" }
+    "./channelDatum": { "types": "./dist/channelDatum.d.ts", "default": "./dist/channelDatum.js" },
+    "./consensusHistory": { "types": "./dist/consensusHistory.d.ts", "default": "./dist/consensusHistory.js" },
+    "./consensusHistoryRecovery": { "types": "./dist/consensusHistoryRecovery.d.ts", "default": "./dist/consensusHistoryRecovery.js" },
+    "./consensusHistoryYaci": { "types": "./dist/consensusHistoryYaci.d.ts", "default": "./dist/consensusHistoryYaci.js" },
+    "./incrementalIbcTree": { "types": "./dist/incrementalIbcTree.d.ts", "default": "./dist/incrementalIbcTree.js" },
+    "./plutusSerialise": { "types": "./dist/plutusSerialise.d.ts", "default": "./dist/plutusSerialise.js" },
+    "./historyBootstrap": { "types": "./dist/historyBootstrap.d.ts", "default": "./dist/historyBootstrap.js" },
+    "./migrationRuntime": { "types": "./dist/migrationRuntime.d.ts", "default": "./dist/migrationRuntime.js" }
   },
   "typesVersions": {
     "*": {
+      "yaciRest": ["dist/yaciRest.d.ts"],
+      "yaciRestHistory": ["dist/yaciRestHistory.d.ts"],
+      "consensusHistoryRest": ["dist/consensusHistoryRest.d.ts"],
+      "packetLaneTransactions": ["dist/packetLaneTransactions.d.ts"],
       "ics23MerkleTree": ["dist/ics23MerkleTree.d.ts"],
       "ibcStateRoot": ["dist/ibcStateRoot.d.ts"],
-      "transferEscrowShard": ["dist/transferEscrowShard.d.ts"],
-      "sendPacketEscrow": ["dist/sendPacketEscrow.d.ts"]
+      "channelDatum": ["dist/channelDatum.d.ts"],
+      "consensusHistory": ["dist/consensusHistory.d.ts"],
+      "consensusHistoryRecovery": ["dist/consensusHistoryRecovery.d.ts"],
+      "consensusHistoryYaci": ["dist/consensusHistoryYaci.d.ts"],
+      "incrementalIbcTree": ["dist/incrementalIbcTree.d.ts"],
+      "plutusSerialise": ["dist/plutusSerialise.d.ts"],
+      "historyBootstrap": ["dist/historyBootstrap.d.ts"],
+      "migrationRuntime": ["dist/migrationRuntime.d.ts"]
     }
   },
   "files": [
@@ -44,7 +64,7 @@
     "@harmoniclabs/cbor": "^1.6.6",
     "@harmoniclabs/crypto": "^0.3.0",
     "@harmoniclabs/pair": "^1.0.0",
-    "@lucid-evolution/lucid": "^0.4.29",
+    "@lucid-evolution/lucid": "^0.6.5",
     "@noble/hashes": "^1.8.0",
     "js-sha256": "^0.11.0",
     "js-sha3": "^0.9.3",
@@ -62,7 +82,7 @@
     "@harmoniclabs/cbor": "^1.6.6",
     "@harmoniclabs/crypto": "^0.3.0",
     "@harmoniclabs/pair": "^1.0.0",
-    "@lucid-evolution/lucid": "^0.4.29",
+    "@lucid-evolution/lucid": "^0.6.5",
     "@noble/hashes": "^1.8.0",
     "js-sha256": "^0.11.0",
     "js-sha3": "^0.9.3",

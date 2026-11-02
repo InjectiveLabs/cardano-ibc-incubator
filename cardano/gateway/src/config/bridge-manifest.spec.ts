@@ -1,5 +1,9 @@
+import { execFileSync } from 'node:child_process';
+import { resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import {
   DEFAULT_HANDLER_JSON_PATH,
+  CONSENSUS_HISTORY_FORMAT,
   ICS20_PACKET_CODEC,
   bridgeManifestsEqual,
   loadBridgeConfigFromEnv,
@@ -22,7 +26,31 @@ function buildValidator(name: string) {
 
 function buildHandlerJsonDeployment() {
   return {
+    packetState: {
+      operations: Object.fromEntries(
+        [
+          'send',
+          'acknowledge',
+          'timeout',
+          'reject',
+          'receive',
+          'timeout_on_close',
+          'retire',
+          'funds',
+          'send_funds',
+        ].map((name) => [name, buildValidator(`packet-${name}`)]),
+      ),
+      format: 'packet-lanes-v1',
+      receiptStorage: 'merkle-history-v1',
+      laneCount: 16,
+      configToken: { policyId: 'config-policy', name: 'config-name' },
+      state: buildValidator('packetState'),
+      batch: buildValidator('packetBatch'),
+      guard: buildValidator('packetGuard'),
+    },
+    deploymentMode: 'legacy',
     deployedAt: '2026-04-01T12:34:56.000Z',
+    consensusHistoryFormat: CONSENSUS_HISTORY_FORMAT,
     ics20PacketCodec: ICS20_PACKET_CODEC.STRICT,
     hostStateNFT: {
       policyId: 'host-policy',
@@ -37,14 +65,29 @@ function buildHandlerJsonDeployment() {
         ...buildValidator('spendChannel'),
         refValidator: {
           acknowledge_packet: { scriptHash: 'ack-hash', refUtxo: { txHash: 'ack-tx', outputIndex: 2 } },
-          chan_close_confirm: { scriptHash: 'close-confirm-hash', refUtxo: { txHash: 'close-confirm-tx', outputIndex: 3 } },
+          chan_close_confirm: {
+            scriptHash: 'close-confirm-hash',
+            refUtxo: { txHash: 'close-confirm-tx', outputIndex: 3 },
+          },
           chan_close_init: { scriptHash: 'close-init-hash', refUtxo: { txHash: 'close-init-tx', outputIndex: 4 } },
           chan_open_ack: { scriptHash: 'open-ack-hash', refUtxo: { txHash: 'open-ack-tx', outputIndex: 5 } },
-          chan_open_confirm: { scriptHash: 'open-confirm-hash', refUtxo: { txHash: 'open-confirm-tx', outputIndex: 6 } },
+          chan_open_confirm: {
+            scriptHash: 'open-confirm-hash',
+            refUtxo: { txHash: 'open-confirm-tx', outputIndex: 6 },
+          },
           recv_packet: { scriptHash: 'recv-hash', refUtxo: { txHash: 'recv-tx', outputIndex: 7 } },
           prune_packet_history: { scriptHash: 'prune-hash', refUtxo: { txHash: 'prune-tx', outputIndex: 10 } },
           send_packet: { scriptHash: 'send-hash', refUtxo: { txHash: 'send-tx', outputIndex: 8 } },
           timeout_packet: { scriptHash: 'timeout-hash', refUtxo: { txHash: 'timeout-tx', outputIndex: 9 } },
+          chan_upgrade: { scriptHash: 'upgrade-hash', refUtxo: { txHash: 'upgrade-tx', outputIndex: 11 } },
+          chan_upgrade_handshake: {
+            scriptHash: 'upgrade-handshake-hash',
+            refUtxo: { txHash: 'upgrade-handshake-tx', outputIndex: 12 },
+          },
+          chan_upgrade_finish: {
+            scriptHash: 'upgrade-finish-hash',
+            refUtxo: { txHash: 'upgrade-finish-tx', outputIndex: 13 },
+          },
         },
       },
       spendTraceRegistry: buildValidator('spendTraceRegistry'),
@@ -82,7 +125,112 @@ function buildHandlerJsonDeployment() {
   };
 }
 
+function buildStagedHandlerJsonDeployment() {
+  const deployment = buildHandlerJsonDeployment();
+  return {
+    ...deployment,
+    validators: {
+      ...deployment.validators,
+      updateClient: buildValidator('updateClient'),
+      spendTendermintUpdateSession: buildValidator('spendTendermintUpdateSession'),
+      mintTendermintUpdateSession: buildValidator('mintTendermintUpdateSession'),
+    },
+  };
+}
+
 describe('bridge manifest normalization', () => {
+  it('rejects legacy packet receipt storage rather than interpreting it as history-backed state', () => {
+    const deployment = buildHandlerJsonDeployment();
+    delete (deployment.packetState as any).receiptStorage;
+    expect(() => normalizeHandlerJsonDeploymentConfig(deployment, {
+      chain_id: 'cardano-devnet', network_magic: 42, network: 'Custom',
+    })).toThrow('fresh history-backed packet-lane deployment');
+  });
+  it('advertises acknowledgement batching only for deployments that enable it', () => {
+    const deployment = buildHandlerJsonDeployment();
+    const options = { chain_id: 'cardano-devnet', network_magic: 42, network: 'Custom' as const };
+    const legacy = normalizeHandlerJsonDeploymentConfig(deployment, options);
+    expect(legacy.bridgeManifest.packet_state.acknowledgement_batch_size).toBeUndefined();
+    const enabled = normalizeHandlerJsonDeploymentConfig({
+      ...deployment, packetState: { ...deployment.packetState, acknowledgementBatchSize: 2 },
+    }, options);
+    expect(enabled.bridgeManifest.packet_state.acknowledgement_batch_size).toBe(2);
+    expect(normalizeBridgeManifestConfig(enabled.bridgeManifest).deployment.packetState.acknowledgementBatchSize).toBe(2);
+  });
+  it('accepts the deployment used by the Gateway image smoke test', () => {
+    const fixtureUrl = pathToFileURL(resolve(__dirname, '../../../../scripts/ci/image-smoke-fixture.mjs')).href;
+    const manifest = JSON.parse(
+      execFileSync(
+        process.execPath,
+        [
+          '--input-type=module',
+          '-e',
+          `import { smokeManifest } from ${JSON.stringify(fixtureUrl)}
+console.log(JSON.stringify(smokeManifest()))`,
+        ],
+        { encoding: 'utf8' },
+      ),
+    );
+    const normalized = normalizeBridgeManifestConfig(manifest);
+    expect(normalized.deployment.packetState.laneCount).toBe(16);
+    expect(normalized.deployment.packetState.operations.timeout_on_close.refUtxo).toEqual({
+      txHash: manifest.packet_state.operations.timeout_on_close.ref_utxo.tx_hash,
+      outputIndex: manifest.packet_state.operations.timeout_on_close.ref_utxo.output_index,
+    });
+  });
+
+  it.each([undefined, null, '', 'archive-nft-v1', 'proof-backed-v2'])(
+    'rejects missing or unsupported history format %s before accepting old contracts',
+    (format) => {
+      const current = buildHandlerJsonDeployment();
+      expect(() =>
+        normalizeHandlerJsonDeploymentConfig(
+          { ...current, consensusHistoryFormat: format },
+          {
+            chain_id: 'cardano-devnet',
+            network_magic: 42,
+            network: 'Custom',
+          },
+        ),
+      ).toThrow('fresh proof-backed deployment is required');
+      const normalized = normalizeHandlerJsonDeploymentConfig(current, {
+        chain_id: 'cardano-devnet',
+        network_magic: 42,
+        network: 'Custom',
+      });
+      expect(() =>
+        normalizeBridgeManifestConfig({ ...normalized.bridgeManifest, consensus_history_format: format }),
+      ).toThrow('fresh proof-backed deployment is required');
+    },
+  );
+
+  it('requires public manifests and handlers to declare the deployment history boundary', () => {
+    const cardano = { chain_id: 'cardano-preview', network_magic: 2, network: 'Preview' };
+    expect(() => normalizeHandlerJsonDeploymentConfig(buildHandlerJsonDeployment(), cardano)).toThrow(
+      'history is required',
+    );
+    const local = normalizeHandlerJsonDeploymentConfig(buildHandlerJsonDeployment(), {
+      chain_id: 'cardano-devnet',
+      network_magic: 42,
+      network: 'Custom',
+    }).bridgeManifest;
+    expect(() => normalizeBridgeManifestConfig({ ...local, cardano })).toThrow('history is required');
+    const history = {
+      format: 'cardano-history-v1',
+      start: { slot: 100, block_height: 5, block_hash: 'aa'.repeat(32) },
+      host_state_nft_mint: { tx_hash: 'bb'.repeat(32), output_index: 0 },
+    };
+    const loaded = normalizeHandlerJsonDeploymentConfig({ ...buildHandlerJsonDeployment(), history }, cardano);
+    expect(loaded.bridgeManifest).toMatchObject({
+      consensus_history_format: CONSENSUS_HISTORY_FORMAT,
+      history,
+    });
+    expect(normalizeBridgeManifestConfig(loaded.bridgeManifest).deployment).toMatchObject({
+      consensusHistoryFormat: CONSENSUS_HISTORY_FORMAT,
+      history,
+    });
+  });
+
   it('normalizes handler.json into the public manifest and internal deployment config', () => {
     const loaded = normalizeHandlerJsonDeploymentConfig(buildHandlerJsonDeployment(), {
       chain_id: 'cardano-devnet',
@@ -91,7 +239,8 @@ describe('bridge manifest normalization', () => {
     });
 
     expect(loaded.bridgeManifest).toMatchObject({
-      schema_version: 4,
+      schema_version: 6,
+      consensus_history_format: CONSENSUS_HISTORY_FORMAT,
       deployment_id: 'cardano-devnet:host-policy.host-token',
       deployed_at: '2026-04-01T12:34:56.000Z',
       ics20_packet_codec: ICS20_PACKET_CODEC.STRICT,
@@ -163,6 +312,126 @@ describe('bridge manifest normalization', () => {
     expect(bridgeManifestsEqual(manifestLoaded.bridgeManifest, legacy.bridgeManifest)).toBe(true);
   });
 
+  it('rejects obsolete archive-NFT deployment fields rather than silently dropping them', () => {
+    const current = buildHandlerJsonDeployment();
+    const identity = { chain_id: 'cardano-devnet', network_magic: 42, network: 'Custom' };
+    expect(() =>
+      normalizeHandlerJsonDeploymentConfig(
+        { ...current, validators: { ...current.validators, spendConsensusState: buildValidator('archive') } },
+        identity,
+      ),
+    ).toThrow(/fresh proof-backed deployment is required/);
+    const normalized = normalizeHandlerJsonDeploymentConfig(current, {
+      chain_id: 'cardano-devnet',
+      network_magic: 42,
+      network: 'Custom',
+    });
+    expect(() =>
+      normalizeBridgeManifestConfig({
+        ...normalized.bridgeManifest,
+        validators: { ...normalized.bridgeManifest.validators, spend_consensus_state: {} },
+      }),
+    ).toThrow(/fresh proof-backed deployment is required/);
+  });
+
+  it('round-trips staged Tendermint session validators', () => {
+    const staged = normalizeHandlerJsonDeploymentConfig(buildStagedHandlerJsonDeployment(), {
+      chain_id: 'cardano-devnet',
+      network_magic: 42,
+      network: 'Custom',
+    });
+
+    expect(staged.deployment.validators.updateClient).toEqual({
+      scriptHash: 'updateClient-hash', address: 'updateClient-address',
+      refUtxo: { txHash: 'updateClient-tx', outputIndex: 1 },
+    });
+    expect(staged.bridgeManifest.validators.update_client).toEqual({
+      script_hash: 'updateClient-hash', address: 'updateClient-address',
+      ref_utxo: { tx_hash: 'updateClient-tx', output_index: 1 },
+    });
+    expect(staged.deployment.validators.spendTendermintUpdateSession).toEqual({
+      scriptHash: 'spendTendermintUpdateSession-hash',
+      address: 'spendTendermintUpdateSession-address',
+      refUtxo: {
+        txHash: 'spendTendermintUpdateSession-tx',
+        outputIndex: 1,
+      },
+    });
+    expect(staged.bridgeManifest.validators.mint_tendermint_update_session).toEqual({
+      script_hash: 'mintTendermintUpdateSession-hash',
+      address: 'mintTendermintUpdateSession-address',
+      ref_utxo: {
+        tx_hash: 'mintTendermintUpdateSession-tx',
+        output_index: 1,
+      },
+    });
+
+    const manifestLoaded = normalizeBridgeManifestConfig(staged.bridgeManifest);
+    expect(manifestLoaded.deployment).toEqual(staged.deployment);
+    expect(bridgeManifestsEqual(manifestLoaded.bridgeManifest, staged.bridgeManifest)).toBe(true);
+  });
+
+  it('rejects ordinary forwarding support without staged sessions', () => {
+    const deployment = buildHandlerJsonDeployment();
+    const options = { chain_id: 'cardano-devnet', network_magic: 42, network: 'Custom' as const };
+    expect(() => normalizeHandlerJsonDeploymentConfig({
+      ...deployment, validators: { ...deployment.validators, updateClient: buildValidator('updateClient') },
+    }, options)).toThrow('Ordinary client forwarding requires staged Tendermint sessions');
+    const manifest = normalizeHandlerJsonDeploymentConfig(deployment, options).bridgeManifest;
+    expect(() => normalizeBridgeManifestConfig({
+      ...manifest, validators: { ...manifest.validators, update_client: manifest.validators.recover_client },
+    })).toThrow('Ordinary client forwarding requires staged Tendermint sessions');
+  });
+
+  it('accepts legacy deployments without Tendermint session validators', () => {
+    const legacy = normalizeHandlerJsonDeploymentConfig(buildHandlerJsonDeployment(), {
+      chain_id: 'cardano-devnet',
+      network_magic: 42,
+      network: 'Custom',
+    });
+
+    expect(legacy.deployment.validators.spendTendermintUpdateSession).toBeUndefined();
+    expect(legacy.deployment.validators.mintTendermintUpdateSession).toBeUndefined();
+    expect(legacy.bridgeManifest.validators.spend_tendermint_update_session).toBeUndefined();
+    expect(legacy.bridgeManifest.validators.mint_tendermint_update_session).toBeUndefined();
+  });
+
+  it('rejects handler files with only one Tendermint session validator', () => {
+    const staged = buildStagedHandlerJsonDeployment();
+    const { mintTendermintUpdateSession: _mintSession, ...withoutMintSession } = staged.validators;
+    const { spendTendermintUpdateSession: _spendSession, ...withoutSpendSession } = staged.validators;
+
+    expect(() =>
+      normalizeHandlerJsonDeploymentConfig(
+        { ...staged, validators: withoutMintSession },
+        { chain_id: 'cardano-devnet', network_magic: 42, network: 'Custom' },
+      ),
+    ).toThrow('staged Tendermint spend and mint session validators must be configured together');
+    expect(() =>
+      normalizeHandlerJsonDeploymentConfig(
+        { ...staged, validators: withoutSpendSession },
+        { chain_id: 'cardano-devnet', network_magic: 42, network: 'Custom' },
+      ),
+    ).toThrow('staged Tendermint spend and mint session validators must be configured together');
+  });
+
+  it('rejects public manifests with only one Tendermint session validator', () => {
+    const staged = normalizeHandlerJsonDeploymentConfig(buildStagedHandlerJsonDeployment(), {
+      chain_id: 'cardano-devnet',
+      network_magic: 42,
+      network: 'Custom',
+    }).bridgeManifest;
+    const { mint_tendermint_update_session: _mintSession, ...withoutMintSession } = staged.validators;
+    const { spend_tendermint_update_session: _spendSession, ...withoutSpendSession } = staged.validators;
+
+    expect(() => normalizeBridgeManifestConfig({ ...staged, validators: withoutMintSession })).toThrow(
+      'staged Tendermint spend and mint session validators must be configured together',
+    );
+    expect(() => normalizeBridgeManifestConfig({ ...staged, validators: withoutSpendSession })).toThrow(
+      'staged Tendermint spend and mint session validators must be configured together',
+    );
+  });
+
   it('keeps handler files without a recovery validator loadable', () => {
     const current = buildHandlerJsonDeployment();
     const { recoverClient: _recoverClient, ...legacyValidators } = current.validators;
@@ -197,7 +466,7 @@ describe('bridge manifest normalization', () => {
     expect(loaded.bridgeManifest.validators.recover_client).toBeUndefined();
   });
 
-  it('defaults handler files without a codec capability to the legacy validators', () => {
+  it('defaults a proof-backed handler without a packet codec to legacy packet encoding', () => {
     const { ics20PacketCodec: _codec, ...legacyHandler } = buildHandlerJsonDeployment();
 
     const loaded = normalizeHandlerJsonDeploymentConfig(legacyHandler, {
@@ -210,7 +479,7 @@ describe('bridge manifest normalization', () => {
     expect(loaded.bridgeManifest.ics20_packet_codec).toBe(ICS20_PACKET_CODEC.LEGACY);
   });
 
-  it('defaults schema-v4 manifests without a codec capability to the legacy validators', () => {
+  it('defaults a proof-backed schema-v4 manifest without a packet codec to legacy packet encoding', () => {
     const current = normalizeHandlerJsonDeploymentConfig(buildHandlerJsonDeployment(), {
       chain_id: 'cardano-devnet',
       network_magic: 42,
@@ -247,7 +516,7 @@ describe('bridge manifest normalization', () => {
         chain_id: 'cardano-devnet',
         network_magic: 42,
         network: 'Custom',
-      })
+      }),
     ).toThrow('Invalid bridge config: "deployedAt" must be a non-empty string');
   });
 
@@ -277,7 +546,7 @@ describe('bridge manifest normalization', () => {
         ...legacy.bridgeManifest,
         schema_version: 3,
       }),
-    ).toThrow('Invalid bridge config: "schema_version" must be 4');
+    ).toThrow('Invalid bridge config: "schema_version" must be 6');
   });
 
   it('accepts legacy voucher_metadata validator payloads and normalizes them to address-only', () => {
@@ -289,7 +558,7 @@ describe('bridge manifest normalization', () => {
 
     const legacyManifest = {
       ...current.bridgeManifest,
-      schema_version: 4,
+      schema_version: 6,
       validators: {
         ...current.bridgeManifest.validators,
         voucher_metadata: {
@@ -363,4 +632,77 @@ describe('bridge manifest normalization', () => {
     expect(fs.readFileSync).toHaveBeenCalledWith(DEFAULT_HANDLER_JSON_PATH, 'utf8');
     expect(loaded.deployment.hostStateNFT).toEqual(handlerJsonDeployment.hostStateNFT);
   });
+});
+
+describe('migration operational counterparty boundary', () => {
+  const matrix = ['handler', 'manifest'].flatMap((source) =>
+    [false, true].flatMap((migration) => [false, true].map((readOnly) => [source, migration, readOnly] as const)),
+  );
+  it.each(matrix)('%s migration=%s historical-only=%s', (source, migration, readOnly) => {
+    const handler = {
+      ...buildStagedHandlerJsonDeployment(),
+      deploymentMode: migration ? 'upgradeable' : 'legacy',
+      ...(migration
+        ? {
+            migration: {
+              profile: 'cardano-ibc-compatible-v3',
+              registryUnit: 'ab'.repeat(28) + '01',
+              registryAddress: 'registry-address',
+              generation: '1',
+              compatibility: 'cd'.repeat(32),
+              originalAddresses: ['host', 'client', 'connection', 'channel', 'transfer'],
+            },
+          }
+        : {}),
+    };
+    const manifest = normalizeHandlerJsonDeploymentConfig(handler, {
+      chain_id: 'cardano-devnet',
+      network_magic: 42,
+      network: 'Custom',
+    }).bridgeManifest;
+    const fs = { readFileSync: jest.fn(() => JSON.stringify(source === 'handler' ? handler : manifest)) };
+    const env = {
+      [source === 'handler' ? 'HANDLER_JSON_PATH' : 'BRIDGE_MANIFEST_PATH']: 'fixture.json',
+      GATEWAY_HISTORICAL_READ_ONLY: String(readOnly),
+    };
+    expect(loadBridgeConfigFromEnv(env, fs).deployment.migration?.profile).toBe(
+      migration ? 'cardano-ibc-compatible-v3' : undefined,
+    );
+  });
+});
+
+describe('deployment recovery capability selection', () => {
+  it('rejects an upgradeable label with missing recovery configuration', () => {
+    expect(() =>
+      normalizeHandlerJsonDeploymentConfig(
+        { ...buildHandlerJsonDeployment(), deploymentMode: 'upgradeable' },
+        { chain_id: 'devnet', network_magic: 42, network: 'Custom' },
+      ),
+    ).toThrow('recovery configuration disagree');
+  });
+  it('requires explicit legacy selection for old unlabelled manifests at startup', () => {
+    const handler = buildHandlerJsonDeployment();
+    const { deploymentMode: _mode, ...old } = handler;
+    const fs = { readFileSync: () => JSON.stringify(old) };
+    expect(() => loadBridgeConfigFromEnv({}, fs)).toThrow('recovery configuration disagree');
+    expect(loadBridgeConfigFromEnv({ IBC_DEPLOYMENT_MODE: 'legacy' }, fs).deployment.migration).toBeUndefined();
+  });
+});
+
+it('publishes explicit legacy selection through Gateway into the actual SDK normalizer', async () => {
+  const { normalizeBridgeManifest } = await import('@cardano-ibc/tx-builder-runtime');
+  const { deploymentMode: _mode, ...old } = buildHandlerJsonDeployment();
+  const loaded = loadBridgeConfigFromEnv(
+    { IBC_DEPLOYMENT_MODE: 'legacy' },
+    { readFileSync: () => JSON.stringify(old) },
+  );
+  const wire = JSON.parse(JSON.stringify(loaded.bridgeManifest));
+  expect(wire.deploymentMode).toBe('legacy');
+  expect(normalizeBridgeManifest(wire).deployment.deploymentMode).toBe('legacy');
+  expect(() => normalizeBridgeManifest({ ...wire, deploymentMode: undefined })).toThrow(
+    'recovery configuration disagree',
+  );
+  expect(() =>
+    loadBridgeConfigFromEnv({ IBC_DEPLOYMENT_MODE: 'upgradeable' }, { readFileSync: () => JSON.stringify(old) }),
+  ).toThrow('recovery configuration disagree');
 });

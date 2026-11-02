@@ -11,6 +11,11 @@ COPY packages/cardano-ibc-trace-registry /workspace/packages/cardano-ibc-trace-r
 COPY packages/cardano-ibc-tx-builder /workspace/packages/cardano-ibc-tx-builder
 COPY packages/cardano-ibc-tx-builder-runtime /workspace/packages/cardano-ibc-tx-builder-runtime
 
+# Runtime source imports the transaction builder's compiled submodules.
+RUN npm ci --prefix /workspace/packages/cardano-ibc-tx-builder \
+  && npm run --prefix /workspace/packages/cardano-ibc-tx-builder build \
+  && rm -rf /workspace/packages/cardano-ibc-tx-builder/node_modules
+
 # The peer graph still contains legacy constraints, but the committed lockfile
 # makes the accepted resolution reproducible.
 RUN npm ci --ignore-scripts --legacy-peer-deps \
@@ -43,6 +48,9 @@ WORKDIR /app
 COPY --from=build --chown=node:node /workspace/dapps/ibc-swap/client/.next/standalone ./
 COPY --from=build --chown=node:node /workspace/dapps/ibc-swap/client/.next/static /app/dapps/ibc-swap/client/.next/static
 COPY --from=build --chown=node:node /workspace/dapps/ibc-swap/client/public /app/dapps/ibc-swap/client/public
+# Server-side WebAssembly is outside Next's traced standalone files.
+COPY --from=build --chown=node:node /workspace/dapps/ibc-swap/client/.next/server/chunks/static /app/dapps/ibc-swap/client/.next/server/chunks/static
+RUN ln -sfn chunks/static /app/dapps/ibc-swap/client/.next/server/static
 
 USER node
 EXPOSE 3000

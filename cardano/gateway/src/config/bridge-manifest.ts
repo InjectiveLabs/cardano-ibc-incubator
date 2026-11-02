@@ -1,3 +1,6 @@
+import { checkedDeploymentMode } from '@cardano-ibc/tx-builder-runtime/migrationRuntime';
+import { requireMigrationConfig, type MigrationRuntimeConfig } from '@cardano-ibc/tx-builder-runtime/migrationRuntime';
+import { requireHistoryBootstrap, type HistoryBootstrap } from '@cardano-ibc/tx-builder-runtime/historyBootstrap';
 type RefUtxo = {
   txHash: string;
   outputIndex: number;
@@ -34,6 +37,9 @@ type DeploymentSpendChannelValidator = DeploymentValidator & {
     prune_packet_history: DeploymentRefValidator;
     send_packet: DeploymentRefValidator;
     timeout_packet: DeploymentRefValidator;
+    chan_upgrade: DeploymentRefValidator;
+    chan_upgrade_handshake: DeploymentRefValidator;
+    chan_upgrade_finish: DeploymentRefValidator;
   };
 };
 
@@ -59,15 +65,71 @@ export const ICS20_PACKET_CODEC = {
 } as const;
 
 export type Ics20PacketCodec = (typeof ICS20_PACKET_CODEC)[keyof typeof ICS20_PACKET_CODEC];
+export const CONSENSUS_HISTORY_FORMAT = 'proof-backed-v1' as const;
+
+function requireConsensusHistoryFormat(value: unknown): typeof CONSENSUS_HISTORY_FORMAT {
+  if (value !== CONSENSUS_HISTORY_FORMAT) {
+    throw new Error(
+      'A fresh proof-backed deployment is required: missing or unsupported consensus-history format. Regenerate deployment artifacts; adding a marker does not migrate old contracts.',
+    );
+  }
+  return value;
+}
+
+const PACKET_OPERATIONS = [
+  'send',
+  'acknowledge',
+  'timeout',
+  'reject',
+  'receive',
+  'timeout_on_close',
+  'retire',
+  'funds',
+  'send_funds',
+] as const;
+
+type PacketStateDeployment = {
+  operations: Record<string, DeploymentValidator>;
+  format: 'packet-lanes-v1';
+  receiptStorage: 'merkle-history-v1';
+  laneCount: number;
+  acknowledgementBatchSize?: 2;
+  configToken: AuthToken;
+  state: DeploymentValidator;
+  batch: DeploymentValidator;
+  guard: DeploymentValidator;
+};
+
+type PacketStateManifest = {
+  operations: Record<string, BridgeManifestValidator>;
+  format: 'packet-lanes-v1';
+  receipt_storage: 'merkle-history-v1';
+  lane_count: number;
+  acknowledgement_batch_size?: 2;
+  config_token: BridgeManifestAuthToken;
+  state: BridgeManifestValidator;
+  batch: BridgeManifestValidator;
+  guard: BridgeManifestValidator;
+};
 
 export type DeploymentConfig = {
+  packetState: PacketStateDeployment;
+  deploymentMode?: 'upgradeable' | 'legacy';
+  migration?: MigrationRuntimeConfig;
   deployedAt: string;
+  consensusHistoryFormat: typeof CONSENSUS_HISTORY_FORMAT;
+  history?: HistoryBootstrap;
   ics20PacketCodec: Ics20PacketCodec;
   hostStateNFT: AuthToken;
   validators: {
     hostStateStt: DeploymentValidator;
+    updateClient?: DeploymentValidator;
     recoverClient?: DeploymentValidator;
     spendClient: DeploymentValidator;
+    // Both session validators are present for staged Tendermint deployments;
+    // both are absent for existing direct deployments.
+    spendTendermintUpdateSession?: DeploymentValidator;
+    mintTendermintUpdateSession?: DeploymentValidator;
     spendConnection: DeploymentValidator;
     spendChannel: DeploymentSpendChannelValidator;
     spendMockModule?: DeploymentValidator;
@@ -127,6 +189,9 @@ type BridgeManifestSpendChannelValidator = BridgeManifestValidator & {
     prune_packet_history: BridgeManifestRefValidator;
     send_packet: BridgeManifestRefValidator;
     timeout_packet: BridgeManifestRefValidator;
+    chan_upgrade: BridgeManifestRefValidator;
+    chan_upgrade_handshake: BridgeManifestRefValidator;
+    chan_upgrade_finish: BridgeManifestRefValidator;
   };
 };
 
@@ -150,9 +215,14 @@ type BridgeManifestTraceRegistry = {
 // external operators. It intentionally uses snake_case and only includes the
 // on-chain facts another Gateway/relayer stack needs to reconnect to this bridge.
 export type BridgeManifest = {
+  packet_state: PacketStateManifest;
+  deploymentMode?: 'upgradeable' | 'legacy';
+  migration?: MigrationRuntimeConfig;
   schema_version: number;
+  consensus_history_format: typeof CONSENSUS_HISTORY_FORMAT;
   deployment_id: string;
   deployed_at: string;
+  history?: HistoryBootstrap;
   ics20_packet_codec: Ics20PacketCodec;
   cardano: {
     chain_id: string;
@@ -162,8 +232,12 @@ export type BridgeManifest = {
   host_state_nft: BridgeManifestAuthToken;
   validators: {
     host_state_stt: BridgeManifestValidator;
+    update_client?: BridgeManifestValidator;
     recover_client?: BridgeManifestValidator;
     spend_client: BridgeManifestValidator;
+    // Presence of this pair selects the staged Tendermint protocol.
+    spend_tendermint_update_session?: BridgeManifestValidator;
+    mint_tendermint_update_session?: BridgeManifestValidator;
     spend_connection: BridgeManifestValidator;
     spend_channel: BridgeManifestSpendChannelValidator;
     spend_mock_module?: BridgeManifestValidator;
@@ -192,7 +266,7 @@ export type BridgeManifest = {
 
 export type BridgeManifestCardanoIdentity = BridgeManifest['cardano'];
 
-export type LoadedBridgeConfig = {
+type LoadedBridgeConfig = {
   deployment: DeploymentConfig;
   bridgeManifest: BridgeManifest;
 };
@@ -351,7 +425,10 @@ function requireDeploymentSpendChannelValidator(value: unknown, path: string): D
         refValidator.chan_close_confirm,
         `${path}.refValidator.chan_close_confirm`,
       ),
-      chan_close_init: requireDeploymentRefValidator(refValidator.chan_close_init, `${path}.refValidator.chan_close_init`),
+      chan_close_init: requireDeploymentRefValidator(
+        refValidator.chan_close_init,
+        `${path}.refValidator.chan_close_init`,
+      ),
       chan_open_ack: requireDeploymentRefValidator(refValidator.chan_open_ack, `${path}.refValidator.chan_open_ack`),
       chan_open_confirm: requireDeploymentRefValidator(
         refValidator.chan_open_confirm,
@@ -364,6 +441,9 @@ function requireDeploymentSpendChannelValidator(value: unknown, path: string): D
       ),
       send_packet: requireDeploymentRefValidator(refValidator.send_packet, `${path}.refValidator.send_packet`),
       timeout_packet: requireDeploymentRefValidator(refValidator.timeout_packet, `${path}.refValidator.timeout_packet`),
+      chan_upgrade: requireDeploymentRefValidator(refValidator.chan_upgrade, `${path}.refValidator.chan_upgrade`),
+      chan_upgrade_handshake: requireDeploymentRefValidator(refValidator.chan_upgrade_handshake, `${path}.refValidator.chan_upgrade_handshake`),
+      chan_upgrade_finish: requireDeploymentRefValidator(refValidator.chan_upgrade_finish, `${path}.refValidator.chan_upgrade_finish`),
     },
   };
 }
@@ -383,7 +463,10 @@ function requireManifestSpendChannelValidator(value: unknown, path: string): Bri
         refValidator.chan_close_confirm,
         `${path}.ref_validator.chan_close_confirm`,
       ),
-      chan_close_init: requireManifestRefValidator(refValidator.chan_close_init, `${path}.ref_validator.chan_close_init`),
+      chan_close_init: requireManifestRefValidator(
+        refValidator.chan_close_init,
+        `${path}.ref_validator.chan_close_init`,
+      ),
       chan_open_ack: requireManifestRefValidator(refValidator.chan_open_ack, `${path}.ref_validator.chan_open_ack`),
       chan_open_confirm: requireManifestRefValidator(
         refValidator.chan_open_confirm,
@@ -396,6 +479,9 @@ function requireManifestSpendChannelValidator(value: unknown, path: string): Bri
       ),
       send_packet: requireManifestRefValidator(refValidator.send_packet, `${path}.ref_validator.send_packet`),
       timeout_packet: requireManifestRefValidator(refValidator.timeout_packet, `${path}.ref_validator.timeout_packet`),
+      chan_upgrade: requireManifestRefValidator(refValidator.chan_upgrade, `${path}.ref_validator.chan_upgrade`),
+      chan_upgrade_handshake: requireManifestRefValidator(refValidator.chan_upgrade_handshake, `${path}.ref_validator.chan_upgrade_handshake`),
+      chan_upgrade_finish: requireManifestRefValidator(refValidator.chan_upgrade_finish, `${path}.ref_validator.chan_upgrade_finish`),
     },
   };
 }
@@ -500,17 +586,13 @@ function manifestValidatorToDeployment(validator: BridgeManifestValidator): Depl
   };
 }
 
-function deploymentVoucherMetadataToManifest(
-  validator: DeploymentVoucherMetadata,
-): BridgeManifestVoucherMetadata {
+function deploymentVoucherMetadataToManifest(validator: DeploymentVoucherMetadata): BridgeManifestVoucherMetadata {
   return {
     address: validator.address,
   };
 }
 
-function manifestVoucherMetadataToDeployment(
-  validator: BridgeManifestVoucherMetadata,
-): DeploymentVoucherMetadata {
+function manifestVoucherMetadataToDeployment(validator: BridgeManifestVoucherMetadata): DeploymentVoucherMetadata {
   return {
     address: validator.address,
   };
@@ -552,7 +634,9 @@ function manifestTraceRegistryToDeployment(traceRegistry: BridgeManifestTraceReg
   };
 }
 
-function deploymentSpendChannelToManifest(validator: DeploymentSpendChannelValidator): BridgeManifestSpendChannelValidator {
+function deploymentSpendChannelToManifest(
+  validator: DeploymentSpendChannelValidator,
+): BridgeManifestSpendChannelValidator {
   return {
     ...deploymentValidatorToManifest(validator),
     ref_validator: {
@@ -565,11 +649,16 @@ function deploymentSpendChannelToManifest(validator: DeploymentSpendChannelValid
       prune_packet_history: deploymentRefValidatorToManifest(validator.refValidator.prune_packet_history),
       send_packet: deploymentRefValidatorToManifest(validator.refValidator.send_packet),
       timeout_packet: deploymentRefValidatorToManifest(validator.refValidator.timeout_packet),
+      chan_upgrade: deploymentRefValidatorToManifest(validator.refValidator.chan_upgrade),
+      chan_upgrade_handshake: deploymentRefValidatorToManifest(validator.refValidator.chan_upgrade_handshake),
+      chan_upgrade_finish: deploymentRefValidatorToManifest(validator.refValidator.chan_upgrade_finish),
     },
   };
 }
 
-function manifestSpendChannelToDeployment(validator: BridgeManifestSpendChannelValidator): DeploymentSpendChannelValidator {
+function manifestSpendChannelToDeployment(
+  validator: BridgeManifestSpendChannelValidator,
+): DeploymentSpendChannelValidator {
   return {
     ...manifestValidatorToDeployment(validator),
     refValidator: {
@@ -582,20 +671,114 @@ function manifestSpendChannelToDeployment(validator: BridgeManifestSpendChannelV
       prune_packet_history: manifestRefValidatorToDeployment(validator.ref_validator.prune_packet_history),
       send_packet: manifestRefValidatorToDeployment(validator.ref_validator.send_packet),
       timeout_packet: manifestRefValidatorToDeployment(validator.ref_validator.timeout_packet),
+      chan_upgrade: manifestRefValidatorToDeployment(validator.ref_validator.chan_upgrade),
+      chan_upgrade_handshake: manifestRefValidatorToDeployment(validator.ref_validator.chan_upgrade_handshake),
+      chan_upgrade_finish: manifestRefValidatorToDeployment(validator.ref_validator.chan_upgrade_finish),
     },
   };
+}
+
+function requirePacketState(value: unknown): PacketStateDeployment {
+  const packet = requireObject(value, 'packetState');
+  assert(packet.format === 'packet-lanes-v1', 'A fresh packet-lane deployment is required');
+  assert(packet.receiptStorage === 'merkle-history-v1', 'A fresh history-backed packet-lane deployment is required. Changing the storage marker does not migrate existing contracts.');
+  const laneCount = requireNonNegativeInteger(packet.laneCount, 'packetState.laneCount');
+  assert(laneCount >= 1 && laneCount <= 64, 'Invalid packet lane count');
+  assert(packet.acknowledgementBatchSize === undefined || packet.acknowledgementBatchSize === 2,
+    'Invalid acknowledgement batch capability');
+  const validator = (name: string) => {
+    const result = requireDeploymentValidator(packet[name], `packetState.${name}`);
+    assert(!!result.address, `Missing packetState.${name}.address`);
+    return result;
+  };
+  const operations = requireObject(packet.operations, 'packetState.operations');
+  return {
+    operations: Object.fromEntries(
+      PACKET_OPERATIONS.map((name) => [
+        name,
+        requireDeploymentValidator(operations[name], `packetState.operations.${name}`),
+      ]),
+    ),
+    format: 'packet-lanes-v1',
+    receiptStorage: 'merkle-history-v1',
+    laneCount,
+    ...(packet.acknowledgementBatchSize === 2 ? { acknowledgementBatchSize: 2 as const } : {}),
+    configToken: requireAuthToken(packet.configToken, 'packetState.configToken'),
+    state: validator('state'),
+    batch: validator('batch'),
+    guard: validator('guard'),
+  };
+}
+
+function packetStateToManifest(packet: PacketStateDeployment): PacketStateManifest {
+  return {
+    operations: Object.fromEntries(
+      PACKET_OPERATIONS.map((name) => [name, deploymentValidatorToManifest(packet.operations[name])]),
+    ),
+    format: packet.format,
+    receipt_storage: packet.receiptStorage,
+    lane_count: packet.laneCount,
+    ...(packet.acknowledgementBatchSize === 2 ? { acknowledgement_batch_size: 2 as const } : {}),
+    config_token: deploymentAuthTokenToManifest(packet.configToken),
+    state: deploymentValidatorToManifest(packet.state),
+    batch: deploymentValidatorToManifest(packet.batch),
+    guard: deploymentValidatorToManifest(packet.guard),
+  };
+}
+
+function packetStateFromManifest(value: unknown): PacketStateDeployment {
+  const packet = requireObject(value, 'packet_state');
+  const operations = requireObject(packet.operations, 'packet_state.operations');
+  return requirePacketState({
+    operations: Object.fromEntries(
+      PACKET_OPERATIONS.map((name) => [
+        name,
+        manifestValidatorToDeployment(requireManifestValidator(operations[name], `packet_state.operations.${name}`)),
+      ]),
+    ),
+    format: packet.format,
+    receiptStorage: packet.receipt_storage,
+    laneCount: packet.lane_count,
+    acknowledgementBatchSize: packet.acknowledgement_batch_size,
+    configToken: manifestAuthTokenToDeployment(
+      requireManifestAuthToken(packet.config_token, 'packet_state.config_token'),
+    ),
+    ...Object.fromEntries(
+      ['state', 'batch', 'guard'].map((name) => [
+        name,
+        manifestValidatorToDeployment(requireManifestValidator(packet[name], `packet_state.${name}`)),
+      ]),
+    ),
+  });
 }
 
 export function requireSttDeploymentConfig(deployment: unknown): DeploymentConfig {
   const deploymentAny = requireObject(deployment, 'deployment');
   const validators = requireObject(deploymentAny.validators, 'validators');
+  if ('spendConsensusState' in validators) {
+    throw new Error(
+      'Archive-NFT consensus history is no longer supported; a fresh proof-backed deployment is required',
+    );
+  }
+  const consensusHistoryFormat = requireConsensusHistoryFormat(deploymentAny.consensusHistoryFormat);
   const modules = requireObject(deploymentAny.modules, 'modules');
+  const hasSpendSession = validators.spendTendermintUpdateSession !== undefined;
+  const hasMintSession = validators.mintTendermintUpdateSession !== undefined;
+  assert(
+    hasSpendSession === hasMintSession,
+    'Invalid bridge config: staged Tendermint spend and mint session validators must be configured together',
+  );
+  assert(!validators.updateClient || hasSpendSession, 'Ordinary client forwarding requires staged Tendermint sessions');
 
   return {
+    packetState: requirePacketState(deploymentAny.packetState),
+    deploymentMode: checkedDeploymentMode(deploymentAny.deploymentMode, deploymentAny.migration),
     deployedAt: requireIsoTimestamp(deploymentAny.deployedAt, 'deployedAt'),
-    // Handler files created before the codec capability existed describe the
-    // legacy validators. Defaulting them to legacy keeps their open packets
-    // settleable after a Gateway upgrade.
+    ...(deploymentAny.migration !== undefined ? { migration: requireMigrationConfig(deploymentAny.migration) } : {}),
+    consensusHistoryFormat,
+    ...(deploymentAny.history ? { history: requireHistoryBootstrap(deploymentAny.history, 42) } : {}),
+    // Packet wire encoding is independent of the required client-history ABI.
+    // Keep its legacy default only after validating the proof-backed marker.
     ics20PacketCodec:
       deploymentAny.ics20PacketCodec === undefined
         ? ICS20_PACKET_CODEC.LEGACY
@@ -603,17 +786,37 @@ export function requireSttDeploymentConfig(deployment: unknown): DeploymentConfi
     hostStateNFT: requireAuthToken(deploymentAny.hostStateNFT, 'hostStateNFT'),
     validators: {
       hostStateStt: requireDeploymentValidator(validators.hostStateStt, 'validators.hostStateStt'),
+      ...(validators.updateClient
+        ? { updateClient: requireDeploymentValidator(validators.updateClient, 'validators.updateClient') }
+        : {}),
       ...(validators.recoverClient
         ? { recoverClient: requireDeploymentValidator(validators.recoverClient, 'validators.recoverClient') }
         : {}),
       spendClient: requireDeploymentValidator(validators.spendClient, 'validators.spendClient'),
+      ...(hasSpendSession
+        ? {
+            spendTendermintUpdateSession: requireDeploymentValidator(
+              validators.spendTendermintUpdateSession,
+              'validators.spendTendermintUpdateSession',
+            ),
+            mintTendermintUpdateSession: requireDeploymentValidator(
+              validators.mintTendermintUpdateSession,
+              'validators.mintTendermintUpdateSession',
+            ),
+          }
+        : {}),
       spendConnection: requireDeploymentValidator(validators.spendConnection, 'validators.spendConnection'),
       spendChannel: requireDeploymentSpendChannelValidator(validators.spendChannel, 'validators.spendChannel'),
       ...(validators.spendMockModule
         ? { spendMockModule: requireDeploymentValidator(validators.spendMockModule, 'validators.spendMockModule') }
         : {}),
       ...(validators.spendTraceRegistry
-        ? { spendTraceRegistry: requireDeploymentValidator(validators.spendTraceRegistry, 'validators.spendTraceRegistry') }
+        ? {
+            spendTraceRegistry: requireDeploymentValidator(
+              validators.spendTraceRegistry,
+              'validators.spendTraceRegistry',
+            ),
+          }
         : {}),
       spendTransferModule: requireDeploymentValidator(validators.spendTransferModule, 'validators.spendTransferModule'),
       mintIdentifier: requireDeploymentValidator(validators.mintIdentifier, 'validators.mintIdentifier'),
@@ -628,7 +831,9 @@ export function requireSttDeploymentConfig(deployment: unknown): DeploymentConfi
       ),
       mintPort: requireDeploymentValidator(validators.mintPort, 'validators.mintPort'),
       ...(validators.voucherMetadata
-        ? { voucherMetadata: requireDeploymentVoucherMetadata(validators.voucherMetadata, 'validators.voucherMetadata') }
+        ? {
+            voucherMetadata: requireDeploymentVoucherMetadata(validators.voucherMetadata, 'validators.voucherMetadata'),
+          }
         : {}),
     },
     modules: {
@@ -648,24 +853,49 @@ export function normalizeHandlerJsonDeploymentConfig(
 ): LoadedBridgeConfig {
   const normalizedDeployment = requireSttDeploymentConfig(deployment);
   const normalizedCardano = requireCardanoIdentity(cardano);
+  if ([1, 2, 764824073].includes(normalizedCardano.network_magic) || normalizedDeployment.history) {
+    normalizedDeployment.history = requireHistoryBootstrap(
+      normalizedDeployment.history,
+      normalizedCardano.network_magic,
+    );
+  }
 
   // Normalize deployment JSON once so both startup sources feed the same public
   // manifest and internal deployment object into the rest of the Gateway.
   return {
     deployment: normalizedDeployment,
     bridgeManifest: {
-      schema_version: 4,
+      schema_version: 6,
+      packet_state: packetStateToManifest(normalizedDeployment.packetState),
+      ...(normalizedDeployment.deploymentMode ? { deploymentMode: normalizedDeployment.deploymentMode } : {}),
+      ...(normalizedDeployment.migration ? { migration: normalizedDeployment.migration } : {}),
+      consensus_history_format: normalizedDeployment.consensusHistoryFormat,
       deployment_id: buildDeploymentId(normalizedCardano, normalizedDeployment.hostStateNFT),
       deployed_at: normalizedDeployment.deployedAt,
+      ...(normalizedDeployment.history ? { history: normalizedDeployment.history } : {}),
       ics20_packet_codec: normalizedDeployment.ics20PacketCodec,
       cardano: normalizedCardano,
       host_state_nft: deploymentAuthTokenToManifest(normalizedDeployment.hostStateNFT),
       validators: {
         host_state_stt: deploymentValidatorToManifest(normalizedDeployment.validators.hostStateStt),
+        ...(normalizedDeployment.validators.updateClient
+          ? { update_client: deploymentValidatorToManifest(normalizedDeployment.validators.updateClient) }
+          : {}),
         ...(normalizedDeployment.validators.recoverClient
           ? { recover_client: deploymentValidatorToManifest(normalizedDeployment.validators.recoverClient) }
           : {}),
         spend_client: deploymentValidatorToManifest(normalizedDeployment.validators.spendClient),
+        ...(normalizedDeployment.validators.spendTendermintUpdateSession &&
+        normalizedDeployment.validators.mintTendermintUpdateSession
+          ? {
+              spend_tendermint_update_session: deploymentValidatorToManifest(
+                normalizedDeployment.validators.spendTendermintUpdateSession,
+              ),
+              mint_tendermint_update_session: deploymentValidatorToManifest(
+                normalizedDeployment.validators.mintTendermintUpdateSession,
+              ),
+            }
+          : {}),
         spend_connection: deploymentValidatorToManifest(normalizedDeployment.validators.spendConnection),
         spend_channel: deploymentSpendChannelToManifest(normalizedDeployment.validators.spendChannel),
         ...(normalizedDeployment.validators.spendMockModule
@@ -707,30 +937,67 @@ export function normalizeHandlerJsonDeploymentConfig(
 
 export function normalizeBridgeManifestConfig(manifest: unknown): LoadedBridgeConfig {
   const manifestAny = requireObject(manifest, 'bridgeManifest');
+  const cardano = requireCardanoIdentity(
+    requireObject(manifestAny.cardano, 'cardano') as unknown as BridgeManifestCardanoIdentity,
+  );
   const validators = requireObject(manifestAny.validators, 'validators');
+  if ('spend_consensus_state' in validators) {
+    throw new Error(
+      'Archive-NFT consensus history is no longer supported; a fresh proof-backed deployment is required',
+    );
+  }
+  const consensusHistoryFormat = requireConsensusHistoryFormat(manifestAny.consensus_history_format);
   const modules = requireObject(manifestAny.modules, 'modules');
+  const hasSpendSession = validators.spend_tendermint_update_session !== undefined;
+  const hasMintSession = validators.mint_tendermint_update_session !== undefined;
+  assert(
+    hasSpendSession === hasMintSession,
+    'Invalid bridge config: staged Tendermint spend and mint session validators must be configured together',
+  );
+  assert(!validators.update_client || hasSpendSession, 'Ordinary client forwarding requires staged Tendermint sessions');
 
   // Manifest startup is the inverse path: validate the public document, then
   // rebuild the internal deployment shape so downstream Gateway code stays
   // unaware of which bootstrap source was used.
   const bridgeManifest: BridgeManifest = {
     schema_version: requireNonNegativeInteger(manifestAny.schema_version, 'schema_version'),
+    packet_state: packetStateToManifest(packetStateFromManifest(manifestAny.packet_state)),
+    deploymentMode: checkedDeploymentMode(manifestAny.deploymentMode, manifestAny.migration),
+    ...(manifestAny.migration !== undefined ? { migration: requireMigrationConfig(manifestAny.migration) } : {}),
+    consensus_history_format: consensusHistoryFormat,
     deployment_id: requireNonEmptyString(manifestAny.deployment_id, 'deployment_id'),
     deployed_at: requireIsoTimestamp(manifestAny.deployed_at, 'deployed_at'),
-    // Existing schema-v4 manifests predate this field and therefore refer to
-    // legacy validators. New manifests always emit the capability explicitly.
+    ...([1, 2, 764824073].includes(cardano.network_magic) || manifestAny.history
+      ? { history: requireHistoryBootstrap(manifestAny.history, cardano.network_magic) }
+      : {}),
+    // The packet codec remains independent of the required history capability.
     ics20_packet_codec:
       manifestAny.ics20_packet_codec === undefined
         ? ICS20_PACKET_CODEC.LEGACY
         : requireIcs20PacketCodec(manifestAny.ics20_packet_codec, 'ics20_packet_codec'),
-    cardano: requireCardanoIdentity(requireObject(manifestAny.cardano, 'cardano') as unknown as BridgeManifestCardanoIdentity),
+    cardano,
     host_state_nft: requireManifestAuthToken(manifestAny.host_state_nft, 'host_state_nft'),
     validators: {
       host_state_stt: requireManifestValidator(validators.host_state_stt, 'validators.host_state_stt'),
+      ...(validators.update_client
+        ? { update_client: requireManifestValidator(validators.update_client, 'validators.update_client') }
+        : {}),
       ...(validators.recover_client
         ? { recover_client: requireManifestValidator(validators.recover_client, 'validators.recover_client') }
         : {}),
       spend_client: requireManifestValidator(validators.spend_client, 'validators.spend_client'),
+      ...(hasSpendSession
+        ? {
+            spend_tendermint_update_session: requireManifestValidator(
+              validators.spend_tendermint_update_session,
+              'validators.spend_tendermint_update_session',
+            ),
+            mint_tendermint_update_session: requireManifestValidator(
+              validators.mint_tendermint_update_session,
+              'validators.mint_tendermint_update_session',
+            ),
+          }
+        : {}),
       spend_connection: requireManifestValidator(validators.spend_connection, 'validators.spend_connection'),
       spend_channel: requireManifestSpendChannelValidator(validators.spend_channel, 'validators.spend_channel'),
       ...(validators.spend_mock_module
@@ -744,7 +1011,10 @@ export function normalizeBridgeManifestConfig(manifest: unknown): LoadedBridgeCo
             ),
           }
         : {}),
-      spend_transfer_module: requireManifestValidator(validators.spend_transfer_module, 'validators.spend_transfer_module'),
+      spend_transfer_module: requireManifestValidator(
+        validators.spend_transfer_module,
+        'validators.spend_transfer_module',
+      ),
       mint_identifier: requireManifestValidator(validators.mint_identifier, 'validators.mint_identifier'),
       verify_proof: requireManifestValidator(validators.verify_proof, 'validators.verify_proof'),
       mint_client_stt: requireManifestValidator(validators.mint_client_stt, 'validators.mint_client_stt'),
@@ -757,7 +1027,12 @@ export function normalizeBridgeManifestConfig(manifest: unknown): LoadedBridgeCo
       ),
       mint_port: requireManifestValidator(validators.mint_port, 'validators.mint_port'),
       ...(validators.voucher_metadata
-        ? { voucher_metadata: requireManifestVoucherMetadata(validators.voucher_metadata, 'validators.voucher_metadata') }
+        ? {
+            voucher_metadata: requireManifestVoucherMetadata(
+              validators.voucher_metadata,
+              'validators.voucher_metadata',
+            ),
+          }
         : {}),
     },
     modules: {
@@ -770,23 +1045,39 @@ export function normalizeBridgeManifestConfig(manifest: unknown): LoadedBridgeCo
       : {}),
   };
 
-  assert(
-    bridgeManifest.schema_version === 4,
-    'Invalid bridge config: "schema_version" must be 4',
-  );
+  assert(bridgeManifest.schema_version === 6, 'Invalid bridge config: "schema_version" must be 6');
 
   return {
     bridgeManifest,
     deployment: {
+      packetState: packetStateFromManifest(bridgeManifest.packet_state),
       deployedAt: bridgeManifest.deployed_at,
+      ...(bridgeManifest.deploymentMode ? { deploymentMode: bridgeManifest.deploymentMode } : {}),
+      ...(bridgeManifest.migration ? { migration: bridgeManifest.migration } : {}),
+      consensusHistoryFormat,
+      ...(bridgeManifest.history ? { history: bridgeManifest.history } : {}),
       ics20PacketCodec: bridgeManifest.ics20_packet_codec,
       hostStateNFT: manifestAuthTokenToDeployment(bridgeManifest.host_state_nft),
       validators: {
         hostStateStt: manifestValidatorToDeployment(bridgeManifest.validators.host_state_stt),
+        ...(bridgeManifest.validators.update_client
+          ? { updateClient: manifestValidatorToDeployment(bridgeManifest.validators.update_client) }
+          : {}),
         ...(bridgeManifest.validators.recover_client
           ? { recoverClient: manifestValidatorToDeployment(bridgeManifest.validators.recover_client) }
           : {}),
         spendClient: manifestValidatorToDeployment(bridgeManifest.validators.spend_client),
+        ...(bridgeManifest.validators.spend_tendermint_update_session &&
+        bridgeManifest.validators.mint_tendermint_update_session
+          ? {
+              spendTendermintUpdateSession: manifestValidatorToDeployment(
+                bridgeManifest.validators.spend_tendermint_update_session,
+              ),
+              mintTendermintUpdateSession: manifestValidatorToDeployment(
+                bridgeManifest.validators.mint_tendermint_update_session,
+              ),
+            }
+          : {}),
         spendConnection: manifestValidatorToDeployment(bridgeManifest.validators.spend_connection),
         spendChannel: manifestSpendChannelToDeployment(bridgeManifest.validators.spend_channel),
         ...(bridgeManifest.validators.spend_mock_module
@@ -804,9 +1095,7 @@ export function normalizeBridgeManifestConfig(manifest: unknown): LoadedBridgeCo
         mintConnectionStt: manifestValidatorToDeployment(bridgeManifest.validators.mint_connection_stt),
         mintChannelStt: manifestValidatorToDeployment(bridgeManifest.validators.mint_channel_stt),
         mintVoucher: manifestValidatorToDeployment(bridgeManifest.validators.mint_voucher),
-        mintTransferEscrowShard: manifestValidatorToDeployment(
-          bridgeManifest.validators.mint_transfer_escrow_shard,
-        ),
+        mintTransferEscrowShard: manifestValidatorToDeployment(bridgeManifest.validators.mint_transfer_escrow_shard),
         mintPort: manifestValidatorToDeployment(bridgeManifest.validators.mint_port),
         ...(bridgeManifest.validators.voucher_metadata
           ? {
@@ -816,8 +1105,12 @@ export function normalizeBridgeManifestConfig(manifest: unknown): LoadedBridgeCo
       },
       modules: {
         transfer: requireDeploymentModule(bridgeManifest.modules.transfer, 'modules.transfer'),
-        ...(bridgeManifest.modules.mock ? { mock: requireDeploymentModule(bridgeManifest.modules.mock, 'modules.mock') } : {}),
-        ...(bridgeManifest.modules.icq ? { icq: requireDeploymentModule(bridgeManifest.modules.icq, 'modules.icq') } : {}),
+        ...(bridgeManifest.modules.mock
+          ? { mock: requireDeploymentModule(bridgeManifest.modules.mock, 'modules.mock') }
+          : {}),
+        ...(bridgeManifest.modules.icq
+          ? { icq: requireDeploymentModule(bridgeManifest.modules.icq, 'modules.icq') }
+          : {}),
       },
       ...(bridgeManifest.trace_registry
         ? { traceRegistry: manifestTraceRegistryToDeployment(bridgeManifest.trace_registry) }
@@ -844,9 +1137,7 @@ export function loadBridgeConfigFromEnv(
   // Startup must have a single source of truth. If both are set, we stop early
   // instead of guessing which deployment description should win.
   if (bridgeManifestPath && explicitHandlerPath) {
-    throw new Error(
-      'BRIDGE_MANIFEST_PATH and HANDLER_JSON_PATH are mutually exclusive; set only one startup source',
-    );
+    throw new Error('BRIDGE_MANIFEST_PATH and HANDLER_JSON_PATH are mutually exclusive; set only one startup source');
   }
 
   const cardanoNetworkMagic = Number(env.CARDANO_CHAIN_NETWORK_MAGIC || 42);
@@ -856,13 +1147,25 @@ export function loadBridgeConfigFromEnv(
     network: deriveCardanoNetwork(cardanoNetworkMagic),
   };
 
+  const supportedOperationalProfile = (loaded: LoadedBridgeConfig): LoadedBridgeConfig => {
+    const selected = env.IBC_DEPLOYMENT_MODE ?? loaded.deployment.deploymentMode ?? 'upgradeable';
+    checkedDeploymentMode(selected, loaded.deployment.migration);
+    if (loaded.deployment.deploymentMode && selected !== loaded.deployment.deploymentMode)
+      throw new Error('Configured deployment mode conflicts with authenticated deployment artifacts');
+    // Publish the validated startup selection, including older unlabelled inputs.
+    // Downstream SDKs must receive the same explicit capability decision.
+    loaded.deployment.deploymentMode = selected as 'upgradeable' | 'legacy';
+    loaded.bridgeManifest.deploymentMode = loaded.deployment.deploymentMode;
+    return loaded;
+  };
+
   if (bridgeManifestPath) {
     const manifestJson = JSON.parse(fs.readFileSync(bridgeManifestPath, 'utf8'));
-    return normalizeBridgeManifestConfig(manifestJson);
+    return supportedOperationalProfile(normalizeBridgeManifestConfig(manifestJson));
   }
 
   // The deployment JSON remains the local/devnet default until manifest-based
   // startup becomes the universal operator path.
   const handlerJson = JSON.parse(fs.readFileSync(explicitHandlerPath || DEFAULT_HANDLER_JSON_PATH, 'utf8'));
-  return normalizeHandlerJsonDeploymentConfig(handlerJson, cardano);
+  return supportedOperationalProfile(normalizeHandlerJsonDeploymentConfig(handlerJson, cardano));
 }

@@ -3,6 +3,8 @@ import { GrpcMethod } from '@nestjs/microservices';
 import {
   MsgCreateClientResponse,
   MsgCreateClient,
+  MsgUpgradeClient,
+  MsgUpgradeClientResponse,
   MsgRecoverClient,
   MsgRecoverClientResponse,
   MsgUpdateClient,
@@ -45,27 +47,59 @@ import {
 import { ConnectionService } from './connection.service';
 import { ClientService } from './client.service';
 import { ChannelService } from './channel.service';
+import { ChannelUpgradeService } from './channel-upgrade.service';
+import {
+  MsgChannelUpgradeInit,
+  MsgChannelUpgradeInitResponse,
+  MsgChannelUpgradeTry,
+  MsgChannelUpgradeTryResponse,
+  MsgChannelUpgradeAck,
+  MsgChannelUpgradeAckResponse,
+  MsgChannelUpgradeConfirm,
+  MsgChannelUpgradeConfirmResponse,
+  MsgChannelUpgradeOpen,
+  MsgChannelUpgradeOpenResponse,
+  MsgChannelUpgradeTimeout,
+  MsgChannelUpgradeTimeoutResponse,
+  MsgChannelUpgradeCancel,
+  MsgChannelUpgradeCancelResponse,
+  MsgChannelUpgradeFlush,
+  MsgChannelUpgradeFlushResponse,
+} from '@cardano-ibc/proto-types/build/ibc/core/channel/v1/tx';
+import { PacketLaneService, BuildPacketBatchRequest, BuildPacketBatchResponse } from './packet-lane.service';
 import { PacketService } from './packet.service';
 import { SubmissionService } from './submission.service';
 import { SubmitSignedTxRequest, SubmitSignedTxResponse } from './dto/submit-signed-tx.dto';
 import { BuildHostStateHeartbeatRequest, BuildHostStateHeartbeatResponse } from './dto/host-state-heartbeat.dto';
-import { MsgPrunePacketHistory, MsgPrunePacketHistoryResponse } from '@cardano-ibc/proto-types/build/ibc/cardano/v1/tx';
+import {
+  CompactPacketBalancesRequest,
+  MsgPrunePacketHistory,
+  MsgPrunePacketHistoryResponse,
+} from '@cardano-ibc/proto-types/build/ibc/cardano/v1/tx';
 import { validateAndFormatPrunePacketHistoryParams } from './helper/packet.validate';
 import { HostStateHeartbeatService } from './host-state-heartbeat.service';
 import { GrpcAuthGuard } from '../security/grpc-auth.guard';
+import { HistoricalReadOnlyGuard } from '../security/historical-read-only.guard';
 import { ObserveTxRequest, ObserveTxResponse } from './dto/observe-tx.dto';
 
 @Controller()
-@UseGuards(GrpcAuthGuard)
+@UseGuards(GrpcAuthGuard, HistoricalReadOnlyGuard)
 export class TxController {
   constructor(
     private readonly clientService: ClientService,
     private readonly connectionService: ConnectionService,
     private readonly channelService: ChannelService,
+    private readonly channelUpgradeService: ChannelUpgradeService,
     private readonly packetService: PacketService,
+    private readonly packetLaneService: PacketLaneService,
     private readonly submissionService: SubmissionService,
     private readonly hostStateHeartbeatService: HostStateHeartbeatService,
   ) {}
+
+  @GrpcMethod('CardanoMsg', 'CompactPacketBalances')
+  async CompactPacketBalances(data: CompactPacketBalancesRequest): Promise<MsgPrunePacketHistoryResponse> {
+    return this.packetLaneService.compactBalances(data);
+  }
 
   @GrpcMethod('Msg', 'CreateClient')
   async CreateClient(data: MsgCreateClient): Promise<MsgCreateClientResponse> {
@@ -77,6 +111,11 @@ export class TxController {
     const response: MsgUpdateClientResponse = await this.clientService.updateClient(data);
     return response;
   }
+  @GrpcMethod('Msg', 'UpgradeClient')
+  async UpgradeClient(data: MsgUpgradeClient): Promise<MsgUpgradeClientResponse> {
+    return this.clientService.upgradeClient(data);
+  }
+
   @GrpcMethod('Msg', 'RecoverClient')
   async RecoverClient(data: MsgRecoverClient): Promise<MsgRecoverClientResponse> {
     return this.clientService.recoverClient(data);
@@ -127,26 +166,35 @@ export class TxController {
   }
   @GrpcMethod('Msg', 'RecvPacket')
   async RecvPacket(data: MsgRecvPacket): Promise<MsgRecvPacketResponse> {
+    if (data.packet?.destination_port === 'transfer') return this.packetLaneService.settle(data, 'receive');
     const response: MsgRecvPacketResponse = await this.packetService.recvPacket(data);
     return response;
   }
+  @GrpcMethod('CardanoMsg', 'BuildPacketBatch')
+  async BuildPacketBatch(data: BuildPacketBatchRequest): Promise<BuildPacketBatchResponse> {
+    return this.packetLaneService.batch(data);
+  }
+
   @GrpcMethod('Msg', 'Transfer')
   async Transfer(data: MsgTransfer): Promise<MsgTransferResponse> {
-    const response: MsgTransferResponse = await this.packetService.sendPacket(data);
+    const response: MsgTransferResponse = await this.packetLaneService.admit(data);
     return response;
   }
   @GrpcMethod('Msg', 'Acknowledgement')
   async Acknowledgement(data: MsgAcknowledgement): Promise<MsgAcknowledgementResponse> {
+    if (data.packet?.source_port === 'transfer') return this.packetLaneService.settle(data, 'acknowledge');
     const response: MsgAcknowledgementResponse = await this.packetService.acknowledgementPacket(data);
     return response;
   }
   @GrpcMethod('Msg', 'Timeout')
   async Timeout(data: MsgTimeout): Promise<MsgTimeoutResponse> {
+    if (data.packet?.source_port === 'transfer') return this.packetLaneService.settle(data, 'timeout');
     const response: MsgTimeoutResponse = await this.packetService.timeoutPacket(data);
     return response;
   }
   @GrpcMethod('Msg', 'TimeoutOnClose')
   async TimeoutOnClose(data: MsgTimeoutOnClose): Promise<MsgTimeoutOnCloseResponse> {
+    if (data.packet?.source_port === 'transfer') return this.packetLaneService.settle(data, 'timeout');
     const response: MsgTimeoutOnCloseResponse = await this.packetService.timeoutOnClosePacket(data);
     return response;
   }
@@ -159,6 +207,39 @@ export class TxController {
   async ChannelCloseConfirm(data: MsgChannelCloseConfirm): Promise<MsgChannelCloseConfirmResponse> {
     const response: MsgChannelCloseConfirmResponse = await this.channelService.channelCloseConfirm(data);
     return response;
+  }
+
+  @GrpcMethod('Msg', 'ChannelUpgradeInit')
+  async ChannelUpgradeInit(data: MsgChannelUpgradeInit): Promise<MsgChannelUpgradeInitResponse> {
+    return this.channelUpgradeService.channelUpgradeInit(data);
+  }
+  @GrpcMethod('Msg', 'ChannelUpgradeTry')
+  async ChannelUpgradeTry(data: MsgChannelUpgradeTry): Promise<MsgChannelUpgradeTryResponse> {
+    return this.channelUpgradeService.channelUpgradeTry(data);
+  }
+  @GrpcMethod('Msg', 'ChannelUpgradeAck')
+  async ChannelUpgradeAck(data: MsgChannelUpgradeAck): Promise<MsgChannelUpgradeAckResponse> {
+    return this.channelUpgradeService.channelUpgradeAck(data);
+  }
+  @GrpcMethod('Msg', 'ChannelUpgradeConfirm')
+  async ChannelUpgradeConfirm(data: MsgChannelUpgradeConfirm): Promise<MsgChannelUpgradeConfirmResponse> {
+    return this.channelUpgradeService.channelUpgradeConfirm(data);
+  }
+  @GrpcMethod('Msg', 'ChannelUpgradeOpen')
+  async ChannelUpgradeOpen(data: MsgChannelUpgradeOpen): Promise<MsgChannelUpgradeOpenResponse> {
+    return this.channelUpgradeService.channelUpgradeOpen(data);
+  }
+  @GrpcMethod('Msg', 'ChannelUpgradeTimeout')
+  async ChannelUpgradeTimeout(data: MsgChannelUpgradeTimeout): Promise<MsgChannelUpgradeTimeoutResponse> {
+    return this.channelUpgradeService.channelUpgradeTimeout(data);
+  }
+  @GrpcMethod('Msg', 'ChannelUpgradeCancel')
+  async ChannelUpgradeCancel(data: MsgChannelUpgradeCancel): Promise<MsgChannelUpgradeCancelResponse> {
+    return this.channelUpgradeService.channelUpgradeCancel(data);
+  }
+  @GrpcMethod('Msg', 'ChannelUpgradeFlush')
+  async ChannelUpgradeFlush(data: MsgChannelUpgradeFlush): Promise<MsgChannelUpgradeFlushResponse> {
+    return this.channelUpgradeService.channelUpgradeFlush(data);
   }
 
   /**

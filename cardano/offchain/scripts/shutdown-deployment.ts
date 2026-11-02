@@ -1,3 +1,13 @@
+import { toOgmiosScript } from "../src/ogmios-script.ts";
+import {
+  assertNoDeploymentState,
+  assertStateDrained,
+  buildReclaimEscrowTx,
+  buildReclaimStateTx,
+  buildRetirePacketLanesTx,
+  packetShutdownReferences,
+  scanDeploymentState,
+} from "../src/shutdown.ts";
 import {
   applyDoubleCborEncoding,
   Data,
@@ -5,11 +15,9 @@ import {
   getAddressDetails,
   Kupmios,
   type LucidEvolution,
-  slotToUnixTime,
   type UTxO,
   validatorToScriptHash,
 } from "@lucid-evolution/lucid";
-import { applySingleCborEncoding } from "@lucid-evolution/utils";
 import {
   installManagedCardanoAuthFetch,
   resolveManagedKupmiosHeaders,
@@ -36,7 +44,13 @@ import {
   type HostStateRedeemer as HostStateRedeemerType,
 } from "../types/index.ts";
 
-type Command = "status" | "enter" | "reclaim-reference-scripts" | "finalize";
+type Command =
+  | "status"
+  | "claim-backup"
+  | "enter"
+  | "reclaim-state"
+  | "reclaim-reference-scripts"
+  | "finalize";
 
 type ScriptArgs = {
   command: Command;
@@ -54,7 +68,10 @@ const TX_VALIDITY_WINDOW_MS = 10 * 60 * 1000;
 export const MIN_SHUTDOWN_GRACE_PERIOD_MS = 24 * 60 * 60 * 1000;
 
 export function shutdownTiming(
-  lucid: Pick<LucidEvolution, "config" | "unixTimeToSlot">,
+  lucid: Pick<
+    LucidEvolution,
+    "config" | "unixTimeToSlot" | "slotToUnixTime"
+  >,
   grace: Pick<ScriptArgs, "gracePeriodEnd" | "gracePeriodMs">,
   now = Date.now(),
 ) {
@@ -67,9 +84,8 @@ export function shutdownTiming(
   if (!network) {
     throw new Error("Shutdown requires a configured Cardano network");
   }
-  const validFrom = slotToUnixTime(network, lucid.unixTimeToSlot(now));
-  const validTo = slotToUnixTime(
-    network,
+  const validFrom = lucid.slotToUnixTime(lucid.unixTimeToSlot(now));
+  const validTo = lucid.slotToUnixTime(
     lucid.unixTimeToSlot(now + TX_VALIDITY_WINDOW_MS),
   );
   const gracePeriodEnd = grace.gracePeriodEnd ?? validTo + grace.gracePeriodMs!;
@@ -109,32 +125,6 @@ type RawKupoUtxo = {
 };
 
 function toOgmiosAdditionalUtxos(utxos: any[] = []): any[] {
-  const toOgmiosScript = (scriptRef: any) => {
-    if (!scriptRef) {
-      return null;
-    }
-
-    switch (scriptRef.type) {
-      case "PlutusV1":
-        return {
-          language: "plutus:v1",
-          cbor: applySingleCborEncoding(scriptRef.script),
-        };
-      case "PlutusV2":
-        return {
-          language: "plutus:v2",
-          cbor: applySingleCborEncoding(scriptRef.script),
-        };
-      case "PlutusV3":
-        return {
-          language: "plutus:v3",
-          cbor: applySingleCborEncoding(scriptRef.script),
-        };
-      default:
-        return null;
-    }
-  };
-
   const toOgmiosAssets = (assets: Record<string, bigint>) => {
     const mapped: Record<string, Record<string, number>> = {};
     Object.entries(assets ?? {}).forEach(([unit, amount]) => {
@@ -534,6 +524,16 @@ class ManagedDmtrKupmios extends KupmiosWithExtendedSubmitTimeout {
     }
     throw new Error(`Timed out waiting for tx ${txHash} to settle`);
   }
+
+  /** Includes spent outputs, for resolving an interrupted migration submission. */
+  async getTransactionOutputs(txHash: string): Promise<UTxO[]> {
+    if (!/^[0-9a-f]{64}$/.test(txHash)) {
+      throw new Error("Invalid transaction hash");
+    }
+    return await this.#fetchMatchUtxos(
+      `${this.#kupoMatchesUrl}/matches/*@${txHash}`,
+    );
+  }
 }
 
 function usage(): never {
@@ -541,7 +541,9 @@ function usage(): never {
     [
       "Usage:",
       "  deno run --env-file=.env.default --allow-net --allow-env --allow-read --allow-run --allow-ffi scripts/shutdown-deployment.ts status [--handler-json <path>]",
+      "  deno run --env-file=.env.default --allow-net --allow-env --allow-read --allow-run --allow-ffi scripts/shutdown-deployment.ts claim-backup [--handler-json <path>]",
       "  deno run --env-file=.env.default --allow-net --allow-env --allow-read --allow-run --allow-ffi scripts/shutdown-deployment.ts enter (--grace-period-ms <ms> | --grace-period-end <unix-ms>) [--handler-json <path>]",
+      "  deno run --env-file=.env.default --allow-net --allow-env --allow-read --allow-run --allow-ffi scripts/shutdown-deployment.ts reclaim-state [--batch-size <n>] [--handler-json <path>]",
       "  deno run --env-file=.env.default --allow-net --allow-env --allow-read --allow-run --allow-ffi scripts/shutdown-deployment.ts reclaim-reference-scripts [--batch-size <n>] [--handler-json <path>]",
       "  deno run --env-file=.env.default --allow-net --allow-env --allow-read --allow-run --allow-ffi scripts/shutdown-deployment.ts finalize [--handler-json <path>]",
       "",
@@ -565,7 +567,9 @@ function parseArgs(argv: string[]): ScriptArgs {
   const command = argv[0] as Command | undefined;
   if (
     command !== "status" &&
+    command !== "claim-backup" &&
     command !== "enter" &&
+    command !== "reclaim-state" &&
     command !== "reclaim-reference-scripts" &&
     command !== "finalize"
   ) {
@@ -632,15 +636,24 @@ function parseArgs(argv: string[]): ScriptArgs {
   };
 }
 
-async function buildLucid(): Promise<LucidEvolution> {
-  const deployerSk = Deno.env.get("DEPLOYER_SK");
+export async function buildOperationalLucid(
+  options: {
+    keyEnvironment?: string;
+    walletAddress?: string;
+    readOnly?: boolean;
+  } = {},
+): Promise<LucidEvolution> {
+  const deployerSk = Deno.env.get(options.keyEnvironment ?? "DEPLOYER_SK");
   const kupoUrl = Deno.env.get("KUPO_URL");
   const ogmiosUrl = Deno.env.get("OGMIOS_URL");
   const cardanoNetworkMagic = Deno.env.get("CARDANO_NETWORK_MAGIC");
   const kupoApiKey = Deno.env.get("KUPO_API_KEY")?.trim();
   const ogmiosApiKey = Deno.env.get("OGMIOS_API_KEY")?.trim();
 
-  if (!deployerSk || !kupoUrl || !ogmiosUrl || !cardanoNetworkMagic) {
+  if (
+    (!deployerSk && !options.readOnly && !options.walletAddress) || !kupoUrl ||
+    !ogmiosUrl || !cardanoNetworkMagic
+  ) {
     throw new Error("Missing required Cardano offchain environment variables");
   }
 
@@ -671,7 +684,13 @@ async function buildLucid(): Promise<LucidEvolution> {
     ogmiosUrl,
     cardanoNetworkMagic,
   );
-  lucid.selectWallet.fromPrivateKey(deployerSk);
+  if (deployerSk) lucid.selectWallet.fromPrivateKey(deployerSk);
+  else if (options.walletAddress) {
+    lucid.selectWallet.fromAddress(
+      options.walletAddress,
+      await lucid.utxosAt(options.walletAddress),
+    );
+  }
   return lucid;
 }
 
@@ -768,6 +787,18 @@ function deploymentReferenceOutRefs(
       refs.push(
         ...Object.values(validator.refValidator).map((entry) => entry.refUtxo),
       );
+    }
+  }
+  if (deployment.packetState) {
+    for (
+      const validator of [
+        deployment.packetState.state,
+        deployment.packetState.batch,
+        deployment.packetState.guard,
+        ...Object.values(deployment.packetState.operations),
+      ]
+    ) {
+      if (validator.refUtxo) refs.push(validator.refUtxo);
     }
   }
   return [...new Map(
@@ -943,8 +974,19 @@ async function status(lucid: LucidEvolution, deployment: DeploymentTemplate) {
     hostState: {
       unit: hostStateUnit(deployment),
       utxo: `${hostUtxo.txHash}#${hostUtxo.outputIndex}`,
+      deployer: hostDatum.deployer,
+      backupOperator: deployment.backupOperatorKeyHash ?? null,
       shutdown: hostDatum.control.shutdown,
     },
+    state: (await scanDeploymentState(lucid, deployment)).map((group) => ({
+      kind: group.kind,
+      remainingUtxos: group.utxos.length,
+      lovelace: group.utxos.reduce(
+        (total, utxo) => total + (utxo.assets.lovelace ?? 0n),
+        0n,
+      ),
+    })),
+    recoveryStakeRegistered: await recoveryStakeRegistered(deployment),
     referenceScripts: {
       address: referenceValidatorAddress,
       liveUtxos: referenceScriptUtxos.length,
@@ -952,7 +994,57 @@ async function status(lucid: LucidEvolution, deployment: DeploymentTemplate) {
   }));
 }
 
-async function enterShutdown(
+export async function claimBackup(
+  lucid: LucidEvolution,
+  deployment: DeploymentTemplate,
+) {
+  const backupOperator = deployment.backupOperatorKeyHash;
+  if (!backupOperator) {
+    throw new Error("This deployment did not name a backup operator");
+  }
+  const signerKeyHash = deployerPaymentKeyHash(await lucid.wallet().address());
+  if (signerKeyHash.toLowerCase() !== backupOperator.toLowerCase()) {
+    throw new Error("The selected wallet is not the named backup operator");
+  }
+  const hostUtxo = await getHostStateUtxo(lucid, deployment);
+  const currentDatum = decodeHostStateDatum(hostUtxo);
+  if (currentDatum.deployer.toLowerCase() === signerKeyHash.toLowerCase()) {
+    throw new Error("The backup operator is already the deployer");
+  }
+  const updatedDatum: HostStateDatumType = {
+    ...currentDatum,
+    deployer: signerKeyHash,
+    state: {
+      ...currentDatum.state,
+      version: currentDatum.state.version + 1n,
+    },
+  };
+  const hostStateSttReferenceUtxo = await refreshUtxoByRef(
+    lucid,
+    normalizeUtxo(deployment.validators.hostStateStt.refUtxo),
+  );
+  const txHash = await submitTx(
+    () =>
+      lucid
+        .newTx()
+        .readFrom([hostStateSttReferenceUtxo])
+        .collectFrom([hostUtxo], Data.to("ClaimBackup", HostStateRedeemer))
+        .pay.ToContract(
+          deployment.validators.hostStateStt.address,
+          {
+            kind: "inline",
+            value: Data.to(updatedDatum, HostStateDatum, { canonical: true }),
+          },
+          hostUtxo.assets,
+        )
+        .addSignerKey(signerKeyHash),
+    lucid,
+    "ClaimDeployerBackup",
+  );
+  console.log(toJson({ txHash, deployer: signerKeyHash }));
+}
+
+export async function enterShutdown(
   lucid: LucidEvolution,
   deployment: DeploymentTemplate,
   grace: Pick<ScriptArgs, "gracePeriodEnd" | "gracePeriodMs">,
@@ -1023,11 +1115,214 @@ async function enterShutdown(
   }));
 }
 
+async function recoveryStakeRegistered(
+  deployment: DeploymentTemplate,
+): Promise<boolean> {
+  const recovery = deployment.validators.recoverClient;
+  if (!recovery) return false;
+  const ogmiosUrl = Deno.env.get("OGMIOS_URL");
+  if (!ogmiosUrl) {
+    throw new Error(
+      "OGMIOS_URL is required to check the recovery staking deposit",
+    );
+  }
+  const response = await queryOgmiosJsonRpc(
+    ogmiosUrl,
+    "queryLedgerState/rewardAccountSummaries",
+    {
+      keys: [
+        recovery.address,
+        ...(deployment.validators.updateClient
+          ? [deployment.validators.updateClient.address]
+          : []),
+      ],
+    },
+    30000,
+    5,
+  );
+  if (response.error) {
+    throw new Error(
+      `Cannot check recovery staking registration: ${toJson(response.error)}`,
+    );
+  }
+  if (response.result === null) return false;
+  if (
+    !response.result || typeof response.result !== "object" ||
+    Array.isArray(response.result)
+  ) {
+    throw new Error("Ogmios did not return recovery staking registration data");
+  }
+  return Object.keys(response.result).length !== 0;
+}
+
+export function buildReclaimRecoveryStakeTx(
+  lucid: LucidEvolution,
+  deployment: DeploymentTemplate,
+  hostUtxo: UTxO,
+  signerKeyHash: string,
+  validFrom: number,
+) {
+  const recovery = deployment.validators.recoverClient;
+  if (!recovery) throw new Error("Missing client recovery validator");
+  const update = deployment.validators.updateClient;
+  const tx = lucid.newTx().readFrom([hostUtxo, recovery.refUtxo]);
+  if (update) {
+    tx.readFrom([update.refUtxo]).deregister.Stake(update.address, Data.void());
+  }
+  return tx.deregister.Stake(recovery.address, Data.void())
+    .addSignerKey(signerKeyHash)
+    .validFrom(validFrom).validTo(validFrom + TX_VALIDITY_WINDOW_MS);
+}
+
+async function requireCleanupComplete(
+  lucid: LucidEvolution,
+  deployment: DeploymentTemplate,
+) {
+  assertNoDeploymentState(await scanDeploymentState(lucid, deployment));
+  if (await recoveryStakeRegistered(deployment)) {
+    throw new Error(
+      "Reclaim the client recovery staking deposit before removing scripts or finalizing shutdown",
+    );
+  }
+}
+
+async function reclaimState(
+  lucid: LucidEvolution,
+  deployment: DeploymentTemplate,
+  batchSize: number,
+) {
+  const walletAddress = await lucid.wallet().address();
+  const signer = deployerPaymentKeyHash(walletAddress);
+  const hostUtxo = await getHostStateUtxo(lucid, deployment);
+  const graceEnd = requireShutdownGracePeriodEnd(
+    decodeHostStateDatum(hostUtxo),
+  );
+  let groups = await scanDeploymentState(lucid, deployment);
+  assertStateDrained(groups, deployment);
+  requireGracePeriodElapsed(graceEnd);
+
+  // Each shard is removed from the authenticated registry before the root can close.
+  while (true) {
+    const transfer = groups.find((group) => group.kind === "transfer");
+    const policy = deployment.validators.mintTransferEscrowShard.scriptHash;
+    const shard = transfer?.utxos.find((utxo) =>
+      Object.keys(utxo.assets).some((unit) => unit.startsWith(policy))
+    );
+    if (!transfer || !shard) break;
+    const tx = await buildReclaimEscrowTx(
+      lucid,
+      deployment,
+      hostUtxo,
+      transfer,
+      shard,
+      walletAddress,
+      requireGracePeriodElapsed(graceEnd),
+    );
+    await submitTx(() => tx, lucid, "ReclaimEmptyEscrow");
+    groups = await scanDeploymentState(lucid, deployment);
+    assertStateDrained(groups, deployment);
+  }
+
+  for (
+    const kind of [
+      "channel",
+      "connection",
+      "client",
+      "module",
+      "trace",
+      "metadata",
+      "transfer",
+      "packet-certificates",
+      "packet-registry",
+      "packet-config",
+    ] as const
+  ) {
+    while (true) {
+      groups = await scanDeploymentState(lucid, deployment);
+      assertStateDrained(groups, deployment);
+      const group = groups.find((entry) =>
+        entry.kind === kind && entry.utxos.length > 0
+      );
+      if (!group) break;
+      const batch = {
+        ...group,
+        utxos: group.utxos.slice(
+          0,
+          kind === "client" || kind === "connection" || kind === "channel"
+            ? 1
+            : batchSize,
+        ),
+      };
+      const transferRoot = groups.find((entry) => entry.kind === "transfer")
+        ?.utxos.find((utxo) =>
+          utxo.assets[deployment.modules.transfer.identifier] === 1n
+        );
+      const liveHostUtxo = await getHostStateUtxo(lucid, deployment);
+      if (kind === "channel") {
+        const retirement = await buildRetirePacketLanesTx(
+          lucid,
+          deployment,
+          liveHostUtxo,
+          batch.utxos[0],
+          walletAddress,
+          requireGracePeriodElapsed(graceEnd),
+        );
+        if (retirement) {
+          await submitTx(() => retirement, lucid, "Retire packet lanes");
+          continue;
+        }
+      }
+      const packetReferences = await packetShutdownReferences(
+        lucid,
+        deployment,
+        batch,
+      );
+      await submitTx(
+        () =>
+          buildReclaimStateTx(
+            lucid,
+            deployment,
+            liveHostUtxo,
+            batch,
+            walletAddress,
+            requireGracePeriodElapsed(graceEnd),
+            ["packet-registry", "packet-certificates"].includes(kind)
+              ? groups.find((entry) => entry.kind === "packet-config")?.utxos[0]
+              : transferRoot,
+            packetReferences,
+          ),
+        lucid,
+        `Reclaim ${kind}`,
+      );
+    }
+  }
+  if (await recoveryStakeRegistered(deployment)) {
+    const liveHostUtxo = await getHostStateUtxo(lucid, deployment);
+    await submitTx(
+      () =>
+        buildReclaimRecoveryStakeTx(
+          lucid,
+          deployment,
+          liveHostUtxo,
+          signer,
+          requireGracePeriodElapsed(graceEnd),
+        ),
+      lucid,
+      "ReclaimRecoveryStakingDeposit",
+    );
+  }
+  await requireCleanupComplete(lucid, deployment);
+  console.log(
+    "Deployment state and the recovery staking deposit have been reclaimed.",
+  );
+}
+
 async function reclaimReferenceScripts(
   lucid: LucidEvolution,
   deployment: DeploymentTemplate,
   batchSize: number,
 ) {
+  await requireCleanupComplete(lucid, deployment);
   const walletAddress = await lucid.wallet().address();
   const signerKeyHash = deployerPaymentKeyHash(walletAddress);
   const hostUtxo = await getHostStateUtxo(lucid, deployment);
@@ -1082,6 +1377,7 @@ async function finalizeShutdown(
   lucid: LucidEvolution,
   deployment: DeploymentTemplate,
 ) {
+  await requireCleanupComplete(lucid, deployment);
   const walletAddress = await lucid.wallet().address();
   const signerKeyHash = deployerPaymentKeyHash(walletAddress);
   const hostUtxo = await getHostStateUtxo(lucid, deployment);
@@ -1166,16 +1462,27 @@ export function buildFinalizeShutdownTx(
 async function main() {
   const args = parseArgs(Deno.args);
   const deployment = await loadDeployment(args.handlerJsonPath);
-  const lucid = await buildLucid();
+  if (deployment.migration && args.command !== "status") {
+    throw new Error(
+      "Shutdown and cleanup are disabled for this upgrade-capable profile; dependencies must remain available for outstanding claims. Use the migration commands.",
+    );
+  }
+  const lucid = await buildOperationalLucid();
 
   switch (args.command) {
     case "status":
       await status(lucid, deployment);
       break;
+    case "claim-backup":
+      await claimBackup(lucid, deployment);
+      break;
     case "enter": {
       await enterShutdown(lucid, deployment, args);
       break;
     }
+    case "reclaim-state":
+      await reclaimState(lucid, deployment, args.batchSize);
+      break;
     case "reclaim-reference-scripts":
       await reclaimReferenceScripts(lucid, deployment, args.batchSize);
       break;

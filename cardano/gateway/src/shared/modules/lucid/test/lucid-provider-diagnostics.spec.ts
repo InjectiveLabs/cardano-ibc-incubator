@@ -4,6 +4,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { gatewayDiagnostics } from '../../../helpers/gateway-diagnostics';
 import { LucidClient } from '../lucid.provider';
+import * as time from '../../../helpers/time';
 
 type EvaluationProvider = {
   evaluateTx: (tx: string, additionalUTxOs?: unknown[]) => Promise<unknown>;
@@ -36,6 +37,7 @@ describe('Lucid provider evaluation diagnostics', () => {
       new Response(
         JSON.stringify({
           result: {
+            version: { major: 11, minor: 0 },
             utxoCostPerByte: 4310,
             plutusCostModels: { 'plutus:v1': [1], 'plutus:v2': [2] },
             scriptExecutionPrices: { memory: '1/100', cpu: '1/1000' },
@@ -55,6 +57,27 @@ describe('Lucid provider evaluation diagnostics', () => {
     );
     return provider;
   }
+
+  it('passes actual Custom slot timing into Lucid before construction', async () => {
+    const timing = { zeroTime: 1_000_000, zeroSlot: 0, slotLength: 200 };
+    jest.spyOn(time, 'queryLocalSlotConfig').mockResolvedValue(timing);
+    const construct = jest.fn(async () => ({}));
+    const slotConfig = { Custom: { zeroTime: 0, zeroSlot: 0, slotLength: 0 } };
+    jest.spyOn(globalThis, 'eval').mockReturnValueOnce(Promise.resolve({
+      Kupmios: jest.fn(() => ({})), Lucid: construct, SLOT_CONFIG_NETWORK: slotConfig,
+    }));
+    jest.spyOn(globalThis, 'fetch').mockResolvedValueOnce(new Response(JSON.stringify({ result: {
+      version: { major: 11, minor: 0 },
+      utxoCostPerByte: 4310, plutusCostModels: { 'plutus:v3': [1] },
+      scriptExecutionPrices: { memory: '1/100', cpu: '1/1000' },
+    } })));
+    await LucidClient.useFactory(new ConfigService({
+      cardanoNetwork: 'Custom', kupoEndpoint: 'http://localhost:1442',
+      ogmiosEndpoint: 'http://localhost:1337', kupoApiKey: '', ogmiosApiKey: '',
+    }));
+    expect(construct).toHaveBeenCalledWith(expect.anything(), 'Custom', expect.objectContaining({ slotConfig: timing }));
+    expect(slotConfig.Custom).toEqual(timing);
+  });
 
   beforeEach(async () => {
     temporaryDirectory = await fs.promises.mkdtemp(join(tmpdir(), 'lucid-provider-diagnostics-test-'));
@@ -90,6 +113,27 @@ describe('Lucid provider evaluation diagnostics', () => {
     expect(evaluateTx.mock.contexts[0]).toBe(provider);
     expect(record).not.toHaveBeenCalled();
     expect(await fs.promises.readdir(temporaryDirectory)).toEqual([]);
+  });
+
+  it('evaluates an unsubmitted session dependency even when a reference script needs ledger fallback', async () => {
+    const session = { txHash: 'session-init', outputIndex: 0, datum: 'd87980', assets: { lovelace: 2_000_000n } };
+    const change = { txHash: 'session-init', outputIndex: 1, assets: { lovelace: 10_000_000n } };
+    const reference = { txHash: 'published-script', outputIndex: 0, scriptRef: { type: 'PlutusV3', script: '00' } };
+    const result = [{ redeemer_tag: 'spend', redeemer_index: 0, ex_units: { mem: 512534, steps: 176524731 } }];
+    const evaluateTx = jest.fn(async (_tx: string, inputs?: unknown[]) => {
+      // The session and its change do not exist on-chain until the earlier link
+      // is submitted. Resolving only indexed inputs cannot evaluate this spend.
+      if (!inputs?.includes(session) || !inputs.includes(change)) {
+        throw new Error('Unknown transaction input: session-init#0');
+      }
+      if (inputs.includes(reference)) throw new Error("Invalid request: couldn't decode plutus script.");
+      return result;
+    });
+    const provider = await createProvider(evaluateTx);
+
+    await expect(provider.evaluateTx('session-advance', [session, change, reference])).resolves.toBe(result);
+    expect(evaluateTx).toHaveBeenCalledTimes(2);
+    expect(evaluateTx).toHaveBeenLastCalledWith('session-advance', [session, change]);
   });
 
   it('preserves the original rejection without serializing or writing diagnostics by default', async () => {
@@ -128,8 +172,12 @@ describe('Lucid provider evaluation diagnostics', () => {
     await drainDiagnostics();
 
     const filenames = await fs.promises.readdir(directory);
-    expect(filenames).toHaveLength(1);
-    expect(JSON.parse(await fs.promises.readFile(join(directory, filenames[0]), 'utf8'))).toEqual(
+    expect(filenames).toHaveLength(2);
+    const records = await Promise.all(filenames.map(async (filename) =>
+      JSON.parse(await fs.promises.readFile(join(directory, filename), 'utf8')),
+    ));
+    expect(records.find((record) => record.scope === 'evaluateTx-body')?.details).toEqual({ txCbor: 'a100' });
+    expect(records.find((record) => record.scope === 'evaluateTx-failure')).toEqual(
       expect.objectContaining({
         scope: 'evaluateTx-failure',
         details: {
@@ -153,8 +201,10 @@ describe('Lucid provider evaluation diagnostics', () => {
     expect(evaluateTx).toHaveBeenCalledTimes(1);
     await drainDiagnostics();
 
-    const [filename] = await fs.promises.readdir(directory);
-    expect(JSON.parse(await fs.promises.readFile(join(directory, filename), 'utf8')).details.error).toEqual({
+    const records = await Promise.all((await fs.promises.readdir(directory)).map(async (filename) =>
+      JSON.parse(await fs.promises.readFile(join(directory, filename), 'utf8')),
+    ));
+    expect(records.find((record) => record.scope === 'evaluateTx-failure')?.details.error).toEqual({
       name: (rejection as Error).name,
       message: (rejection as Error).message,
       stack: (rejection as Error).stack,
@@ -171,8 +221,10 @@ describe('Lucid provider evaluation diagnostics', () => {
     await drainDiagnostics();
 
     expect(evaluateTx).toHaveBeenCalledWith('a100', undefined);
-    const [filename] = await fs.promises.readdir(directory);
-    expect(JSON.parse(await fs.promises.readFile(join(directory, filename), 'utf8')).details).toEqual({
+    const records = await Promise.all((await fs.promises.readdir(directory)).map(async (filename) =>
+      JSON.parse(await fs.promises.readFile(join(directory, filename), 'utf8')),
+    ));
+    expect(records.find((record) => record.scope === 'evaluateTx-failure')?.details).toEqual({
       txCbor: 'a100',
       additionalUTxOs: [],
       error,

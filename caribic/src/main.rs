@@ -7,6 +7,7 @@ use crate::utils::default_config_path;
 use clap::Parser;
 use clap::Subcommand;
 
+mod bridge_history;
 mod chains;
 mod check;
 mod commands;
@@ -14,6 +15,7 @@ mod config;
 mod demos;
 mod install;
 mod light_client_test;
+mod local_network;
 mod logger;
 mod process;
 mod route_setup;
@@ -25,7 +27,9 @@ mod utils;
 
 #[derive(clap::ValueEnum, Clone, Debug, PartialEq)]
 enum DemoType {
-    /// Starts the token-swap demo preset using a running bridge plus selected chain/network
+    /// Transfers tokens between Cardano and Cosmos or Injective
+    TokenTransfer,
+    /// Swaps a Cardano token through an Osmosis pool
     TokenSwap,
 }
 
@@ -33,11 +37,15 @@ enum DemoType {
 pub(crate) enum LightClientTest {
     /// Recover an expired probabilistic client through the ibc-go governance authority path
     RecoverClient,
+    /// Check signed staged challenges and recovery on isolated v8 applications
+    ChallengeRecovery,
+    /// Check committed deadline orderings and host interruption with the snapshot format
+    DeadlineOrdering,
 }
 
 #[derive(clap::ValueEnum, Clone, Debug, PartialEq)]
 enum StartTarget {
-    /// Starts everything (network + bridge + IBC Swap dapp)
+    /// Starts the network and bridge, plus the IBC Swap dapp where supported
     All,
     /// Starts the managed Cardano network/runtime services
     Network,
@@ -49,8 +57,6 @@ enum StartTarget {
     Dapp,
     /// Starts only the Hermes relayer
     Relayer,
-    /// Deprecated and disabled; retained for historical reference only
-    Mithril,
 }
 
 #[derive(clap::ValueEnum, Clone, Debug, PartialEq)]
@@ -69,8 +75,6 @@ enum StopTarget {
     Gateway,
     /// Stops only the Hermes relayer
     Relayer,
-    /// Stops only the Mithril services
-    Mithril,
 }
 
 #[derive(Parser)]
@@ -138,20 +142,30 @@ enum SetupCommand {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Propose or execute a governance-approved bridge admin handover
+    Deployer {
+        #[arg(value_parser = ["nominate-deployer", "graduate-deployer", "inspect", "cancel"])]
+        action: String,
+        /// Operator arguments such as --handler, --signers, --successor and --out
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Inspect or manage the Yaci DevKit local network
+    Devkit {
+        #[arg(value_enum)]
+        action: commands::devkit::DevkitAction,
+    },
     /// Verifies that all the prerequisites are installed and ensures that the configuration is correctly set up
     Check,
     /// Installs missing local prerequisites on macOS or Ubuntu Linux
     Install,
-    /// Starts bridge components. No argument starts the network, bridge, and IBC Swap dapp; optionally specify: all, network, bridge, gateway, dapp, relayer (mithril is disabled)
+    /// Starts bridge components. No argument starts the network and bridge, plus the IBC Swap dapp where supported. DevKit uses the Cosmos CLI workflow
     Start {
         #[arg(value_enum)]
         target: Option<StartTarget>,
         /// Cleans up the local environment before starting the services
         #[arg(long, default_value_t = false)]
         clean: bool,
-        /// Deprecated and disabled; use the default stake-weighted-stability light-client mode
-        #[arg(long, default_value_t = false)]
-        with_mithril: bool,
         /// Optional network profile for the managed Cardano runtime (local, preprod, preview)
         #[arg(long)]
         network: Option<String>,
@@ -159,7 +173,7 @@ enum Commands {
         #[arg(long = "chain-flag")]
         chain_flag: Vec<String>,
     },
-    /// Stops bridge components. No argument stops everything; optionally specify: all, network, bridge, dapp, demo, gateway, relayer, mithril
+    /// Stops bridge components. No argument stops everything; optionally specify: all, network, bridge, dapp, demo, gateway, relayer
     Stop {
         #[arg(value_enum)]
         target: Option<StopTarget>,
@@ -193,9 +207,10 @@ enum Commands {
         /// Cardano network profile to query
         #[arg(long, default_value = "preprod")]
         network: String,
-        /// Select the first block of tip_epoch - epochs_back
-        #[arg(long, default_value_t = 2)]
-        epochs_back: u64,
+        /// Select the block this many blocks below the tip (at least 2161, one
+        /// past the 2160-block rollback limit, so the checkpoint is final)
+        #[arg(long, default_value_t = commands::DEFAULT_YACI_CHECKPOINT_DEPTH)]
+        depth: u64,
         /// Write the network marker and YACI_SYNC_START_* values into cardano/gateway/.env
         #[arg(long, default_value_t = false)]
         write_env: bool,
@@ -246,11 +261,11 @@ enum Commands {
         #[command(subcommand)]
         command: SetupCommand,
     },
-    /// Starts a demo preset. Usage: `caribic demo token-swap --chain cosmos --network v8-classic`
+    /// Starts a demo preset. Usage: `caribic demo token-transfer --chain cosmos --network v8-classic`
     Demo {
         #[arg(value_enum)]
         use_case: DemoType,
-        /// Optional chain selector for demos that support multiple chains (currently token-swap)
+        /// Target chain (defaults to Cosmos for transfers and Osmosis for swaps)
         #[arg(long, value_enum)]
         chain: Option<start::OptionalChainId>,
         /// Optional network profile for the selected demo chain (for example: local, testnet)
@@ -396,6 +411,29 @@ async fn main() {
 
     // Dispatch each subcommand to its module-level handler.
     let command_result: Result<(), String> = match args.command {
+        Commands::Deployer { action, args } => {
+            let mut arguments = vec![
+                "run",
+                "--allow-net",
+                "--allow-env",
+                "--allow-read",
+                "--allow-write",
+                "--allow-run",
+                "--allow-ffi",
+                "scripts/migrate-deployment.ts",
+                action.as_str(),
+            ];
+            arguments.extend(args.iter().map(String::as_str));
+            utils::execute_script(
+                &project_root_path.join("cardano/offchain"),
+                "deno",
+                arguments,
+                None,
+            )
+            .map(|output| print!("{output}"))
+            .map_err(|error| error.to_string())
+        }
+        Commands::Devkit { action } => commands::devkit::run_devkit(project_root_path, action),
         Commands::Check => commands::run_check().await,
         Commands::Install => commands::run_install(project_root_path),
         Commands::Chains => commands::run_chains(),
@@ -413,21 +451,18 @@ async fn main() {
         Commands::Start {
             target,
             clean,
-            with_mithril,
             network,
             chain_flag,
-        } => commands::run_start(target, clean, with_mithril, network, chain_flag).await,
+        } => commands::run_start(target, clean, network, chain_flag).await,
         Commands::Keys { command } => commands::run_keys(project_root_path, command),
         Commands::HealthCheck { service } => {
             commands::run_health_check(project_root_path, service.as_deref())
         }
         Commands::YaciCheckpoint {
             network,
-            epochs_back,
+            depth,
             write_env,
-        } => {
-            commands::run_yaci_checkpoint(project_root_path, &network, epochs_back, write_env).await
-        }
+        } => commands::run_yaci_checkpoint(project_root_path, &network, depth, write_env).await,
         Commands::Audit => commands::run_audit(project_root_path),
         Commands::ListClients { chain } => commands::run_list_clients(&chain),
         Commands::CreateClient { a_chain, b_chain } => {
@@ -490,6 +525,63 @@ async fn main() {
 #[cfg(test)]
 mod cli_tests {
     use super::*;
+
+    #[test]
+    fn deployer_command_preserves_operator_arguments() {
+        let parsed = Args::try_parse_from([
+            "caribic",
+            "deployer",
+            "nominate-deployer",
+            "--handler",
+            "deployment.json",
+            "--signers",
+            "key1,key2",
+            "--out",
+            "approval.json",
+        ])
+        .unwrap();
+        match parsed.command {
+            Commands::Deployer { action, args } => {
+                assert_eq!(action, "nominate-deployer");
+                assert_eq!(
+                    args,
+                    [
+                        "--handler",
+                        "deployment.json",
+                        "--signers",
+                        "key1,key2",
+                        "--out",
+                        "approval.json"
+                    ]
+                );
+            }
+            _ => panic!("expected deployer command"),
+        }
+        assert!(Args::try_parse_from(["caribic", "deployer", "force"]).is_err());
+    }
+
+    #[test]
+    fn transfer_and_swap_demo_names_select_different_workflows() {
+        for (name, expected) in [
+            ("token-transfer", DemoType::TokenTransfer),
+            ("token-swap", DemoType::TokenSwap),
+        ] {
+            let args = Args::try_parse_from(["caribic", "demo", name]).unwrap();
+            match args.command {
+                Commands::Demo { use_case, .. } => assert_eq!(use_case, expected),
+                _ => panic!("expected demo command"),
+            }
+        }
+    }
+
+    #[test]
+    fn local_start_has_one_provisioner() {
+        assert!(
+            Args::try_parse_from(["caribic", "start", "network", "--network", "local"]).is_ok()
+        );
+        assert!(Args::try_parse_from(["caribic", "start", "--local-runtime", "legacy"]).is_err());
+        assert!(Args::try_parse_from(["caribic", "start", "--local-runtime", "devkit"]).is_err());
+    }
 
     #[test]
     fn light_client_flag_defaults_to_recover_client() {

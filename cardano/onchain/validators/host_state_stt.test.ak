@@ -9,12 +9,15 @@ use aiken/primitive/bytearray
 use aiken/primitive/int
 use aiken/primitive/string
 use cardano/address.{Address, Credential, Script, VerificationKey}
-use cardano/assets.{PolicyId, Value, add, from_asset, zero}
+use cardano/assets.{PolicyId, Value, add, from_asset, quantity_of, zero}
 use cardano/transaction.{
   InlineDatum, Input, NoDatum, Output, OutputReference, Redeemer, Spend,
   Transaction, placeholder,
 }
 use host_state_stt
+use ibc/apps/transfer/types/transfer_module_datum.{
+  TransferModuleDatum, empty_escrow_shard_registry_root,
+}
 use ibc/auth.{AuthToken}
 use ibc/client/ics_007_tendermint_client/client_datum.{
   ClientDatum, ClientDatumState,
@@ -25,6 +28,7 @@ use ibc/client/ics_007_tendermint_client/height.{Height} as height_mod
 use ibc/client/ics_007_tendermint_client/types/unchecked_rational.{
   UncheckedRational,
 }
+use ibc/core/ics_002_client_semantics/registry
 use ibc/core/ics_002_client_semantics/types/keys as client_id_keys
 use ibc/core/ics_003_connection_semantics/connection_datum.{ConnectionDatum}
 use ibc/core/ics_003_connection_semantics/types/connection_end.{ConnectionEnd}
@@ -33,7 +37,8 @@ use ibc/core/ics_003_connection_semantics/types/keys as connection_keys
 use ibc/core/ics_003_connection_semantics/types/state as connection_state
 use ibc/core/ics_003_connection_semantics/types/version.{Version}
 use ibc/core/ics_004/channel_datum.{
-  ChannelDatum, ChannelDatumState, max_packet_entries_per_channel,
+  ChannelDatum, ChannelDatumState, initial_upgrade_state,
+  max_packet_entries_per_channel,
 }
 use ibc/core/ics_004/channel_redeemer.{
   AcknowledgePacket, PrunePacketHistory as PruneChannelPacketHistory, RecvPacket,
@@ -58,12 +63,20 @@ use ibc/core/ics_025_handler_interface/host_state.{
   max_bound_ports, min_shutdown_grace_period_ms, validate_bind_port,
 }
 use ibc/core/ics_025_handler_interface/host_state_redeemer.{
-  BindPort, CreateConnection, EnterShutdown, FinalizeShutdown, HandlePacket,
-  Heartbeat, HostStateRedeemer, UpdateChannel, UpdateClient, UpdateConnection,
+  AuthorizeFinalization, BindPort, ClaimBackup, CreateClient, CreateConnection,
+  EnterShutdown, FinalizeShutdown, HandlePacket, Heartbeat, HostStateRedeemer,
+  UpdateChannel, UpdateClient, UpdateConnection,
 }
 use ibc/core/ics_025_handler_interface/ibc_state_commitment
+use ibc/migration/types.{
+  Authority, Counts, Emergency, FixedIdentity, Governance, Implementation,
+  Moving, Proposed, Ready, Registry, Replace, Rotate, minimum_delay_ms,
+  registry_token_name,
+}
+use ibc/testing/client_registry_fixtures.{RegistryCase}
 use ibc/testing/fuzz_dsl
 use ibc/utils/bits
+use upgradeable/host_state as migration_host
 
 // Build a list with `count` copies of `value`.
 fn repeat_bytearray(value: ByteArray, count: Int) -> List<ByteArray> {
@@ -154,7 +167,7 @@ test module_registration_cbor_matches_offchain_codec() {
 
 test host_state_datum_decodes_injective_compatibility_fixture() {
   let fixture =
-    #"d87984d8798701582042424242424242424242424242424242424242424242424242424242424242420203048007581c24242424242424242424242424242424242424242424242424242424581c17171717171717171717171717171717171717171717171717171717d87982a1487472616e73666572d87983581c11111111111111111111111111111111111111111111111111111111d87982581c222222222222222222222222222222222222222222222222222222224101d87982581c333333333333333333333333333333333333333333333333333333334102d87980"
+    #"d87984d8798701582042424242424242424242424242424242424242424242424242424242424242420203048007581c24242424242424242424242424242424242424242424242424242424581c17171717171717171717171717171717171717171717171717171717d87986a1487472616e73666572d87983581c11111111111111111111111111111111111111111111111111111111d87982581c222222222222222222222222222222222222222222222222222222224101d87982581c333333333333333333333333333333333333333333333333333333334102d8798000000000"
   expect Some(data) = cbor.deserialise(fixture)
   expect decoded: HostStateDatum = data
 
@@ -171,6 +184,7 @@ test host_state_datum_decodes_injective_compatibility_fixture() {
     nft_policy: #"24242424242424242424242424242424242424242424242424242424",
     deployer: #"17171717171717171717171717171717171717171717171717171717",
     control: HostStateControl {
+      last_heartbeat_time: 0,
       port_registry: [
         Pair(
           "transfer",
@@ -188,6 +202,9 @@ test host_state_datum_decodes_injective_compatibility_fixture() {
         ),
       ],
       shutdown: Active,
+      live_clients: 0,
+      live_connections: 0,
+      live_channels: 0,
     },
   }
 }
@@ -212,7 +229,14 @@ fn test_host_state_datum_with_control(
     state,
     nft_policy,
     deployer: trusted_deployer,
-    control: HostStateControl { port_registry, shutdown },
+    control: HostStateControl {
+      last_heartbeat_time: 0,
+      port_registry,
+      shutdown,
+      live_clients: 0,
+      live_connections: 0,
+      live_channels: 0,
+    },
   }
 }
 
@@ -243,6 +267,7 @@ fn test_channel(state: channel_state.ChannelState) -> Channel {
     },
     connection_hops: ["connection-0"],
     version: "ics20-1",
+    upgrade_sequence: 0,
   }
 }
 
@@ -262,6 +287,7 @@ fn test_channel_datum(
       packet_commitment,
       packet_receipt: [],
       packet_acknowledgement: [],
+      upgrade: initial_upgrade_state,
     },
     port_id: "transfer",
     token: test_channel_token(),
@@ -608,18 +634,158 @@ fn spend_host_state_with_signatories(
   outputs: List<Output>,
   extra_signatories: List<crypto.VerificationKeyHash>,
 ) -> Bool {
+  spend_host_state_with_backup(redeemer, inputs, outputs, extra_signatories, "")
+}
+
+fn spend_host_state_with_backup(
+  redeemer: HostStateRedeemer,
+  inputs: List<Input>,
+  outputs: List<Output>,
+  extra_signatories: List<crypto.VerificationKeyHash>,
+  backup_operator: ByteArray,
+) -> Bool {
   host_state_stt.host_state_stt.spend(
     test_nft_policy(),
-    test_client_script_hash(),
+    [
+      registry.legacy(
+        "mock client policy",
+        test_client_script_hash(),
+        "mock proof policy",
+      ),
+    ],
     test_connection_script_hash(),
     test_channel_script_hash(),
     "mock client policy",
     "mock connection policy",
     "mock channel policy",
+    backup_operator,
     None,
     redeemer,
     test_host_ref(),
-    Transaction { ..placeholder, inputs, outputs, extra_signatories },
+    Transaction {
+      ..placeholder,
+      inputs,
+      outputs,
+      extra_signatories,
+      validity_range: when redeemer is {
+        Heartbeat -> {
+          expect Some(output) =
+            list.find(
+              outputs,
+              fn(o) {
+                quantity_of(o.value, test_nft_policy(), host_state_token_name) == 1
+              },
+            )
+          expect InlineDatum(raw) = output.datum
+          expect datum: HostStateDatum = raw
+          interval.between(0, datum.state.last_update_time)
+        }
+        _ -> placeholder.validity_range
+      },
+    },
+  )
+}
+
+const named_backup = #"99999999999999999999999999999999999999999999999999999999"
+
+fn claim_backup_as(
+  deployed_backup: ByteArray,
+  new_deployer: ByteArray,
+  signatories: List<crypto.VerificationKeyHash>,
+  change_root: Bool,
+) -> Bool {
+  let old_state = test_host_state(empty_ibc_state_root, 1)
+  let new_state =
+    HostState {
+      ..old_state,
+      version: old_state.version + 1,
+      ibc_state_root: if change_root {
+        #"01"
+      } else {
+        old_state.ibc_state_root
+      },
+    }
+  let new_datum =
+    HostStateDatum {
+      ..test_host_state_datum(new_state, test_nft_policy()),
+      deployer: new_deployer,
+    }
+  let output =
+    Output { ..test_host_output(new_state), datum: InlineDatum(new_datum) }
+  spend_host_state_with_backup(
+    ClaimBackup,
+    [test_host_input(old_state)],
+    [output],
+    signatories,
+    deployed_backup,
+  )
+}
+
+test named_backup_can_claim_deployer_authority() {
+  claim_backup_as(named_backup, named_backup, [named_backup], False)
+}
+
+test backup_claim_rejects_missing_backup_signature() {
+  !claim_backup_as(named_backup, named_backup, [trusted_deployer], False)
+}
+
+test backup_claim_rejects_arbitrary_new_deployer() {
+  !claim_backup_as(named_backup, trusted_deployer, [named_backup], False)
+}
+
+test backup_claim_rejects_root_mutation() {
+  !claim_backup_as(named_backup, named_backup, [named_backup], True)
+}
+
+test backup_claim_rejects_deployment_without_backup() {
+  !claim_backup_as("", named_backup, [named_backup], False)
+}
+
+type HostCase =
+  Pair<HostStateRedeemer, Transaction>
+
+fn packet_host_case(
+  redeemer: HostStateRedeemer,
+  channel_redeemer: SpendChannelRedeemer,
+  channel_input: Input,
+  inputs: List<Input>,
+  outputs: List<Output>,
+) -> HostCase {
+  let channel_redeemer_data: Redeemer = channel_redeemer
+  Pair(
+    redeemer,
+    Transaction {
+      ..placeholder,
+      inputs,
+      outputs,
+      redeemers: [
+        Pair(Spend(channel_input.output_reference), channel_redeemer_data),
+      ],
+    },
+  )
+}
+
+fn run_host_case(case: HostCase) -> Bool {
+  let Pair(redeemer, transaction) = case
+  host_state_stt.host_state_stt.spend(
+    test_nft_policy(),
+    [
+      registry.legacy(
+        "mock client policy",
+        test_client_script_hash(),
+        "mock proof policy",
+      ),
+    ],
+    test_connection_script_hash(),
+    test_channel_script_hash(),
+    "mock client policy",
+    "mock connection policy",
+    "mock channel policy",
+    "",
+    None,
+    redeemer,
+    test_host_ref(),
+    transaction,
   )
 }
 
@@ -630,26 +796,8 @@ fn spend_host_state_with_channel_redeemer(
   inputs: List<Input>,
   outputs: List<Output>,
 ) -> Bool {
-  let channel_redeemer_data: Redeemer = channel_redeemer
-  host_state_stt.host_state_stt.spend(
-    test_nft_policy(),
-    test_client_script_hash(),
-    test_connection_script_hash(),
-    test_channel_script_hash(),
-    "mock client policy",
-    "mock connection policy",
-    "mock channel policy",
-    None,
-    redeemer,
-    test_host_ref(),
-    Transaction {
-      ..placeholder,
-      inputs,
-      outputs,
-      redeemers: [
-        Pair(Spend(channel_input.output_reference), channel_redeemer_data),
-      ],
-    },
+  run_host_case(
+    packet_host_case(redeemer, channel_redeemer, channel_input, inputs, outputs),
   )
 }
 
@@ -736,6 +884,7 @@ fn test_consensus_state(seed: Int) -> ConsensusState {
 
 fn test_client_state(latest_height: Height) -> ClientState {
   ClientState {
+    upgrade_path: [],
     chain_id: "chain-0",
     trust_level: UncheckedRational { numerator: 1, denominator: 3 },
     trusting_period: 1000,
@@ -750,6 +899,7 @@ fn test_client_state(latest_height: Height) -> ClientState {
 fn test_client_datum(latest_height: Int, seed: Int) -> ClientDatum {
   let height = test_height(latest_height)
   ClientDatum {
+    history_root: #"0000000000000000000000000000000000000000000000000000000000000000",
     state: ClientDatumState {
       client_state: test_client_state(height),
       consensus_states: [Pair(height, test_consensus_state(seed))],
@@ -762,10 +912,13 @@ fn test_client_datum(latest_height: Int, seed: Int) -> ClientDatum {
 
 fn test_updated_client_datum(seed: Int) -> ClientDatum {
   let old_height = test_height(1)
-  let new_height = test_height(2)
   ClientDatum {
+    history_root: #"0000000000000000000000000000000000000000000000000000000000000000",
     state: ClientDatumState {
-      client_state: test_client_state(new_height),
+      client_state: ClientState {
+        ..test_client_state(old_height),
+        frozen_height: old_height,
+      },
       consensus_states: [Pair(old_height, test_consensus_state(seed))],
       processed_times: [Pair(old_height, 0)],
       processed_heights: [Pair(old_height, 0)],
@@ -775,24 +928,21 @@ fn test_updated_client_datum(seed: Int) -> ClientDatum {
 }
 
 fn test_updated_client_datum_with_consensus_insert(seed: Int) -> ClientDatum {
-  let old_height = test_height(1)
   let new_height = test_height(2)
   ClientDatum {
+    history_root: #"0000000000000000000000000000000000000000000000000000000000000000",
     state: ClientDatumState {
       client_state: test_client_state(new_height),
-      consensus_states: [
-        Pair(new_height, test_consensus_state(seed + 1)),
-        Pair(old_height, test_consensus_state(seed)),
-      ],
-      processed_times: [Pair(new_height, 1), Pair(old_height, 0)],
-      processed_heights: [Pair(new_height, 1), Pair(old_height, 0)],
+      consensus_states: [Pair(new_height, test_consensus_state(seed + 1))],
+      processed_times: [Pair(new_height, 1)],
+      processed_heights: [Pair(new_height, 1)],
     },
     token: test_client_token(),
   }
 }
 
 fn test_client_input(datum: ClientDatum) -> Input {
-  let token = test_client_token()
+  let token = datum.token
   Input(
     test_object_ref(1),
     Output {
@@ -805,12 +955,20 @@ fn test_client_input(datum: ClientDatum) -> Input {
 }
 
 fn test_client_output(datum: ClientDatum) -> Output {
-  let token = test_client_token()
+  let token = datum.token
   Output {
     address: Address(Script(test_client_script_hash()), None),
     value: from_asset(token.policy_id, token.name, 1),
     datum: InlineDatum(datum),
     reference_script: None,
+  }
+}
+
+fn test_client_output_without_token(datum: ClientDatum) -> Output {
+  let token = datum.token
+  Output {
+    ..test_client_output(datum),
+    value: from_asset(token.policy_id, token.name, 0),
   }
 }
 
@@ -961,6 +1119,7 @@ fn test_channel_datum_full(
       packet_acknowledgement,
       minimum_receive_proof_height: height_mod.zero_height(),
       maximum_receive_proof_height: height_mod.zero_height(),
+      upgrade: initial_upgrade_state,
     },
     port_id: "transfer",
     token: test_channel_token(),
@@ -1149,6 +1308,109 @@ fn test_handle_packet_commitment_delete_root(
   )
 }
 
+test host_create_client_rejects_counterfeit_client_policy() fail {
+  let seed = 613
+  let canonical_token = test_client_token()
+  let counterfeit_token =
+    AuthToken { ..canonical_token, policy_id: "counterfeit client mint policy" }
+  let client_datum =
+    ClientDatum { ..test_client_datum(1, seed), token: counterfeit_token }
+  let client_state_siblings = full_empty_siblings()
+  let client_state_key = client_keys.full_client_state_path("07-tendermint-0")
+  let consensus_state_key =
+    client_keys.full_client_consensus_state_path("07-tendermint-0", "0-1")
+  let client_state_value = cbor.serialise(client_datum.state.client_state)
+  let root_after_client_state =
+    ibc_state_commitment.apply_update(
+      empty_ibc_state_root,
+      client_state_key,
+      "",
+      client_state_value,
+      client_state_siblings,
+    )
+  let consensus_state_siblings =
+    siblings_after_single_insert(
+      client_state_key,
+      client_state_value,
+      consensus_state_key,
+    )
+  let new_root =
+    ibc_state_commitment.apply_update(
+      root_after_client_state,
+      consensus_state_key,
+      "",
+      cbor.serialise(test_consensus_state(seed)),
+      consensus_state_siblings,
+    )
+  let old_state = test_host_state(empty_ibc_state_root, seed)
+  let new_state =
+    HostState {
+      ..old_state,
+      version: old_state.version + 1,
+      ibc_state_root: new_root,
+      next_client_sequence: old_state.next_client_sequence + 1,
+    }
+  let redeemer: HostStateRedeemer =
+    CreateClient { client_state_siblings, consensus_state_siblings }
+
+  spend_host_state(
+    redeemer,
+    [test_host_input(old_state)],
+    [test_host_output(new_state), test_client_output(client_datum)],
+  )
+}
+
+test host_create_client_rejects_datum_token_missing_from_output() fail {
+  let seed = 613
+  let client_datum = test_client_datum(1, seed)
+  let client_state_siblings = full_empty_siblings()
+  let client_state_key = client_keys.full_client_state_path("07-tendermint-0")
+  let consensus_state_key =
+    client_keys.full_client_consensus_state_path("07-tendermint-0", "0-1")
+  let client_state_value = cbor.serialise(client_datum.state.client_state)
+  let root_after_client_state =
+    ibc_state_commitment.apply_update(
+      empty_ibc_state_root,
+      client_state_key,
+      "",
+      client_state_value,
+      client_state_siblings,
+    )
+  let consensus_state_siblings =
+    siblings_after_single_insert(
+      client_state_key,
+      client_state_value,
+      consensus_state_key,
+    )
+  let new_root =
+    ibc_state_commitment.apply_update(
+      root_after_client_state,
+      consensus_state_key,
+      "",
+      cbor.serialise(test_consensus_state(seed)),
+      consensus_state_siblings,
+    )
+  let old_state = test_host_state(empty_ibc_state_root, seed)
+  let new_state =
+    HostState {
+      ..old_state,
+      version: old_state.version + 1,
+      ibc_state_root: new_root,
+      next_client_sequence: old_state.next_client_sequence + 1,
+    }
+  let redeemer: HostStateRedeemer =
+    CreateClient { client_state_siblings, consensus_state_siblings }
+
+  spend_host_state(
+    redeemer,
+    [test_host_input(old_state)],
+    [
+      test_host_output(new_state),
+      test_client_output_without_token(client_datum),
+    ],
+  )
+}
+
 test prop_host_update_client_accepts_exact_root(seed via fuzz.int()) {
   fuzz.label(@"fuzz.contract.host.update_client.valid")
 
@@ -1175,8 +1437,7 @@ test prop_host_update_client_accepts_exact_root(seed via fuzz.int()) {
   let redeemer: HostStateRedeemer =
     UpdateClient {
       client_state_siblings: siblings,
-      consensus_state_siblings: siblings,
-      removed_consensus_state_siblings: [],
+      consensus_state_siblings: [],
     }
 
   fuzz_dsl.valid_check(
@@ -1190,6 +1451,80 @@ test prop_host_update_client_accepts_exact_root(seed via fuzz.int()) {
     ),
   )
     |> fuzz_dsl.assert_valid
+}
+
+test host_update_client_rejects_counterfeit_client_policy() fail {
+  let seed = 613
+  let canonical_token = test_client_token()
+  let counterfeit_token =
+    AuthToken { ..canonical_token, policy_id: "counterfeit client mint policy" }
+  let input_client_datum =
+    ClientDatum { ..test_client_datum(1, seed), token: counterfeit_token }
+  let output_client_datum =
+    ClientDatum { ..test_updated_client_datum(seed), token: counterfeit_token }
+  let siblings = full_empty_siblings()
+  let old_root = test_committed_client_root(input_client_datum, siblings)
+  let new_root =
+    test_update_client_root(
+      old_root,
+      input_client_datum,
+      output_client_datum,
+      siblings,
+    )
+  let old_state = test_host_state(old_root, seed)
+  let new_state =
+    HostState {
+      ..old_state,
+      version: old_state.version + 1,
+      ibc_state_root: new_root,
+    }
+  let redeemer: HostStateRedeemer =
+    UpdateClient {
+      client_state_siblings: siblings,
+      consensus_state_siblings: siblings,
+    }
+
+  spend_host_state(
+    redeemer,
+    [test_host_input(old_state), test_client_input(input_client_datum)],
+    [test_host_output(new_state), test_client_output(output_client_datum)],
+  )
+}
+
+test host_update_client_rejects_datum_token_missing_from_output() fail {
+  let seed = 613
+  let input_client_datum = test_client_datum(1, seed)
+  let output_client_datum = test_updated_client_datum(seed)
+  let siblings = full_empty_siblings()
+  let old_root = test_committed_client_root(input_client_datum, siblings)
+  let new_root =
+    test_update_client_root(
+      old_root,
+      input_client_datum,
+      output_client_datum,
+      siblings,
+    )
+  let old_state = test_host_state(old_root, seed)
+  let new_state =
+    HostState {
+      ..old_state,
+      version: old_state.version + 1,
+      ibc_state_root: new_root,
+    }
+  let redeemer: HostStateRedeemer =
+    UpdateClient {
+      client_state_siblings: siblings,
+      consensus_state_siblings: siblings,
+    }
+
+  spend_host_state(
+    redeemer,
+    [test_host_input(old_state), test_client_input(input_client_datum)],
+    [
+      test_host_output(new_state),
+      test_client_output_without_token(output_client_datum),
+    ],
+  )
 }
 
 /// Deterministic companion for the Tendermint UpdateClient capacity report.
@@ -1206,9 +1541,9 @@ fn prepare_host_update_client_capacity() -> Pair<HostStateRedeemer, Transaction>
     test_updated_client_datum_with_consensus_insert(seed)
   let client_state_key = client_keys.full_client_state_path("07-tendermint-0")
   let old_consensus_key =
-    client_keys.full_client_consensus_state_path("07-tendermint-0", "1")
+    client_keys.full_client_consensus_state_path("07-tendermint-0", "0-1")
   let new_consensus_key =
-    client_keys.full_client_consensus_state_path("07-tendermint-0", "2")
+    client_keys.full_client_consensus_state_path("07-tendermint-0", "0-2")
   let old_client_state_value =
     cbor.serialise(input_client_datum.state.client_state)
   let new_client_state_value =
@@ -1275,11 +1610,7 @@ fn prepare_host_update_client_capacity() -> Pair<HostStateRedeemer, Transaction>
       ibc_state_root: new_root,
     }
   let redeemer: HostStateRedeemer =
-    UpdateClient {
-      client_state_siblings,
-      consensus_state_siblings,
-      removed_consensus_state_siblings: [],
-    }
+    UpdateClient { client_state_siblings, consensus_state_siblings }
 
   Pair(
     redeemer,
@@ -1301,16 +1632,59 @@ fn prepare_host_update_client_capacity() -> Pair<HostStateRedeemer, Transaction>
 const host_update_client_capacity_fixture =
   prepare_host_update_client_capacity()
 
+fn host_update_client_capacity_fixture_is_constructed(
+  redeemer: HostStateRedeemer,
+  inputs: List<Input>,
+  outputs: List<Output>,
+) -> Bool {
+  expect UpdateClient { client_state_siblings, consensus_state_siblings } =
+    redeemer
+  and {
+    list.length(inputs) == 2,
+    list.length(outputs) == 2,
+    list.length(client_state_siblings) == ibc_state_commitment.merkle_depth_bits,
+    list.length(consensus_state_siblings) == ibc_state_commitment.merkle_depth_bits,
+  }
+}
+
+test host_update_client_capacity_fixture_setup_baseline() {
+  let Pair(redeemer, transaction) = host_update_client_capacity_fixture
+  let Transaction { inputs, outputs, .. } = transaction
+  host_update_client_capacity_fixture_is_constructed(redeemer, inputs, outputs)
+}
+
+/// Deterministic companion for the Tendermint UpdateClient capacity report.
+///
+/// Keep this as a unit test (rather than a property test) so `aiken check`
+/// emits stable execution units for the complete 64-level client-state and
+/// consensus-state root transition. Consensus-state removals are deliberately
+/// empty: issue #613 measures validator-set capacity independently of the
+/// pruning growth tracked by issue #557.
 test host_update_client_capacity_minimum_history_succeeds() {
   let Pair(redeemer, transaction) = host_update_client_capacity_fixture
+  let Transaction { inputs, outputs, .. } = transaction
+  expect
+    host_update_client_capacity_fixture_is_constructed(
+      redeemer,
+      inputs,
+      outputs,
+    )
+
   host_state_stt.host_state_stt.spend(
     test_nft_policy(),
-    test_client_script_hash(),
+    [
+      registry.legacy(
+        "mock client policy",
+        test_client_script_hash(),
+        "mock proof policy",
+      ),
+    ],
     test_connection_script_hash(),
     test_channel_script_hash(),
     "mock client policy",
     "mock connection policy",
     "mock channel policy",
+    "",
     None,
     redeemer,
     test_host_ref(),
@@ -1338,7 +1712,6 @@ test prop_host_update_client_rejects_wrong_root(seed via fuzz.int()) fail {
     UpdateClient {
       client_state_siblings: siblings,
       consensus_state_siblings: siblings,
-      removed_consensus_state_siblings: [],
     }
 
   spend_host_state(
@@ -1447,21 +1820,43 @@ fn create_connection_thread(token: AuthToken, mint: Value) -> Bool {
       ..test_connection_output(datum),
       value: from_asset(token.policy_id, token.name, 1),
     }
+  let host_output = test_host_output(new_state)
+  let host_datum = test_host_state_datum(new_state, test_nft_policy())
+  let host_output =
+    Output {
+      ..host_output,
+      datum: InlineDatum(
+        HostStateDatum {
+          ..host_datum,
+          control: HostStateControl {
+            ..host_datum.control,
+            live_connections: 1,
+          },
+        },
+      ),
+    }
   host_state_stt.host_state_stt.spend(
     test_nft_policy(),
-    test_client_script_hash(),
+    [
+      registry.legacy(
+        "mock client policy",
+        test_client_script_hash(),
+        "mock proof policy",
+      ),
+    ],
     test_connection_script_hash(),
     test_channel_script_hash(),
     "mock client policy",
     "mock connection policy",
     "mock channel policy",
+    "",
     None,
     CreateConnection { connection_siblings: siblings },
     test_host_ref(),
     Transaction {
       ..placeholder,
       inputs: [test_host_input(old_state)],
-      outputs: [test_host_output(new_state), connection_output],
+      outputs: [host_output, connection_output],
       mint,
     },
   )
@@ -1781,6 +2176,10 @@ test prop_host_update_channel_rejects_receive_height_mutation(
 }
 
 fn check_host_handle_packet_send(seed: Int, token: AuthToken) -> Bool {
+  run_host_case(prepare_containment_send(seed, token))
+}
+
+fn prepare_containment_send(seed: Int, token: AuthToken) -> HostCase {
   // SendPacket creates a packet commitment, so the new root must commit exactly
   // that packet key/value and the channel datum must record the same sequence.
   let sequence = test_sequence(seed)
@@ -1843,7 +2242,7 @@ fn check_host_handle_packet_send(seed: Int, token: AuthToken) -> Bool {
       ibc_state_root: new_root,
     }
 
-  spend_host_state_with_channel_redeemer(
+  packet_host_case(
     handle_packet_redeemer([], siblings, [], [], commitment_siblings, [], []),
     SendPacket { packet },
     test_channel_input_full(input_channel_datum),
@@ -1879,9 +2278,7 @@ test host_state_rejects_counterfeit_packet_thread_policy() fail {
   )
 }
 
-test prop_host_handle_packet_accepts_recv(seed via fuzz.int()) {
-  fuzz.label(@"fuzz.contract.host.handle_packet.valid_recv")
-
+fn prepare_containment_recv(seed: Int) -> HostCase {
   let sequence = test_sequence(seed)
   let packet = test_packet(sequence)
   let acknowledgement_commitment = #"010203"
@@ -1938,32 +2335,37 @@ test prop_host_handle_packet_accepts_recv(seed via fuzz.int()) {
       ibc_state_root: new_root,
     }
 
+  packet_host_case(
+    handle_packet_redeemer(
+      [],
+      [],
+      [],
+      [],
+      [],
+      siblings,
+      acknowledgement_siblings,
+    ),
+    RecvPacket {
+      packet,
+      proof_commitment: empty_proof(),
+      proof_height: test_height(1),
+    },
+    test_channel_input_full(input_channel_datum),
+    [test_host_input(old_state), test_channel_input_full(input_channel_datum)],
+    [
+      test_host_output(new_state),
+      test_channel_output_full(output_channel_datum),
+    ],
+  )
+}
+
+test prop_host_handle_packet_accepts_recv(seed via fuzz.int()) {
+  fuzz.label(@"fuzz.contract.host.handle_packet.valid_recv")
   fuzz_dsl.valid_check(
     "host",
     "handle_packet_recv",
     "spend_host_state",
-    spend_host_state_with_channel_redeemer(
-      handle_packet_redeemer(
-        [],
-        [],
-        [],
-        [],
-        [],
-        siblings,
-        acknowledgement_siblings,
-      ),
-      RecvPacket {
-        packet,
-        proof_commitment: empty_proof(),
-        proof_height: test_height(1),
-      },
-      test_channel_input_full(input_channel_datum),
-      [test_host_input(old_state), test_channel_input_full(input_channel_datum)],
-      [
-        test_host_output(new_state),
-        test_channel_output_full(output_channel_datum),
-      ],
-    ),
+    run_host_case(prepare_containment_recv(seed)),
   )
     |> fuzz_dsl.assert_valid
 }
@@ -2050,19 +2452,25 @@ test host_state_handle_packet_recv_succeeds_at_history_capacity() {
 }
 
 test prop_host_handle_packet_rejects_history_capacity_overflow(
-  seed via fuzz.int(),
+  seed via capacity_receipt_count(),
 ) fail {
   fuzz.label(@"fuzz.contract.host.handle_packet.invalid_history_capacity")
 
-  let half_capacity = max_packet_entries_per_channel / 2
-  let sequence = half_capacity + 1
+  let receipt_count = seed
+  let acknowledgement_count = max_packet_entries_per_channel - receipt_count
+  if receipt_count < max_packet_entries_per_channel / 2 {
+    fuzz.label(@"fuzz.contract.host.capacity.ack_dominant")
+  } else {
+    fuzz.label(@"fuzz.contract.host.capacity.receipt_dominant")
+  }
+  let sequence = max_packet_entries_per_channel + 1
   let packet = test_packet(sequence)
   let acknowledgement = "new acknowledgement"
   let siblings = full_empty_siblings()
   let old_root = empty_ibc_state_root
-  let existing_receipts = packet_entries(1, half_capacity, "")
+  let existing_receipts = packet_entries(1, receipt_count, "")
   let existing_acknowledgements =
-    packet_entries(1, half_capacity, "existing acknowledgement")
+    packet_entries(1, acknowledgement_count, "existing acknowledgement")
   let input_channel_datum =
     test_channel_datum_full(
       test_channel(channel_state.Open),
@@ -2227,19 +2635,25 @@ test host_state_handle_packet_acknowledgement_succeeds_at_history_capacity() {
 }
 
 test prop_host_handle_packet_rejects_acknowledgement_capacity_overflow(
-  seed via fuzz.int(),
+  seed via capacity_receipt_count(),
 ) fail {
   fuzz.label(@"fuzz.contract.host.handle_packet.invalid_ack_capacity")
 
-  let half_capacity = max_packet_entries_per_channel / 2
-  let sequence = half_capacity + 1
+  let receipt_count = seed
+  let acknowledgement_count = max_packet_entries_per_channel - receipt_count
+  if receipt_count < max_packet_entries_per_channel / 2 {
+    fuzz.label(@"fuzz.contract.host.capacity.ack_dominant")
+  } else {
+    fuzz.label(@"fuzz.contract.host.capacity.receipt_dominant")
+  }
+  let sequence = max_packet_entries_per_channel + 1
   let packet = test_packet(sequence)
   let acknowledgement = "new acknowledgement"
   let siblings = full_empty_siblings()
   let old_root = empty_ibc_state_root
-  let existing_receipts = packet_entries(1, half_capacity, "")
+  let existing_receipts = packet_entries(1, receipt_count, "")
   let existing_acknowledgements =
-    packet_entries(1, half_capacity - 1, "existing acknowledgement")
+    packet_entries(1, acknowledgement_count - 1, "existing acknowledgement")
   let input_channel_datum =
     test_channel_datum_full(
       test_channel(channel_state.Open),
@@ -2395,12 +2809,18 @@ test host_state_handle_packet_send_succeeds_at_commitment_capacity() {
 }
 
 test prop_host_handle_packet_rejects_commitment_capacity_overflow(
-  seed via fuzz.int(),
+  seed via capacity_receipt_count(),
 ) fail {
   fuzz.label(@"fuzz.contract.host.handle_packet.invalid_commitment_capacity")
 
-  let half_capacity = max_packet_entries_per_channel / 2
-  let sequence = half_capacity + 1
+  let receipt_count = seed
+  let acknowledgement_count = max_packet_entries_per_channel - receipt_count
+  if receipt_count < max_packet_entries_per_channel / 2 {
+    fuzz.label(@"fuzz.contract.host.capacity.ack_dominant")
+  } else {
+    fuzz.label(@"fuzz.contract.host.capacity.receipt_dominant")
+  }
+  let sequence = max_packet_entries_per_channel + 1
   let packet = test_packet(sequence)
   let commitment = packet_mod.commit_packet(packet)
   let siblings = full_empty_siblings()
@@ -2414,9 +2834,9 @@ test prop_host_handle_packet_rejects_commitment_capacity_overflow(
       cbor.serialise(sequence),
       siblings,
     )
-  let existing_receipts = packet_entries(1, half_capacity, "")
+  let existing_receipts = packet_entries(1, receipt_count, "")
   let existing_acknowledgements =
-    packet_entries(1, half_capacity, "existing acknowledgement")
+    packet_entries(1, acknowledgement_count, "existing acknowledgement")
   let input_channel_datum =
     test_channel_datum_full(
       test_channel(channel_state.Open),
@@ -2593,9 +3013,7 @@ test prop_host_handle_packet_rejects_recv_with_unrelated_channel_mutation(
   )
 }
 
-test prop_host_handle_packet_accepts_ack(seed via fuzz.int()) {
-  fuzz.label(@"fuzz.contract.host.handle_packet.valid_ack")
-
+fn prepare_containment_ack(seed: Int) -> HostCase {
   let sequence = test_sequence(seed)
   let packet = test_packet(sequence)
   let siblings = full_empty_siblings()
@@ -2636,32 +3054,35 @@ test prop_host_handle_packet_accepts_ack(seed via fuzz.int()) {
       ibc_state_root: new_root,
     }
 
+  packet_host_case(
+    handle_packet_redeemer([], [], [], [], siblings, [], []),
+    AcknowledgePacket {
+      packet,
+      acknowledgement: "acknowledgement",
+      proof_acked: empty_proof(),
+      proof_height: test_height(1),
+    },
+    test_channel_input_full(input_channel_datum),
+    [test_host_input(old_state), test_channel_input_full(input_channel_datum)],
+    [
+      test_host_output(new_state),
+      test_channel_output_full(output_channel_datum),
+    ],
+  )
+}
+
+test prop_host_handle_packet_accepts_ack(seed via fuzz.int()) {
+  fuzz.label(@"fuzz.contract.host.handle_packet.valid_ack")
   fuzz_dsl.valid_check(
     "host",
     "handle_packet_ack",
     "spend_host_state",
-    spend_host_state_with_channel_redeemer(
-      handle_packet_redeemer([], [], [], [], siblings, [], []),
-      AcknowledgePacket {
-        packet,
-        acknowledgement: "acknowledgement",
-        proof_acked: empty_proof(),
-        proof_height: test_height(1),
-      },
-      test_channel_input_full(input_channel_datum),
-      [test_host_input(old_state), test_channel_input_full(input_channel_datum)],
-      [
-        test_host_output(new_state),
-        test_channel_output_full(output_channel_datum),
-      ],
-    ),
+    run_host_case(prepare_containment_ack(seed)),
   )
     |> fuzz_dsl.assert_valid
 }
 
-test prop_host_handle_packet_accepts_timeout(seed via fuzz.int()) {
-  fuzz.label(@"fuzz.contract.host.handle_packet.valid_timeout")
-
+fn prepare_containment_timeout(seed: Int) -> HostCase {
   let sequence = test_sequence(seed)
   let packet = test_packet(sequence)
   let siblings = full_empty_siblings()
@@ -2702,25 +3123,30 @@ test prop_host_handle_packet_accepts_timeout(seed via fuzz.int()) {
       ibc_state_root: new_root,
     }
 
+  packet_host_case(
+    handle_packet_redeemer([], [], [], [], siblings, [], []),
+    TimeoutPacket {
+      packet,
+      proof_unreceived: empty_proof(),
+      proof_height: test_height(1),
+      next_sequence_recv: 1,
+    },
+    test_channel_input_full(input_channel_datum),
+    [test_host_input(old_state), test_channel_input_full(input_channel_datum)],
+    [
+      test_host_output(new_state),
+      test_channel_output_full(output_channel_datum),
+    ],
+  )
+}
+
+test prop_host_handle_packet_accepts_timeout(seed via fuzz.int()) {
+  fuzz.label(@"fuzz.contract.host.handle_packet.valid_timeout")
   fuzz_dsl.valid_check(
     "host",
     "handle_packet_timeout",
     "spend_host_state",
-    spend_host_state_with_channel_redeemer(
-      handle_packet_redeemer([], [], [], [], siblings, [], []),
-      TimeoutPacket {
-        packet,
-        proof_unreceived: empty_proof(),
-        proof_height: test_height(1),
-        next_sequence_recv: 1,
-      },
-      test_channel_input_full(input_channel_datum),
-      [test_host_input(old_state), test_channel_input_full(input_channel_datum)],
-      [
-        test_host_output(new_state),
-        test_channel_output_full(output_channel_datum),
-      ],
-    ),
+    run_host_case(prepare_containment_timeout(seed)),
   )
     |> fuzz_dsl.assert_valid
 }
@@ -2779,6 +3205,7 @@ test host_handle_packet_accepts_timeout_on_already_closed_channel() {
         proof_close: empty_proof(),
         proof_height: test_height(1),
         next_sequence_recv: 1,
+        counterparty_upgrade_sequence: 0,
       },
       test_channel_input_full(input_channel_datum),
       [test_host_input(old_state), test_channel_input_full(input_channel_datum)],
@@ -2888,6 +3315,13 @@ fn check_host_prune_packet_history(
   use_wrong_ack_witness: Bool,
   at_capacity: Bool,
 ) -> Bool {
+  run_host_case(prepare_containment_prune(use_wrong_ack_witness, at_capacity))
+}
+
+fn prepare_containment_prune(
+  use_wrong_ack_witness: Bool,
+  at_capacity: Bool,
+) -> HostCase {
   let sequence =
     if at_capacity {
       max_packet_entries_per_channel / 2
@@ -3026,7 +3460,7 @@ fn check_host_prune_packet_history(
     }
   let channel_input = test_channel_input_full(input_channel_datum)
 
-  spend_host_state_with_channel_redeemer(
+  packet_host_case(
     host_redeemer,
     channel_redeemer,
     channel_input,
@@ -3453,6 +3887,7 @@ test host_state_bind_port_succeeds_with_correct_root_witness() {
     "mock client policy",
     "mock connection policy",
     "mock channel policy",
+    "",
     None,
     redeemer,
     input_ref,
@@ -3549,6 +3984,7 @@ test host_state_bind_port_fails_with_arbitrary_root() fail {
     "mock client policy",
     "mock connection policy",
     "mock channel policy",
+    "",
     None,
     redeemer,
     input_ref,
@@ -3666,6 +4102,7 @@ test host_state_cannot_move_nft_to_different_address() fail {
     "mock client policy",
     "mock connection policy",
     "mock channel policy",
+    "",
     None,
     redeemer,
     input_ref,
@@ -3776,6 +4213,7 @@ test host_state_bind_port_fails_without_required_sibling_hashes() fail {
     "mock client policy",
     "mock connection policy",
     "mock channel policy",
+    "",
     None,
     redeemer,
     input_ref,
@@ -3848,6 +4286,7 @@ test host_state_bind_port_fails_if_output_missing() fail {
     "mock client policy",
     "mock connection policy",
     "mock channel policy",
+    "",
     None,
     redeemer,
     input_ref,
@@ -3944,6 +4383,7 @@ fn validate_test_enter_shutdown(
     "mock client policy",
     "mock connection policy",
     "mock channel policy",
+    "",
     None,
     redeemer,
     input_ref,
@@ -4040,7 +4480,10 @@ test host_state_enter_shutdown_requires_finite_upper_bound() fail {
   )
 }
 
-fn test_shutdown_host_input(grace_period_end: Int) -> Input {
+fn test_shutdown_host_input_with_registry(
+  grace_period_end: Int,
+  port_registry: Pairs<ByteArray, ModuleRegistration>,
+) -> Input {
   let nft_policy = test_nft_policy()
   let old_state = test_host_state(empty_ibc_state_root, 2000)
   Input(
@@ -4049,9 +4492,10 @@ fn test_shutdown_host_input(grace_period_end: Int) -> Input {
       address: Address(Script(test_host_script_hash()), None),
       value: from_asset(nft_policy, host_state_token_name, 1),
       datum: InlineDatum(
-        test_host_state_datum_with_shutdown(
+        test_host_state_datum_with_control(
           old_state,
           nft_policy,
+          port_registry,
           ShuttingDown {
             initiated_at: old_state.last_update_time,
             grace_period_end,
@@ -4063,32 +4507,162 @@ fn test_shutdown_host_input(grace_period_end: Int) -> Input {
   )
 }
 
+fn test_shutdown_host_input(grace_period_end: Int) -> Input {
+  test_shutdown_host_input_with_registry(grace_period_end, [])
+}
+
 fn validate_test_finalize_shutdown(
   mint: Value,
   outputs: List<Output>,
   valid_from: Int,
   grace_period_end: Int,
 ) -> Bool {
+  validate_test_finalize_shutdown_with_input(
+    test_shutdown_host_input(grace_period_end),
+    mint,
+    outputs,
+    valid_from,
+  )
+}
+
+fn validate_test_finalize_shutdown_with_input(
+  host_input: Input,
+  mint: Value,
+  outputs: List<Output>,
+  valid_from: Int,
+) -> Bool {
   host_state_stt.host_state_stt.spend(
     test_nft_policy(),
-    test_client_script_hash(),
+    [
+      registry.legacy(
+        "mock client policy",
+        test_client_script_hash(),
+        "mock proof policy",
+      ),
+    ],
     test_connection_script_hash(),
     test_channel_script_hash(),
     "mock client policy",
     "mock connection policy",
     "mock channel policy",
+    "",
     None,
     FinalizeShutdown,
     test_host_ref(),
     Transaction {
       ..placeholder,
-      inputs: [test_shutdown_host_input(grace_period_end)],
+      inputs: [host_input],
       outputs,
       mint,
       extra_signatories: [trusted_deployer],
       validity_range: interval.after(valid_from),
     },
   )
+}
+
+fn validate_test_authorize_finalization(root_present: Bool) -> Bool {
+  let nft_policy = test_nft_policy()
+  let grace_period_end = 2000 + min_shutdown_grace_period_ms
+  let registration = test_module_registration(test_module_script_hash())
+  let old_state = test_host_state(empty_ibc_state_root, 2000)
+  let shutdown =
+    ShuttingDown { initiated_at: old_state.last_update_time, grace_period_end }
+  let old_datum =
+    test_host_state_datum_with_control(
+      old_state,
+      nft_policy,
+      [Pair("transfer", registration)],
+      shutdown,
+    )
+  let new_datum =
+    test_host_state_datum_with_control(
+      HostState { ..old_state, version: old_state.version + 1 },
+      nft_policy,
+      [],
+      shutdown,
+    )
+  let host_input =
+    Input(
+      test_host_ref(),
+      Output {
+        address: Address(Script(test_host_script_hash()), None),
+        value: from_asset(nft_policy, host_state_token_name, 1),
+        datum: InlineDatum(old_datum),
+        reference_script: None,
+      },
+    )
+  let root_input =
+    Input(
+      test_object_ref(99),
+      Output {
+        ..test_module_output(registration),
+        datum: InlineDatum(
+          TransferModuleDatum {
+            escrow_shard_registry_root: empty_escrow_shard_registry_root,
+            outstanding_voucher_obligation: 0,
+          },
+        ),
+      },
+    )
+  let host_output =
+    Output {
+      address: host_input.output.address,
+      value: host_input.output.value,
+      datum: InlineDatum(new_datum),
+      reference_script: None,
+    }
+  let mint =
+    from_asset(
+      registration.port_token.policy_id,
+      registration.port_token.name,
+      -1,
+    )
+      |> add(
+          registration.module_token.policy_id,
+          registration.module_token.name,
+          -1,
+        )
+  let inputs =
+    if root_present {
+      [host_input, root_input]
+    } else {
+      [host_input]
+    }
+  host_state_stt.host_state_stt.spend(
+    nft_policy,
+    [
+      registry.legacy(
+        "mock client policy",
+        test_client_script_hash(),
+        "mock proof policy",
+      ),
+    ],
+    test_connection_script_hash(),
+    test_channel_script_hash(),
+    "mock client policy",
+    "mock connection policy",
+    "mock channel policy",
+    "",
+    None,
+    AuthorizeFinalization,
+    test_host_ref(),
+    Transaction {
+      ..placeholder,
+      inputs,
+      outputs: [host_output],
+      mint,
+      extra_signatories: [trusted_deployer],
+      validity_range: interval.after(grace_period_end),
+    },
+  )
+}
+
+test host_state_authorizes_finalization_with_transfer_root() {
+  validate_test_authorize_finalization(True)
+}
+
+test host_state_rejects_finalization_without_transfer_root() fail {
+  validate_test_authorize_finalization(False)
 }
 
 test host_state_finalize_shutdown_succeeds_with_exact_nft_burn() {
@@ -4099,6 +4673,47 @@ test host_state_finalize_shutdown_succeeds_with_exact_nft_burn() {
     [],
     grace_period_end,
     grace_period_end,
+  )
+}
+
+test host_state_finalize_shutdown_rejects_registered_transfer_root() fail {
+  let nft_policy = test_nft_policy()
+  let grace_period_end = 2000 + min_shutdown_grace_period_ms
+  host_state_stt.host_state_stt.spend(
+    nft_policy,
+    [
+      registry.legacy(
+        "mock client policy",
+        test_client_script_hash(),
+        "mock proof policy",
+      ),
+    ],
+    test_connection_script_hash(),
+    test_channel_script_hash(),
+    "mock client policy",
+    "mock connection policy",
+    "mock channel policy",
+    "",
+    None,
+    FinalizeShutdown,
+    test_host_ref(),
+    Transaction {
+      ..placeholder,
+      inputs: [
+        test_shutdown_host_input_with_registry(
+          grace_period_end,
+          [
+            Pair(
+              "transfer",
+              test_module_registration(test_module_script_hash()),
+            ),
+          ],
+        ),
+      ],
+      mint: from_asset(nft_policy, host_state_token_name, -1),
+      extra_signatories: [trusted_deployer],
+      validity_range: interval.after(grace_period_end),
+    },
   )
 }
 
@@ -4126,33 +4741,6 @@ test host_state_finalize_shutdown_rejects_wrong_burn_quantity() fail {
   validate_test_finalize_shutdown(
     from_asset(nft_policy, host_state_token_name, -2),
     [],
-    grace_period_end,
-    grace_period_end,
-  )
-}
-
-test host_state_finalize_shutdown_rejects_another_name_under_nft_policy() fail {
-  let nft_policy = test_nft_policy()
-  let grace_period_end = 5000
-  let mint =
-    from_asset(nft_policy, host_state_token_name, -1)
-      |> add(nft_policy, "another-token", -1)
-  validate_test_finalize_shutdown(mint, [], grace_period_end, grace_period_end)
-}
-
-test host_state_finalize_shutdown_rejects_nft_output_with_burn() fail {
-  let nft_policy = test_nft_policy()
-  let grace_period_end = 5000
-  let nft_output =
-    Output {
-      address: Address(Script(test_client_script_hash()), None),
-      value: from_asset(nft_policy, host_state_token_name, 1),
-      datum: NoDatum,
-      reference_script: None,
-    }
-  validate_test_finalize_shutdown(
-    from_asset(nft_policy, host_state_token_name, -1),
-    [nft_output],
     grace_period_end,
     grace_period_end,
   )
@@ -4288,6 +4876,7 @@ test host_state_update_channel_rejects_packet_field_changes() fail {
     "mock client policy",
     "mock connection policy",
     "mock channel policy",
+    "",
     None,
     redeemer,
     host_ref,
@@ -4425,6 +5014,7 @@ test host_state_handle_packet_rejects_channel_only_changes() fail {
     "mock client policy",
     "mock connection policy",
     "mock channel policy",
+    "",
     None,
     redeemer,
     host_ref,
@@ -4444,7 +5034,7 @@ test host_state_heartbeat_preserves_ibc_state() {
   spend_host_state_with_signatories(
     Heartbeat,
     [test_host_input(old_state)],
-    [test_host_output(new_state)],
+    [test_heartbeat_output(new_state)],
     [trusted_deployer],
   )
 }
@@ -4461,7 +5051,7 @@ test host_state_heartbeat_finds_host_output_first() {
   spend_host_state_with_signatories(
     Heartbeat,
     [test_host_input(old_state)],
-    [test_host_output(new_state), ..test_unrelated_outputs(8)],
+    [test_heartbeat_output(new_state), ..test_unrelated_outputs(8)],
     [trusted_deployer],
   )
 }
@@ -4477,7 +5067,7 @@ test host_state_heartbeat_finds_host_output_middle() {
   let outputs =
     list.concat(
       test_unrelated_outputs(4),
-      [test_host_output(new_state), ..test_unrelated_outputs(4)],
+      [test_heartbeat_output(new_state), ..test_unrelated_outputs(4)],
     )
 
   spend_host_state_with_signatories(
@@ -4497,47 +5087,13 @@ test host_state_heartbeat_finds_host_output_last() {
       last_update_time: old_state.last_update_time + 1,
     }
   let outputs =
-    list.concat(test_unrelated_outputs(8), [test_host_output(new_state)])
+    list.concat(test_unrelated_outputs(8), [test_heartbeat_output(new_state)])
 
   spend_host_state_with_signatories(
     Heartbeat,
     [test_host_input(old_state)],
     outputs,
     [trusted_deployer],
-  )
-}
-
-test host_state_heartbeat_rejects_duplicate_host_outputs() fail {
-  let old_state = test_host_state(#"11", 1000)
-  let new_state =
-    HostState {
-      ..old_state,
-      version: old_state.version + 1,
-      last_update_time: old_state.last_update_time + 1,
-    }
-  let host_output = test_host_output(new_state)
-
-  spend_host_state_with_signatories(
-    Heartbeat,
-    [test_host_input(old_state)],
-    [host_output, host_output],
-    [trusted_deployer],
-  )
-}
-
-test host_state_heartbeat_rejects_unauthorized_signer() fail {
-  let old_state = test_host_state(#"11", 1000)
-  let new_state =
-    HostState {
-      ..old_state,
-      version: old_state.version + 1,
-      last_update_time: old_state.last_update_time + 1,
-    }
-
-  spend_host_state(
-    Heartbeat,
-    [test_host_input(old_state)],
-    [test_host_output(new_state)],
   )
 }
 
@@ -4554,7 +5110,7 @@ test host_state_heartbeat_rejects_root_change() fail {
   spend_host_state_with_signatories(
     Heartbeat,
     [test_host_input(old_state)],
-    [test_host_output(new_state)],
+    [test_heartbeat_output(new_state)],
     [trusted_deployer],
   )
 }
@@ -4572,19 +5128,7 @@ test host_state_heartbeat_rejects_counter_change() fail {
   spend_host_state_with_signatories(
     Heartbeat,
     [test_host_input(old_state)],
-    [test_host_output(new_state)],
-    [trusted_deployer],
-  )
-}
-
-test host_state_heartbeat_rejects_stale_timestamp() fail {
-  let old_state = test_host_state(#"11", 1000)
-  let new_state = HostState { ..old_state, version: old_state.version + 1 }
-
-  spend_host_state_with_signatories(
-    Heartbeat,
-    [test_host_input(old_state)],
-    [test_host_output(new_state)],
+    [test_heartbeat_output(new_state)],
     [trusted_deployer],
   )
 }
@@ -4621,7 +5165,17 @@ test host_state_heartbeat_rejects_shutdown_state() fail {
       address,
       value: from_asset(nft_policy, host_state_token_name, 1),
       datum: InlineDatum(
-        test_host_state_datum_with_shutdown(new_state, nft_policy, shutdown),
+        HostStateDatum {
+          ..test_host_state_datum_with_shutdown(new_state, nft_policy, shutdown),
+          control: HostStateControl {
+            ..test_host_state_datum_with_shutdown(
+              new_state,
+              nft_policy,
+              shutdown,
+            ).control,
+            last_heartbeat_time: new_state.last_update_time,
+          },
+        },
       ),
       reference_script: None,
     }
@@ -4699,6 +5253,7 @@ test all_host_state_transitions_preserve_successor_invariants() {
       HostStateDatum {
         ..successor,
         state: HostState { ..successor.state, next_client_sequence: 1 },
+        control: HostStateControl { ..successor.control, live_clients: 1 },
       },
       host_state.validate_create_client,
     ),
@@ -4707,6 +5262,7 @@ test all_host_state_transitions_preserve_successor_invariants() {
       HostStateDatum {
         ..successor,
         state: HostState { ..successor.state, next_connection_sequence: 1 },
+        control: HostStateControl { ..successor.control, live_connections: 1 },
       },
       host_state.validate_create_connection,
     ),
@@ -4715,6 +5271,7 @@ test all_host_state_transitions_preserve_successor_invariants() {
       HostStateDatum {
         ..successor,
         state: HostState { ..successor.state, next_channel_sequence: 1 },
+        control: HostStateControl { ..successor.control, live_channels: 1 },
       },
       host_state.validate_create_channel,
     ),
@@ -4779,5 +5336,871 @@ test root_updates_remain_allowed_during_shutdown() {
     old,
     successor,
     host_state.validate_update_only_root,
+  )
+}
+
+fn state_value_heartbeat(input_extra: Value, output_extra: Value) -> Bool {
+  let old_state = test_host_state(#"11", 1000)
+  let new_state =
+    HostState {
+      ..old_state,
+      version: old_state.version + 1,
+      last_update_time: old_state.last_update_time + 1,
+    }
+  let input = test_host_input(old_state)
+  let output = test_heartbeat_output(new_state)
+  let input =
+    Input {
+      ..input,
+      output: Output {
+        ..input.output,
+        value: assets.merge(input.output.value, input_extra),
+      },
+    }
+  let output =
+    Output { ..output, value: assets.merge(output.value, output_extra) }
+  spend_host_state_with_signatories(
+    Heartbeat,
+    [input],
+    [output],
+    [trusted_deployer],
+  )
+}
+
+test state_value_host_state_rejects_surplus_ada_sweep() fail {
+  state_value_heartbeat(
+    assets.from_lovelace(8_000_000),
+    assets.from_lovelace(2_000_000),
+  )
+}
+
+test state_value_host_state_rejects_unrelated_asset_sweep() fail {
+  let reserve = assets.from_lovelace(8_000_000)
+  state_value_heartbeat(
+    assets.add(reserve, "unrelated policy", "reserve", 7),
+    reserve,
+  )
+}
+
+test state_value_host_state_accepts_full_reserves_and_ada_top_up() {
+  let reserve =
+    assets.from_lovelace(8_000_000)
+      |> assets.add("unrelated policy", "reserve", 7)
+  state_value_heartbeat(
+    reserve,
+    assets.merge(reserve, assets.from_lovelace(2_000_000)),
+  )
+}
+
+fn capacity_receipt_count() -> Fuzzer<Int> {
+  fuzz.int_between(1, max_packet_entries_per_channel - 1)
+}
+
+// Containment audit of the CURRENT protocol, not a new emergency-pause API.
+// Reuse the ordinary commitment fixtures and execute the complete HostState
+// wrapper. Positive controls execute the same operation in Ready and Proposed.
+// These are compiled validator-context tests, not balanced ledger transactions
+// or end-to-end counterparty proof tests. The channel/application validators
+// have their own suites; here the shared HostState phase gate is under test.
+fn containment_registry(phase: Int) -> Registry {
+  let current =
+    Implementation {
+      generation: 1,
+      addresses: list.map(
+        [
+          test_host_script_hash(),
+          test_client_script_hash(),
+          test_connection_script_hash(),
+          test_channel_script_hash(),
+          test_module_script_hash(),
+        ],
+        fn(hash) { Address(Script(hash), None) },
+      ),
+      compatibility: bytearray.from_int_big_endian(462, 32),
+    }
+  let target =
+    Implementation {
+      ..current,
+      generation: 2,
+      addresses: list.map(
+        [101, 102, 103, 104, 105],
+        fn(n) { Address(Script(bytearray.from_int_big_endian(n, 28)), None) },
+      ),
+    }
+  let governance =
+    Governance {
+      signers: [trusted_deployer],
+      quorum: 1,
+      delay_ms: minimum_delay_ms,
+    }
+  let counts = Counts { clients: 10, connections: 10, channels: 10 }
+  let proposal =
+    Replace {
+      source_generation: 1,
+      nonce: 1,
+      target,
+      maximum: counts,
+      escrow_inventory: ibc_state_commitment.empty_hash,
+    }
+  Registry {
+    emergency: Emergency {
+      authority: Authority {
+        signers: [bytearray.from_int_big_endian(999, 28)],
+        quorum: 1,
+      },
+      epoch: 0,
+      mask: 0,
+      restoration: None,
+    },
+    token: AuthToken {
+      policy_id: bytearray.from_int_big_endian(462, 28),
+      name: registry_token_name,
+    },
+    host_policy: test_nft_policy(),
+    identity: FixedIdentity {
+      client_policy: "mock client policy",
+      connection_policy: "mock connection policy",
+      channel_policy: "mock channel policy",
+      escrow_policy: bytearray.from_int_big_endian(463, 28),
+      reference_holder: Address(
+        Script(bytearray.from_int_big_endian(464, 28)),
+        None,
+      ),
+    },
+    approval_authority: bytearray.from_int_big_endian(950, 28),
+    governance,
+    nonce: if phase == 0 {
+      0
+    } else {
+      1
+    },
+    current,
+    phase: when phase is {
+      0 -> Ready
+      1 ->
+        Proposed {
+          proposal,
+          ready_at: minimum_delay_ms + 2_000,
+          expires_at: minimum_delay_ms * 2,
+        }
+      2 ->
+        Moving {
+          target,
+          limits: counts,
+          next: Counts { clients: 0, connections: 0, channels: 0 },
+          registration: test_module_registration(test_module_script_hash()),
+          escrow_remaining: ibc_state_commitment.empty_hash,
+          module_moved: False,
+        }
+      3 ->
+        Proposed {
+          proposal: Rotate { nonce: 1, governance },
+          ready_at: minimum_delay_ms + 2_000,
+          expires_at: minimum_delay_ms * 2,
+        }
+      _ -> Proposed { proposal, ready_at: 0, expires_at: 500 }
+    },
+  }
+}
+
+fn containment_host_case(operation: Int) -> HostCase {
+  when operation is {
+    0 -> prepare_containment_send(462, test_channel_token())
+    1 -> prepare_containment_recv(462)
+    2 -> prepare_containment_ack(462)
+    3 -> prepare_containment_timeout(462)
+    4 -> prepare_containment_prune(False, False)
+    5 -> prepare_host_update_client_capacity()
+    _ -> {
+      let old = test_host_state(ibc_state_commitment.empty_hash, 1_000)
+      let next =
+        HostState { ..old, version: old.version + 1, last_update_time: 2_000 }
+      Pair(
+        Heartbeat,
+        Transaction {
+          ..placeholder,
+          inputs: [test_host_input(old)],
+          outputs: [test_heartbeat_output(next)],
+          extra_signatories: [],
+          validity_range: interval.between(1_000, 2_000),
+        },
+      )
+    }
+  }
+}
+
+fn containment_execute(operation: Int, phase: Int, successor: Bool) -> Bool {
+  containment_restricted(operation, phase, successor, 0)
+}
+
+fn containment_restricted(
+  operation: Int,
+  phase: Int,
+  successor: Bool,
+  mask: Int,
+) -> Bool {
+  let case = containment_host_case(operation)
+  expect run_host_case(case)
+  let Pair(redeemer, tx) = case
+  let original = containment_registry(phase)
+  let registry =
+    Registry { ..original, emergency: Emergency { ..original.emergency, mask } }
+  let reference =
+    Input {
+      output_reference: test_object_ref(462),
+      output: Output {
+        address: Address(Script(bytearray.from_int_big_endian(465, 28)), None),
+        value: from_asset(registry.token.policy_id, registry.token.name, 1),
+        datum: InlineDatum(registry),
+        reference_script: None,
+      },
+    }
+  let transaction =
+    Transaction {
+      ..tx,
+      reference_inputs: [reference, ..tx.reference_inputs],
+      validity_range: interval.between(1_000, 2_000),
+    }
+  let transaction =
+    if successor {
+      // Begin already moved HostState to generation 2. Check that its normal
+      // entry point is blocked as well as the source generation's entry point.
+      let address =
+        Address(Script(bytearray.from_int_big_endian(101, 28)), None)
+      Transaction {
+        ..transaction,
+        inputs: list.map(
+          transaction.inputs,
+          fn(input) {
+            if input.output_reference == test_host_ref() {
+              Input { ..input, output: Output { ..input.output, address } }
+            } else {
+              input
+            }
+          },
+        ),
+        outputs: list.map(
+          transaction.outputs,
+          fn(output) {
+            if output.address == Address(Script(test_host_script_hash()), None) {
+              Output { ..output, address }
+            } else {
+              output
+            }
+          },
+        ),
+      }
+    } else {
+      transaction
+    }
+  let raw: Data = redeemer
+  migration_host.host_state.spend(
+    registry.token.policy_id,
+    if successor {
+      2
+    } else {
+      1
+    },
+    None,
+    raw,
+    test_host_ref(),
+    transaction,
+  )
+}
+
+fn registry_bound_heartbeat(
+  registry: Registry,
+  generation: Int,
+  own_ref: OutputReference,
+) -> Bool {
+  let Pair(redeemer, tx) = containment_host_case(6)
+  let reference =
+    Input {
+      output_reference: test_object_ref(462),
+      output: Output {
+        address: Address(Script(bytearray.from_int_big_endian(465, 28)), None),
+        value: from_asset(registry.token.policy_id, registry.token.name, 1),
+        datum: InlineDatum(registry),
+        reference_script: None,
+      },
+    }
+  let raw: Data = redeemer
+  migration_host.host_state.spend(
+    registry.token.policy_id,
+    generation,
+    None,
+    raw,
+    own_ref,
+    Transaction {
+      ..tx,
+      reference_inputs: [reference],
+      validity_range: interval.between(1_000, 2_000),
+    },
+  )
+}
+
+test registry_bound_heartbeat_accepts_current_host() {
+  registry_bound_heartbeat(containment_registry(0), 1, test_host_ref())
+}
+
+test registry_bound_heartbeat_rejects_another_role_address() fail {
+  let registry = containment_registry(0)
+  expect [host, client, ..rest] = registry.current.addresses
+  let registry =
+    Registry {
+      ..registry,
+      current: Implementation {
+        ..registry.current,
+        addresses: [client, host, ..rest],
+      },
+    }
+  registry_bound_heartbeat(registry, 1, test_host_ref())
+}
+
+test registry_bound_heartbeat_rejects_missing_own_input() fail {
+  registry_bound_heartbeat(containment_registry(0), 1, test_object_ref(999))
+}
+
+test registry_bound_heartbeat_rejects_wrong_generation() fail {
+  registry_bound_heartbeat(containment_registry(0), 2, test_host_ref())
+}
+
+test containment_current_ready_permits_send() {
+  containment_execute(0, 0, False)
+}
+
+test containment_current_approval_delay_permits_send() {
+  containment_execute(0, 1, False)
+}
+
+test containment_current_rotation_delay_permits_send() {
+  containment_execute(0, 3, False)
+}
+
+test containment_current_expired_proposal_permits_send() {
+  containment_execute(0, 4, False)
+}
+
+test containment_current_moving_rejects_source_send() fail {
+  containment_execute(0, 2, False)
+}
+
+test containment_current_moving_rejects_successor_send() fail {
+  containment_execute(0, 2, True)
+}
+
+test containment_current_ready_permits_receive() {
+  containment_execute(1, 0, False)
+}
+
+test containment_current_approval_delay_permits_receive() {
+  containment_execute(1, 1, False)
+}
+
+test containment_current_rotation_delay_permits_receive() {
+  containment_execute(1, 3, False)
+}
+
+test containment_current_expired_proposal_permits_receive() {
+  containment_execute(1, 4, False)
+}
+
+test containment_current_moving_rejects_source_receive() fail {
+  containment_execute(1, 2, False)
+}
+
+test containment_current_moving_rejects_successor_receive() fail {
+  containment_execute(1, 2, True)
+}
+
+test containment_current_ready_permits_acknowledge() {
+  containment_execute(2, 0, False)
+}
+
+test containment_current_approval_delay_permits_acknowledge() {
+  containment_execute(2, 1, False)
+}
+
+test containment_current_rotation_delay_permits_acknowledge() {
+  containment_execute(2, 3, False)
+}
+
+test containment_current_expired_proposal_permits_acknowledge() {
+  containment_execute(2, 4, False)
+}
+
+test containment_current_moving_rejects_source_acknowledge() fail {
+  containment_execute(2, 2, False)
+}
+
+test containment_current_moving_rejects_successor_acknowledge() fail {
+  containment_execute(2, 2, True)
+}
+
+test containment_current_ready_permits_timeout() {
+  containment_execute(3, 0, False)
+}
+
+test containment_current_approval_delay_permits_timeout() {
+  containment_execute(3, 1, False)
+}
+
+test containment_current_rotation_delay_permits_timeout() {
+  containment_execute(3, 3, False)
+}
+
+test containment_current_expired_proposal_permits_timeout() {
+  containment_execute(3, 4, False)
+}
+
+test containment_current_moving_rejects_source_timeout() fail {
+  containment_execute(3, 2, False)
+}
+
+test containment_current_moving_rejects_successor_timeout() fail {
+  containment_execute(3, 2, True)
+}
+
+test containment_current_ready_permits_prune() {
+  containment_execute(4, 0, False)
+}
+
+test containment_current_approval_delay_permits_prune() {
+  containment_execute(4, 1, False)
+}
+
+test containment_current_rotation_delay_permits_prune() {
+  containment_execute(4, 3, False)
+}
+
+test containment_current_expired_proposal_permits_prune() {
+  containment_execute(4, 4, False)
+}
+
+test containment_current_moving_rejects_source_prune() fail {
+  containment_execute(4, 2, False)
+}
+
+test containment_current_moving_rejects_successor_prune() fail {
+  containment_execute(4, 2, True)
+}
+
+test containment_current_ready_permits_client_update() {
+  containment_execute(5, 0, False)
+}
+
+test containment_current_approval_delay_permits_client_update() {
+  containment_execute(5, 1, False)
+}
+
+test containment_current_rotation_delay_permits_client_update() {
+  containment_execute(5, 3, False)
+}
+
+test containment_current_expired_proposal_permits_client_update() {
+  containment_execute(5, 4, False)
+}
+
+test containment_current_moving_rejects_source_client_update() fail {
+  containment_execute(5, 2, False)
+}
+
+test containment_current_moving_rejects_successor_client_update() fail {
+  containment_execute(5, 2, True)
+}
+
+test containment_current_ready_permits_heartbeat() {
+  containment_execute(6, 0, False)
+}
+
+test containment_current_approval_delay_permits_heartbeat() {
+  containment_execute(6, 1, False)
+}
+
+test containment_current_rotation_delay_permits_heartbeat() {
+  containment_execute(6, 3, False)
+}
+
+test containment_current_expired_proposal_permits_heartbeat() {
+  containment_execute(6, 4, False)
+}
+
+test containment_current_moving_rejects_source_heartbeat() fail {
+  containment_execute(6, 2, False)
+}
+
+test containment_current_moving_rejects_successor_heartbeat() fail {
+  containment_execute(6, 2, True)
+}
+
+test emergency_traffic_mask_phase_0_send() fail {
+  containment_restricted(0, 0, False, 1)
+}
+
+test emergency_traffic_mask_phase_0_recv() fail {
+  containment_restricted(1, 0, False, 1)
+}
+
+test emergency_traffic_mask_phase_0_ack() fail {
+  containment_restricted(2, 0, False, 1)
+}
+
+test emergency_traffic_mask_phase_0_timeout() fail {
+  containment_restricted(3, 0, False, 1)
+}
+
+test emergency_traffic_mask_phase_0_prune() fail {
+  containment_restricted(4, 0, False, 1)
+}
+
+test emergency_traffic_mask_phase_0_client() {
+  containment_restricted(5, 0, False, 1)
+}
+
+test emergency_traffic_mask_phase_0_heartbeat() {
+  containment_restricted(6, 0, False, 1)
+}
+
+test emergency_traffic_mask_phase_1_send() fail {
+  containment_restricted(0, 1, False, 1)
+}
+
+test emergency_traffic_mask_phase_1_recv() fail {
+  containment_restricted(1, 1, False, 1)
+}
+
+test emergency_traffic_mask_phase_1_ack() fail {
+  containment_restricted(2, 1, False, 1)
+}
+
+test emergency_traffic_mask_phase_1_timeout() fail {
+  containment_restricted(3, 1, False, 1)
+}
+
+test emergency_traffic_mask_phase_1_prune() fail {
+  containment_restricted(4, 1, False, 1)
+}
+
+test emergency_traffic_mask_phase_1_client() {
+  containment_restricted(5, 1, False, 1)
+}
+
+test emergency_traffic_mask_phase_1_heartbeat() {
+  containment_restricted(6, 1, False, 1)
+}
+
+test emergency_traffic_mask_phase_3_send() fail {
+  containment_restricted(0, 3, False, 1)
+}
+
+test emergency_traffic_mask_phase_3_recv() fail {
+  containment_restricted(1, 3, False, 1)
+}
+
+test emergency_traffic_mask_phase_3_ack() fail {
+  containment_restricted(2, 3, False, 1)
+}
+
+test emergency_traffic_mask_phase_3_timeout() fail {
+  containment_restricted(3, 3, False, 1)
+}
+
+test emergency_traffic_mask_phase_3_prune() fail {
+  containment_restricted(4, 3, False, 1)
+}
+
+test emergency_traffic_mask_phase_3_client() {
+  containment_restricted(5, 3, False, 1)
+}
+
+test emergency_traffic_mask_phase_3_heartbeat() {
+  containment_restricted(6, 3, False, 1)
+}
+
+test emergency_traffic_mask_phase_4_send() fail {
+  containment_restricted(0, 4, False, 1)
+}
+
+test emergency_traffic_mask_phase_4_recv() fail {
+  containment_restricted(1, 4, False, 1)
+}
+
+test emergency_traffic_mask_phase_4_ack() fail {
+  containment_restricted(2, 4, False, 1)
+}
+
+test emergency_traffic_mask_phase_4_timeout() fail {
+  containment_restricted(3, 4, False, 1)
+}
+
+test emergency_traffic_mask_phase_4_prune() fail {
+  containment_restricted(4, 4, False, 1)
+}
+
+test emergency_traffic_mask_phase_4_client() {
+  containment_restricted(5, 4, False, 1)
+}
+
+test emergency_traffic_mask_phase_4_heartbeat() {
+  containment_restricted(6, 4, False, 1)
+}
+
+test emergency_clients_reject_update() fail {
+  containment_restricted(5, 0, False, 2)
+}
+
+test emergency_clients_permit_heartbeat() {
+  containment_restricted(6, 0, False, 2)
+}
+
+test emergency_heartbeat_rejects_heartbeat() fail {
+  containment_restricted(6, 0, False, 4)
+}
+
+test emergency_heartbeat_permits_send() {
+  containment_restricted(0, 0, False, 4)
+}
+
+// Two registered types coexist under the same host. Only the selected type's
+// policy, spending script and IBC identifier may authorize its new commitment.
+fn create_alternate_registered_client(commitment_id: ByteArray) -> Bool {
+  let first =
+    registry.legacy("mock client policy", test_client_script_hash(), "proof-a")
+  let second =
+    registry.ClientRegistration {
+      ..registry.legacy(
+        "alternate client policy",
+        "alternate client script",
+        "proof-b",
+      ),
+      client_type: "99-test",
+    }
+  create_registered_client(
+    RegistryCase {
+      first,
+      second,
+      sequence: "0",
+      sequence_number: 0,
+      reverse: False,
+      reverse_references: False,
+    },
+    commitment_id,
+  )
+}
+
+fn create_registered_client(
+  sample: RegistryCase,
+  commitment_id: ByteArray,
+) -> Bool {
+  let seed = sample.sequence_number + 613
+  let second = sample.second
+  let token =
+    AuthToken {
+      policy_id: second.mint_policy,
+      name: auth.generate_token_name(
+        AuthToken { policy_id: test_nft_policy(), name: host_state_token_name },
+        client_id_keys.client_prefix,
+        sample.sequence,
+      ),
+    }
+  let client = ClientDatum { ..test_client_datum(1, seed), token }
+  let state_key = client_keys.full_client_state_path(commitment_id)
+  let consensus_key =
+    client_keys.full_client_consensus_state_path(commitment_id, "0-1")
+  let state_value = cbor.serialise(client.state.client_state)
+  let client_state_siblings = full_empty_siblings()
+  let after_client =
+    ibc_state_commitment.apply_update(
+      empty_ibc_state_root,
+      state_key,
+      "",
+      state_value,
+      client_state_siblings,
+    )
+  let consensus_state_siblings =
+    siblings_after_single_insert(state_key, state_value, consensus_key)
+  let new_root =
+    ibc_state_commitment.apply_update(
+      after_client,
+      consensus_key,
+      "",
+      cbor.serialise(test_consensus_state(seed)),
+      consensus_state_siblings,
+    )
+  let old_state =
+    HostState {
+      ..test_host_state(empty_ibc_state_root, seed),
+      next_client_sequence: sample.sequence_number,
+    }
+  let new_state =
+    HostState {
+      ..old_state,
+      version: old_state.version + 1,
+      next_client_sequence: sample.sequence_number + 1,
+      ibc_state_root: new_root,
+    }
+  let client_output =
+    Output {
+      ..test_client_output(client),
+      address: Address(Script(second.spend_validator), None),
+    }
+  let host_output = test_host_output(new_state)
+  expect InlineDatum(data) = host_output.datum
+  expect host_datum: HostStateDatum = data
+  let host_output =
+    Output {
+      ..host_output,
+      datum: InlineDatum(
+        HostStateDatum {
+          ..host_datum,
+          control: HostStateControl { ..host_datum.control, live_clients: 1 },
+        },
+      ),
+    }
+  host_state_stt.host_state_stt.spend(
+    test_nft_policy(),
+    client_registry_fixtures.registrations(sample),
+    test_connection_script_hash(),
+    test_channel_script_hash(),
+    "mock client policy",
+    "mock connection policy",
+    "mock channel policy",
+    "",
+    None,
+    CreateClient { client_state_siblings, consensus_state_siblings },
+    test_host_ref(),
+    Transaction {
+      ..placeholder,
+      inputs: [test_host_input(old_state)],
+      outputs: [host_output, client_output],
+      mint: from_asset(token.policy_id, token.name, 1),
+    },
+  )
+}
+
+test registered_client_creation_commits_the_selected_types_identifier() {
+  create_alternate_registered_client("99-test-0")
+}
+
+test registered_client_creation_rejects_a_different_types_commitment() fail {
+  create_alternate_registered_client("07-tendermint-0")
+}
+
+test prop_host_registered_client_commits_exact_namespace(
+  sample via registered_client_cases(),
+) {
+  fuzz.label(@"fuzz.contract.host.client_registry.valid_namespace")
+  create_registered_client(
+    sample,
+    registry.identifier(sample.second, sample.sequence),
+  )
+}
+
+test prop_host_registered_client_rejects_other_namespace(
+  sample via registered_client_cases(),
+) fail {
+  fuzz.label(@"fuzz.contract.host.client_registry.invalid_namespace")
+  create_registered_client(
+    sample,
+    registry.identifier(sample.first, sample.sequence),
+  )
+}
+
+fn registered_client_cases() -> Fuzzer<client_registry_fixtures.RegistryCase> {
+  let suffix <- fuzz.and_then(fuzz.int_between(0, 65535))
+  let sequence <- fuzz.and_then(fuzz.int_between(0, 99999999))
+  let seed <- fuzz.and_then(fuzz.bytearray())
+  let reverse <- fuzz.and_then(fuzz.bool())
+  let reverse_references <- fuzz.map(fuzz.bool())
+  client_registry_fixtures.registry_case(
+    suffix,
+    sequence,
+    seed,
+    reverse,
+    reverse_references,
+  )
+}
+
+fn test_heartbeat_output(state: HostState) -> Output {
+  let output = test_host_output(state)
+  expect InlineDatum(raw) = output.datum
+  expect datum: HostStateDatum = raw
+  Output {
+    ..output,
+    datum: InlineDatum(
+      HostStateDatum {
+        ..datum,
+        control: HostStateControl {
+          ..datum.control,
+          last_heartbeat_time: state.last_update_time,
+        },
+      },
+    ),
+  }
+}
+
+test heartbeat_does_not_depend_on_current_deployer() {
+  let old_state = test_host_state(empty_ibc_state_root, 1)
+  let new_state =
+    HostState {
+      ..old_state,
+      version: old_state.version + 1,
+      last_update_time: old_state.last_update_time + 1,
+    }
+  let input = test_host_input(old_state)
+  let Input { output_reference: reference, output: old_output } = input
+  let old_datum =
+    HostStateDatum {
+      ..test_host_state_datum(old_state, test_nft_policy()),
+      deployer: named_backup,
+    }
+  let new_datum =
+    HostStateDatum {
+      ..old_datum,
+      state: new_state,
+      control: HostStateControl {
+        ..old_datum.control,
+        last_heartbeat_time: new_state.last_update_time,
+      },
+    }
+  spend_host_state_with_backup(
+    Heartbeat,
+    [Input(reference, Output { ..old_output, datum: InlineDatum(old_datum) })],
+    [
+      Output {
+        ..test_heartbeat_output(new_state),
+        datum: InlineDatum(new_datum),
+      },
+    ],
+    [trusted_deployer],
+    named_backup,
+  )
+}
+
+test host_state_heartbeat_accepts_independent_relayer() {
+  let old_state = test_host_state(#"11", 1000)
+  let new_state =
+    HostState {
+      ..old_state,
+      version: old_state.version + 1,
+      last_update_time: old_state.last_update_time + 1,
+    }
+
+  spend_host_state(
+    Heartbeat,
+    [test_host_input(old_state)],
+    [test_heartbeat_output(new_state)],
+  )
+}
+
+test host_state_heartbeat_rejects_missing_heartbeat_clock() fail {
+  let old_state = test_host_state(#"11", 1000)
+  let new_state = HostState { ..old_state, version: old_state.version + 1 }
+
+  spend_host_state_with_signatories(
+    Heartbeat,
+    [test_host_input(old_state)],
+    [test_host_output(new_state)],
+    [trusted_deployer],
   )
 }

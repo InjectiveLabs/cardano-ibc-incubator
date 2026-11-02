@@ -1,6 +1,6 @@
 'use client';
 
-/* global BigInt */
+import type { FundedIntent } from '@/utils/cardanoIntent';
 
 import {
   Box,
@@ -41,7 +41,12 @@ import {
   type TransferPlanResponse,
 } from '@/apis/restapi/cardano';
 import { useWallet } from '@meshsdk/react';
-import { formatPrice } from '@/utils/string';
+import { baseAmountToDisplayAmount, formatPrice } from '@/utils/string';
+import { tokenAmount } from '@/utils/token';
+import {
+  cardanoTokenOption,
+  tokenPrimaryLabel,
+} from '@/utils/cardanoAssetPresentation';
 import { useCardanoChain } from '@/hooks/useCardanoChain';
 import { useSafeCardanoAddress } from '@/hooks/useSafeCardanoAddress';
 import SwapContext from '@/contexts/SwapContext';
@@ -86,6 +91,7 @@ import {
 } from './index.style';
 
 type EstimateFeeType = {
+  intentChannel?: string;
   display: boolean;
   canEst: boolean;
   msgs: any[];
@@ -97,6 +103,7 @@ type EstimateFeeType = {
   destinationAddress?: string;
   tokenId?: string;
   sendAmount?: string;
+  baseAmount?: string;
 };
 
 type RoutePreviewState = {
@@ -119,14 +126,6 @@ type RouteAvailabilityStatus =
   | 'available'
   | 'unavailable'
   | 'unknown';
-
-type CardanoAsset = {
-  assetName: string;
-  quantity?: string;
-  unit?: string;
-  fingerprint?: string;
-  policyId?: string;
-};
 
 const initEstData = {
   display: false,
@@ -210,14 +209,6 @@ const formatRouteDiagnosticsMessage = (
   return `No canonical transfer route exists from ${fromChainName} to ${toChainName}. Missing live IBC transfer channel${
     missingHops.length === 1 ? '' : 's'
   } for: ${missingDescriptions.join('; ')}.`;
-};
-
-const hasPositiveIntegerAmount = (value: string): boolean => {
-  try {
-    return BigInt(value || '0') >= BigInt(1);
-  } catch {
-    return false;
-  }
 };
 
 const getCardanoBuildErrorMessage = (error: unknown): string => {
@@ -374,6 +365,7 @@ const RoutePreview = ({
 
 const Transfer = () => {
   const [isSubmitted, setIsSubmitted] = useState(false);
+  const [fundedIntent, setFundedIntent] = useState<FundedIntent>();
   const [networkList, setNetworkList] = useState<NetworkItemProps[]>([]);
   const [tokenList, setTokenList] = useState<TransferTokenItemProps[]>([]);
   const [validationAddress, setValidationAddress] = useState<string>('');
@@ -404,6 +396,7 @@ const Transfer = () => {
     setEstData(initEstData);
     setLastPrepareFailed(false);
     setLastTxHash('');
+    setFundedIntent(undefined);
     setLastTransferSubmittedAt('');
     clearResumableTransfer();
   };
@@ -444,15 +437,7 @@ const Transfer = () => {
   // handle get cardano assets
   const cardano = useCardanoChain();
   const cardanoAddress = useSafeCardanoAddress();
-  const cardanoAssets: CardanoAsset[] = [];
-  cardano.getTotalSupply()?.forEach((asset) => {
-    const assetWithName = asset as typeof asset & { assetName: string };
-    cardanoAssets.push({
-      quantity: assetWithName.quantity,
-      assetName: assetWithName.assetName,
-      unit: asset.unit,
-    });
-  });
+  const transferToken = tokenAmount(selectedToken, sendAmount);
 
   const currentConfiguredRoute = findRuntimeRoute(
     fromNetwork.networkId,
@@ -462,12 +447,14 @@ const Transfer = () => {
   const estimateMatchesCurrentTransfer = (
     candidate: EstimateFeeType,
   ): boolean =>
+    Boolean(transferToken) &&
     candidate.canEst &&
     candidate.sourceChainId === fromNetwork.networkId &&
     candidate.destinationChainId === toNetwork.networkId &&
     candidate.destinationAddress === destinationAddress &&
     candidate.tokenId === selectedToken.tokenId &&
-    candidate.sendAmount === sendAmount;
+    candidate.sendAmount === sendAmount &&
+    candidate.baseAmount === transferToken?.amount;
 
   const getSourceWalletAddress = (sourceChainId = fromNetwork.networkId) =>
     sourceChainId === CARDANO_CHAIN_ID
@@ -481,6 +468,15 @@ const Transfer = () => {
   ): ResumableTransferRecord => ({
     version: 1,
     sourceTxHash,
+    ...(submittedEstData.intentChannel
+      ? {
+          intent: {
+            hash: sourceTxHash,
+            channel: submittedEstData.intentChannel,
+            signer: getSourceWalletAddress() || '',
+          },
+        }
+      : {}),
     sourceChainId: fromNetwork.networkId || '',
     destinationChainId: toNetwork.networkId || '',
     sourceWalletAddress: getSourceWalletAddress(),
@@ -497,6 +493,7 @@ const Transfer = () => {
 
   const restoreResumableTransfer = (record: ResumableTransferRecord) => {
     isRestoringTransferRef.current = true;
+    setFundedIntent(record.intent);
     const restoredFromNetwork = networkItemFromChainId(
       record.sourceChainId,
       record.fromNetwork,
@@ -618,7 +615,7 @@ const Transfer = () => {
     }
 
     // do verify address:
-    if (!validateAddress() || !hasPositiveIntegerAmount(sendAmount)) {
+    if (!validateAddress() || !transferToken) {
       return initEstData;
     }
     const dataTransfer = getDataTransfer();
@@ -694,12 +691,12 @@ const Transfer = () => {
         'destination-chain-unavailable': `No discovered IBC transfer channels reach ${toChainName}.`,
         'no-outbound-channels': `${fromChainName} has no outbound IBC transfer channels.`,
         'no-route-found': `No IBC transfer route found from ${fromChainName} to ${toChainName}.`,
-        'missing-unwind-hop': `Token ${
-          selectedToken.tokenName || selectedToken.tokenId
-        } must unwind on a specific IBC hop before it can reach ${toChainName}, but that reverse hop is not currently available.`,
-        'ambiguous-unwind-hop': `Token ${
-          selectedToken.tokenName || selectedToken.tokenId
-        } can unwind through multiple local channels on the way to ${toChainName}; refusing to guess.`,
+        'missing-unwind-hop': `Token ${tokenPrimaryLabel(
+          selectedToken,
+        )} must unwind on a specific IBC hop before it can reach ${toChainName}, but that reverse hop is not currently available.`,
+        'ambiguous-unwind-hop': `Token ${tokenPrimaryLabel(
+          selectedToken,
+        )} can unwind through multiple local channels on the way to ${toChainName}; refusing to guess.`,
         'no-forward-route':
           formatRouteDiagnosticsMessage(
             routePlan,
@@ -772,7 +769,7 @@ const Transfer = () => {
     // });
 
     // estimate amount after PFM
-    let estReceiveAmount = BigNumber(sendAmount);
+    let estReceiveAmount = BigNumber(transferToken.amount);
     if (chains.length > 2) {
       const feeChains = chains.slice(1, chains.length - 1);
       feeChains.forEach((chainId) => {
@@ -798,7 +795,7 @@ const Transfer = () => {
         senderAddress?.address,
         destinationAddress,
         PACKET_TIMEOUT_NANOSEC,
-        { amount: sendAmount, denom: selectedToken.tokenId! },
+        transferToken,
       );
       try {
         const est = await estimateFee(msg);
@@ -815,7 +812,10 @@ const Transfer = () => {
           display: true,
           canEst: true,
           msgs: msg,
-          estReceiveAmount: estReceiveAmount.toString(10),
+          estReceiveAmount: baseAmountToDisplayAmount(
+            estReceiveAmount.toFixed(0),
+            selectedToken.tokenExponent ?? 0,
+          ),
           estFee: `${estFee.amount} ${estFee.denom.toUpperCase()}`,
           estTime: COSMOS_TRANSFER_EST_TIME,
           sourceChainId: fromNetwork.networkId,
@@ -823,6 +823,7 @@ const Transfer = () => {
           destinationAddress,
           tokenId: selectedToken.tokenId,
           sendAmount,
+          baseAmount: transferToken.amount,
         };
       } catch (e) {
         if (estimateGenerationRef.current !== estimateGeneration) {
@@ -854,7 +855,7 @@ const Transfer = () => {
           cardanoAddress || '',
           destinationAddress,
           PACKET_TIMEOUT_NANOSEC,
-          { amount: sendAmount, denom: selectedToken.tokenId! },
+          transferToken,
           walletUtxos,
         );
         if (estimateGenerationRef.current !== estimateGeneration) {
@@ -868,13 +869,18 @@ const Transfer = () => {
         setRoutePreview({
           status: 'ready',
           chainIds: liveRouteChainIds,
-          message: 'Unsigned Cardano transaction ready. You can sign it now.',
+          message:
+            'Ready to fund your request. The relayer will submit the packet without another wallet signature.',
         });
         return {
           display: true,
           canEst: true,
           msgs: [unsignedTx],
-          estReceiveAmount: estReceiveAmount.toString(10),
+          intentChannel: msg[0].intentChannel,
+          estReceiveAmount: baseAmountToDisplayAmount(
+            estReceiveAmount.toFixed(0),
+            selectedToken.tokenExponent ?? 0,
+          ),
           estFee: estFee ? `${formatPrice(estFee)} lovelace` : 'See wallet',
           estTime: CARDANO_TRANSFER_EST_TIME,
           sourceChainId: fromNetwork.networkId,
@@ -882,6 +888,7 @@ const Transfer = () => {
           destinationAddress,
           tokenId: selectedToken.tokenId,
           sendAmount,
+          baseAmount: transferToken.amount,
         };
       } catch (e) {
         if (estimateGenerationRef.current !== estimateGeneration) {
@@ -912,7 +919,7 @@ const Transfer = () => {
     routeAvailability === 'available' &&
     Boolean(selectedToken.tokenId) &&
     Boolean(destinationAddress) &&
-    hasPositiveIntegerAmount(sendAmount) &&
+    Boolean(transferToken) &&
     !getSourceWalletMismatch() &&
     verifyAddress(destinationAddress, toNetwork.networkId?.toString());
 
@@ -939,6 +946,11 @@ const Transfer = () => {
         persistResumableTransfer(
           buildResumableTransferRecord(txHash, preparedEstData, submittedAt),
         );
+        setFundedIntent({
+          hash: txHash,
+          channel: preparedEstData.intentChannel!,
+          signer: cardanoAddress || '',
+        });
         setLastTxHash(txHash);
         setLastTransferSubmittedAt(submittedAt);
         setIsSubmitted(true);
@@ -1096,17 +1108,11 @@ const Transfer = () => {
     if (fromNetwork.networkId && fromNetwork.networkId === CARDANO_CHAIN_ID) {
       try {
         setIsFetchDataLoading(true);
-        if (cardanoAssets?.length) {
-          tokenListData =
-            cardanoAssets?.map((asset) => ({
-              tokenId: asset.unit,
-              tokenLogo: DefaultCardanoNetworkIcon.src,
-              tokenName: asset.assetName,
-              tokenSymbol: asset.unit,
-              tokenExponent: 0,
-              balance: asset.quantity,
-            })) || [];
-        }
+        tokenListData = cardano
+          .getTotalSupply()
+          .map((asset) =>
+            cardanoTokenOption(asset, DefaultCardanoNetworkIcon.src),
+          );
       } catch (error) {
         setIsFetchDataLoading(false);
       }
@@ -1115,6 +1121,38 @@ const Transfer = () => {
     setTokenList(tokenListData);
     setIsFetchDataLoading(false);
   };
+
+  useEffect(() => {
+    if (
+      fromNetwork.networkId === CARDANO_CHAIN_ID &&
+      !isSubmitted &&
+      !isProcessingTransfer
+    ) {
+      const options = cardano
+        .getTotalSupply()
+        .map((asset) =>
+          cardanoTokenOption(asset, DefaultCardanoNetworkIcon.src),
+        );
+      setTokenList(options);
+      if (selectedToken.tokenId) {
+        const current = options.find(
+          (asset) => asset.tokenId === selectedToken.tokenId,
+        );
+        setSelectedToken(current || {});
+        if (!current || current.tokenExponent !== selectedToken.tokenExponent)
+          setSendAmount('');
+      }
+    }
+  }, [
+    cardano,
+    fromNetwork.networkId,
+    isSubmitted,
+    isProcessingTransfer,
+    selectedToken.tokenId,
+    selectedToken.tokenExponent,
+    setSelectedToken,
+    setSendAmount,
+  ]);
 
   useEffect(() => {
     handleResetSwapData();
@@ -1349,7 +1387,7 @@ const Transfer = () => {
         setEstData(calculatedEstData);
       }
     };
-    if (hasPositiveIntegerAmount(sendAmount)) {
+    if (transferToken) {
       debounce(checkEstData, 500)();
     } else {
       setEstData(initEstData);
@@ -1383,6 +1421,7 @@ const Transfer = () => {
       estReceiveAmount={estData.estReceiveAmount}
       estFee={estData.estFee}
       estTime={estData.estTime}
+      intent={fundedIntent}
       lastTxHash={lastTxHash}
       submittedAt={lastTransferSubmittedAt}
       resetLastTxData={resetLastTxData}

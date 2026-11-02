@@ -1,7 +1,6 @@
 use aiken/builtin
 use aiken/cbor
 use aiken/collection/pairs
-use aiken/fuzz
 use aiken/interval
 use aiken/primitive/bytearray
 use cardano/address.{from_script}
@@ -22,8 +21,8 @@ use ibc/client/ics_007_tendermint_client/height.{Height} as height_mod
 use ibc/client/ics_007_tendermint_client/types/unchecked_rational.{
   UncheckedRational,
 }
-use ibc/client/ics_007_tendermint_client/types/verify_proof_redeemer.{
-  VerifyMembership,
+use ibc/core/ics_002_client_semantics/verify_proof_redeemer.{
+  VerifyMembership, VerifyProofEnvelope,
 }
 use ibc/core/ics_003_connection_semantics/connection_datum.{ConnectionDatum}
 use ibc/core/ics_003_connection_semantics/types/connection_end.{ConnectionEnd}
@@ -31,8 +30,9 @@ use ibc/core/ics_003_connection_semantics/types/counterparty.{Counterparty} as c
 use ibc/core/ics_003_connection_semantics/types/state.{Open}
 use ibc/core/ics_003_connection_semantics/types/version.{Version}
 use ibc/core/ics_003_connection_semantics/verify as verify_mod
-use ibc/core/ics_004/channel_datum.{ChannelDatum,
-  ChannelDatumState} as channel_datum_mod
+use ibc/core/ics_004/channel_datum.{
+  ChannelDatum, ChannelDatumState, initial_upgrade_state,
+} as channel_datum_mod
 use ibc/core/ics_004/channel_redeemer.{RecvPacket}
 use ibc/core/ics_004/types/acknowledgement as acknowledgement_mod
 use ibc/core/ics_004/types/channel.{Channel}
@@ -184,6 +184,62 @@ fn check_recv_packet_with_timeout(
   timeout_height: Height,
   timeout_timestamp: Int,
 ) -> Bool {
+  check_recv_packet_with_history(
+    include_module_callback,
+    mutate_successor,
+    match_callback_packet,
+    match_callback_acknowledgement,
+    preserve_module_binding,
+    compose_host_state,
+    packet_data,
+    timeout_height,
+    timeout_timestamp,
+    False,
+  )
+}
+
+fn check_recv_packet_with_history(
+  include_module_callback: Bool,
+  mutate_successor: Bool,
+  match_callback_packet: Bool,
+  match_callback_acknowledgement: Bool,
+  preserve_module_binding: Bool,
+  compose_host_state: Bool,
+  packet_data: ByteArray,
+  timeout_height: Height,
+  timeout_timestamp: Int,
+  already_received: Bool,
+) -> Bool {
+  check_recv_packet_with_proof(
+    include_module_callback,
+    mutate_successor,
+    match_callback_packet,
+    match_callback_acknowledgement,
+    preserve_module_binding,
+    compose_host_state,
+    packet_data,
+    timeout_height,
+    timeout_timestamp,
+    already_received,
+    None,
+    True,
+  )
+}
+
+fn check_recv_packet_with_proof(
+  include_module_callback: Bool,
+  mutate_successor: Bool,
+  match_callback_packet: Bool,
+  match_callback_acknowledgement: Bool,
+  preserve_module_binding: Bool,
+  compose_host_state: Bool,
+  packet_data: ByteArray,
+  timeout_height: Height,
+  timeout_timestamp: Int,
+  already_received: Bool,
+  opaque_proof: Option<Data>,
+  match_proof: Bool,
+) -> Bool {
   let mock_data = setup()
 
   let channel_id =
@@ -200,6 +256,7 @@ fn check_recv_packet_with_timeout(
       },
       connection_hops: [mock_data.connection_id],
       version: "mock-version",
+      upgrade_sequence: 0,
     }
 
   let input_channel_datum =
@@ -212,8 +269,13 @@ fn check_recv_packet_with_timeout(
         next_sequence_recv: 1,
         next_sequence_ack: 1,
         packet_commitment: [],
-        packet_receipt: [],
+        packet_receipt: if already_received {
+          [Pair(1, "")]
+        } else {
+          []
+        },
         packet_acknowledgement: [],
+        upgrade: initial_upgrade_state,
       },
       port_id: mock_data.port_id,
       token: mock_data.channel_token,
@@ -408,7 +470,7 @@ fn check_recv_packet_with_timeout(
   let validity_range = mock_data.validity_range
 
   //========================arrange redeemers=======================
-  let proof_commitment =
+  let proof_commitment: Data =
     MerkleProof {
       proofs: [
         CommitmentProof {
@@ -503,6 +565,12 @@ fn check_recv_packet_with_timeout(
       ],
     }
 
+  let proof_commitment: Data =
+    when opaque_proof is {
+      Some(payload) -> payload
+      None -> proof_commitment
+    }
+
   let spend_channel_redeemer: Redeemer =
     RecvPacket { packet, proof_commitment, proof_height }
 
@@ -554,17 +622,25 @@ fn check_recv_packet_with_timeout(
   let commitment = packet_mod.commit_packet(packet)
 
   let verify_proof_redeemer: Redeemer =
-    VerifyMembership {
-      cs: client_datum_state.client_state,
-      cons_state: consensus_state,
-      height: proof_height,
-      processed_time: 0,
-      processed_height: 0,
-      delay_time_period: time_delay,
-      delay_block_period: block_delay,
-      proof: proof_commitment,
-      path: merkle_path,
-      value: commitment,
+    VerifyProofEnvelope {
+      history_witness: None,
+      proof: VerifyMembership {
+        cs: client_datum_state.client_state,
+        cons_state: consensus_state,
+        height: proof_height,
+        processed_time: 0,
+        processed_height: 0,
+        delay_time_period: time_delay,
+        delay_block_period: block_delay,
+        proof: if match_proof {
+          proof_commitment
+        } else {
+          let wrong_proof: Data = #"ff"
+          wrong_proof
+        },
+        path: merkle_path,
+        value: commitment,
+      },
     }
 
   let recv_packet_redeemer: Redeemer = mock_data.channel_token
@@ -637,6 +713,7 @@ fn check_recv_packet_with_timeout(
         mock_data.client_minting_policy_id,
         mock_data.connection_minting_policy_id,
         mock_data.channel_minting_policy_id,
+        "",
         None,
         host_state_redeemer,
         host_input.output_reference,
@@ -709,49 +786,27 @@ test succeed_recv_packet_maximum_ics20_packet() {
   )
 }
 
-test prop_tx_recv_packet_accepts_atomic_successor_and_callback(
-  _seed via fuzz.int(),
-) {
-  fuzz.label(@"regression.contract.packet.recv.valid_atomic_successor_callback")
+test regression_tx_recv_packet_accepts_atomic_successor_and_callback() {
   check_recv_packet(True, False, True, True, True, True)
 }
 
-test prop_tx_recv_packet_rejects_missing_application_callback(
-  _seed via fuzz.int(),
-) fail {
-  fuzz.label(
-    @"regression.contract.packet.recv.invalid_missing_application_callback",
-  )
+test regression_tx_recv_packet_rejects_missing_application_callback() fail {
   check_recv_packet(False, False, True, True, True, True)
 }
 
-test prop_tx_recv_packet_rejects_moved_port_binding(_seed via fuzz.int()) fail {
-  fuzz.label(@"regression.contract.packet.recv.invalid_moved_port_binding")
+test regression_tx_recv_packet_rejects_moved_port_binding() fail {
   check_recv_packet(True, False, True, True, False, True)
 }
 
-test prop_tx_recv_packet_rejects_unrelated_successor_mutation(
-  _seed via fuzz.int(),
-) fail {
-  fuzz.label(
-    @"regression.contract.packet.recv.invalid_unrelated_successor_mutation",
-  )
+test regression_tx_recv_packet_rejects_unrelated_successor_mutation() fail {
   check_recv_packet(True, True, True, True, True, True)
 }
 
-test prop_tx_recv_packet_rejects_callback_packet_data_mismatch(
-  _seed via fuzz.int(),
-) fail {
-  fuzz.label(@"regression.contract.packet.recv.invalid_callback_packet_data")
+test regression_tx_recv_packet_rejects_callback_packet_data_mismatch() fail {
   check_recv_packet(True, False, False, True, True, True)
 }
 
-test prop_tx_recv_packet_rejects_callback_acknowledgement_mismatch(
-  _seed via fuzz.int(),
-) fail {
-  fuzz.label(
-    @"regression.contract.packet.recv.invalid_callback_acknowledgement",
-  )
+test regression_tx_recv_packet_rejects_callback_acknowledgement_mismatch() fail {
   check_recv_packet(True, False, True, False, True, True)
 }
 
@@ -785,6 +840,7 @@ test recv_packet_fails_when_channel_is_closed() fail {
       },
       connection_hops: [mock_data.connection_id],
       version: "mock-version",
+      upgrade_sequence: 0,
     }
 
   let input_channel_datum =
@@ -799,6 +855,7 @@ test recv_packet_fails_when_channel_is_closed() fail {
         packet_commitment: [],
         packet_receipt: [],
         packet_acknowledgement: [],
+        upgrade: initial_upgrade_state,
       },
       port_id: mock_data.port_id,
       token: mock_data.channel_token,
@@ -893,6 +950,7 @@ test recv_packet_non_mock_data_rejects_mixed_timeout() fail {
           },
           connection_hops: ["connection-0"],
           version: "ics20-1",
+          upgrade_sequence: 0,
         },
         next_sequence_send: 1,
         next_sequence_recv: 1,
@@ -900,6 +958,7 @@ test recv_packet_non_mock_data_rejects_mixed_timeout() fail {
         packet_commitment: [],
         packet_receipt: [],
         packet_acknowledgement: [],
+        upgrade: initial_upgrade_state,
       },
       port_id: "port-100",
       token: channel_token,
@@ -987,10 +1046,14 @@ test recv_packet_non_mock_data_rejects_mixed_timeout() fail {
             nft_policy: host_state_nft_policy_id,
             deployer: #"00000000000000000000000000000000000000000000000000000000",
             control: HostStateControl {
+              last_heartbeat_time: 0,
               port_registry: [
                 Pair(input_channel_datum.port_id, module_registration),
               ],
               shutdown: Active,
+              live_clients: 0,
+              live_connections: 0,
+              live_channels: 0,
             },
           },
         ),
@@ -1114,6 +1177,7 @@ test recv_packet_non_mock_data_rejects_mixed_timeout() fail {
   let mint_verifying_proof_redeemer: Redeemer =
     VerifyMembership {
       cs: ClientState {
+        upgrade_path: [],
         chain_id: #"76657373656c6f7261636c65",
         trust_level: UncheckedRational { numerator: 1, denominator: 3 },
         trusting_period: 129600000000000,
@@ -1194,8 +1258,10 @@ test recv_packet_non_mock_data_rejects_mixed_timeout() fail {
 
   let client_datum =
     ClientDatum {
+      history_root: #"0000000000000000000000000000000000000000000000000000000000000000",
       state: ClientDatumState {
         client_state: ClientState {
+          upgrade_path: [],
           chain_id: "vesseloracle",
           trust_level: UncheckedRational { numerator: 1, denominator: 3 },
           trusting_period: 129600000000000,
@@ -1512,4 +1578,48 @@ test recv_packet_non_mock_data_rejects_mixed_timeout() fail {
     recv_packet_policy_id,
     transaction,
   )
+}
+
+test recv_packet_rejects_existing_receipt() fail {
+  check_recv_packet_with_history(
+    True,
+    False,
+    True,
+    True,
+    True,
+    False,
+    "mock packet data",
+    Height { revision_number: 0, revision_height: 0 },
+    1735689600000000000,
+    True,
+  )
+}
+
+fn check_opaque_recv_proof(proof: Data, match_proof: Bool) -> Bool {
+  check_recv_packet_with_proof(
+    True,
+    False,
+    True,
+    True,
+    True,
+    False,
+    "mock packet data",
+    Height { revision_number: 0, revision_height: 0 },
+    1735689600000000000,
+    False,
+    Some(proof),
+    match_proof,
+  )
+}
+
+test recv_packet_accepts_opaque_byte_string_proof() {
+  check_opaque_recv_proof(#"010203", True)
+}
+
+test recv_packet_accepts_opaque_list_proof() {
+  check_opaque_recv_proof([1, 2, 3], True)
+}
+
+test recv_packet_rejects_mismatched_opaque_proof() fail {
+  check_opaque_recv_proof(#"010203", False)
 }

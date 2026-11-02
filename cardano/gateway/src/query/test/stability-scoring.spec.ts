@@ -25,15 +25,12 @@ describe('stability-scoring', () => {
   });
 
   it('keeps one stability threshold of local rollback headroom after an anchor is accepted', () => {
-    const shelleyGenesis = JSON.parse(
-      readFileSync(resolve(__dirname, '../../../../../chains/cardano/config/devnet/genesis-shelley.json'), 'utf8'),
-    ) as { securityParam: number };
-    const byronGenesis = JSON.parse(
-      readFileSync(resolve(__dirname, '../../../../../chains/cardano/config/devnet/genesis-byron.json'), 'utf8'),
-    ) as { protocolConsts: { k: number } };
-
-    expect(byronGenesis.protocolConsts.k).toBe(shelleyGenesis.securityParam);
-    expect(BigInt(shelleyGenesis.securityParam) >= getStabilityPolicy().threshold_depth * 2n).toBe(true);
+    const properties = readFileSync(
+      resolve(__dirname, '../../../../../chains/cardano/devkit/node.properties'), 'utf8',
+    );
+    const securityParameter = properties.match(/^securityParam=(\d+)$/m)?.[1];
+    expect(securityParameter).toBeDefined();
+    expect(BigInt(securityParameter!) >= getStabilityPolicy().threshold_depth * 2n).toBe(true);
   });
 
   it('computes qualified pool stake and score from epoch stake distribution', () => {
@@ -77,6 +74,7 @@ describe('stability-scoring', () => {
 
     const metrics = computeStabilityMetrics(descendants, epochStakeDistribution, stabilityPolicy, {
       poolRegistrationCutoffSlot,
+      poolProduction: { epoch: 1n, pools: epochStakeDistribution.map((entry) => ({ pool_id: entry.poolId, completed_epochs_bitmap: 1, produced_current_epoch: false })) },
     });
 
     expect(metrics.qualifiedUniquePoolsCount).toBe(3);
@@ -126,6 +124,7 @@ describe('stability-scoring', () => {
 
     const metrics = computeStabilityMetrics(descendants, epochStakeDistribution, stabilityPolicy, {
       poolRegistrationCutoffSlot,
+      poolProduction: { epoch: 1n, pools: epochStakeDistribution.map((entry) => ({ pool_id: entry.poolId, completed_epochs_bitmap: 1, produced_current_epoch: false })) },
     });
 
     expect(metrics.qualifiedUniquePoolsCount).toBe(2);
@@ -176,6 +175,7 @@ describe('stability-scoring', () => {
 
     const metrics = computeStabilityMetrics(descendants, epochStakeDistribution, stabilityPolicy, {
       poolRegistrationCutoffSlot,
+      poolProduction: { epoch: 1n, pools: epochStakeDistribution.map((entry) => ({ pool_id: entry.poolId, completed_epochs_bitmap: 1, produced_current_epoch: false })) },
     });
 
     expect(metrics.qualifiedUniquePoolsCount).toBe(3);
@@ -230,6 +230,7 @@ describe('stability-scoring', () => {
 
     const metrics = computeStabilityMetrics(descendants, epochStakeDistribution, stabilityPolicy, {
       poolRegistrationCutoffSlot,
+      poolProduction: { epoch: 1n, pools: epochStakeDistribution.map((entry) => ({ pool_id: entry.poolId, completed_epochs_bitmap: 1, produced_current_epoch: false })) },
     });
 
     expect(metrics.qualifiedUniquePoolsCount).toBe(1);
@@ -255,7 +256,7 @@ describe('stability-scoring', () => {
     ];
 
     expect(() =>
-      computeStabilityMetrics(descendants, epochStakeDistribution, stabilityPolicy, { poolRegistrationCutoffSlot }),
+      computeStabilityMetrics(descendants, epochStakeDistribution, stabilityPolicy, { poolRegistrationCutoffSlot, poolProduction: { epoch: 1n, pools: epochStakeDistribution.map((entry) => ({ pool_id: entry.poolId, completed_epochs_bitmap: 1, produced_current_epoch: false })) } }),
     ).toThrow('First registration slot missing');
   });
 });

@@ -1,0 +1,740 @@
+import {
+  Constr,
+  Data,
+  getAddressDetails,
+  type LucidEvolution,
+  type UTxO,
+} from "@lucid-evolution/lucid";
+import { DeploymentIbcTree } from "./deployment.ts";
+import type { DeploymentTemplate } from "./utils.ts";
+import { fromText } from "@lucid-evolution/lucid";
+import { HostStateDatum, HostStateRedeemer } from "../types/index.ts";
+
+type StateKind =
+  | "channel"
+  | "connection"
+  | "client"
+  | "transfer"
+  | "module"
+  | "trace"
+  | "metadata"
+  | "packet-lanes"
+  | "packet-liquidity"
+  | "packet-certificates"
+  | "packet-registry"
+  | "packet-config";
+type Validator = {
+  script: string;
+  scriptHash: string;
+  address: string;
+  refUtxo?: UTxO;
+};
+export type ShutdownStateGroup = {
+  kind: StateKind;
+  validator: Validator;
+  utxos: UTxO[];
+};
+const EMPTY_ROOT = "00".repeat(32);
+const encode = (data: Data) =>
+  Data.to(data as never, undefined as never, { canonical: true });
+const record = (...fields: Data[]) => new Constr(0, fields);
+
+export function datumFields(data: Data, length: number): Data[] {
+  if (
+    !(data instanceof Constr) || data.index !== 0 ||
+    data.fields.length !== length
+  ) {
+    throw new Error(
+      "Unexpected state datum, cleanup requires the deployed datum format",
+    );
+  }
+  return data.fields;
+}
+
+export function escrowDatum(utxo: UTxO) {
+  if (!utxo.datum) throw new Error("Escrow shard has no datum");
+  const [channelId, denom, amount] = datumFields(Data.from(utxo.datum), 3);
+  if (
+    typeof channelId !== "string" || typeof denom !== "string" ||
+    typeof amount !== "bigint" || amount < 0n
+  ) {
+    throw new Error("Escrow shard has no valid deposit balance");
+  }
+  return { channelId, denom, amount };
+}
+
+export async function scanDeploymentState(
+  lucid: Pick<LucidEvolution, "utxosAt">,
+  deployment: DeploymentTemplate,
+): Promise<ShutdownStateGroup[]> {
+  // Session NFTs represent independently owned verification work, not bridge
+  // state. Anyone can mint them, so they must not veto deployment shutdown.
+  // Their owners can still cancel them using inline scripts after shutdown.
+  const definitions = [
+    ["channel", deployment.validators.spendChannel],
+    ["connection", deployment.validators.spendConnection],
+    ["client", deployment.validators.spendClient],
+    ["transfer", deployment.validators.spendTransferModule],
+    ["module", deployment.validators.spendMockModule],
+    ["trace", deployment.validators.spendTraceRegistry],
+    ["metadata", deployment.validators.voucherMetadata],
+    ["packet-registry", deployment.packetState?.state],
+    ["packet-lanes", deployment.packetState?.guard],
+    ["packet-liquidity", deployment.packetState?.batch],
+    ["packet-config", deployment.packetState?.configuration],
+  ] as const;
+  const seen = new Set<string>();
+  const groups: Array<{ kind: StateKind; validator: Validator }> = [];
+  for (const [kind, validator] of definitions) {
+    if (!validator?.address || seen.has(validator.address)) continue;
+    if (
+      !("script" in validator) || !validator.script ||
+      !("scriptHash" in validator)
+    ) {
+      throw new Error(
+        `Deployment does not include the ${kind} cleanup validator, deploy the updated contracts first`,
+      );
+    }
+    seen.add(validator.address);
+    groups.push({ kind, validator: validator as Validator });
+  }
+  for (const module of Object.values(deployment.modules ?? {})) {
+    if (!seen.has(module.address)) {
+      throw new Error(
+        `No cleanup validator for module address ${module.address}`,
+      );
+    }
+  }
+  const scanned = await Promise.all(groups.map(async (group) => ({
+    ...group,
+    utxos: await lucid.utxosAt(group.validator.address),
+  })));
+  return scanned.flatMap((group): ShutdownStateGroup[] => {
+    if (group.kind !== "packet-registry") return [group];
+    const unit = deployment.packetState.state.scriptHash +
+      fromText("ibc_packet_registry");
+    return [
+      { ...group, utxos: group.utxos.filter((u) => u.assets[unit] === 1n) },
+      {
+        ...group,
+        kind: "packet-certificates",
+        utxos: group.utxos.filter((u) => u.assets[unit] !== 1n),
+      },
+    ];
+  });
+}
+
+export function assertStateDrained(
+  groups: ShutdownStateGroup[],
+  deployment: DeploymentTemplate,
+) {
+  const shardPolicy = deployment.validators.mintTransferEscrowShard?.scriptHash;
+  for (const group of groups) {
+    for (const utxo of group.utxos) {
+      if (group.kind === "packet-lanes") {
+        if (!utxo.datum) throw new Error("Packet state has no datum");
+        const datum = Data.from(utxo.datum) as Constr<Data>;
+        if (datum.fields.length === 5) {
+          throw new Error("Cancel funded user intents before cleanup");
+        }
+        if (
+          datum.fields.length === 12 &&
+          (datum.fields[6] as Map<Data, Data>).size !== 0
+        ) throw new Error("Packet lane still has unsettled packets");
+      }
+      if (group.kind === "packet-liquidity") {
+        if (!utxo.datum || datumFields(Data.from(utxo.datum), 8)[6] !== 0n) {
+          throw new Error("Packet liquidity still holds user deposits");
+        }
+      }
+      if (group.kind === "channel") {
+        if (!utxo.datum) throw new Error("Channel has no datum");
+        const [state] = datumFields(Data.from(utxo.datum), 3);
+        // ChannelDatumState ends with the channel's upgrade state.
+        const commitments = datumFields(state, 10)[4];
+        if (!(commitments instanceof Map) || commitments.size !== 0) {
+          throw new Error(
+            `Channel ${utxo.txHash}#${utxo.outputIndex} still has unsettled packets`,
+          );
+        }
+      }
+      if (
+        group.kind === "transfer" && shardPolicy &&
+        Object.keys(utxo.assets).some((unit) => unit.startsWith(shardPolicy))
+      ) {
+        if (escrowDatum(utxo).amount !== 0n) {
+          throw new Error(
+            `Escrow ${utxo.txHash}#${utxo.outputIndex} still holds user deposits, withdraw or refund them before cleanup`,
+          );
+        }
+      }
+    }
+  }
+}
+
+export function assertNoDeploymentState(groups: ShutdownStateGroup[]) {
+  const remaining = groups.flatMap((group) =>
+    group.utxos.map((utxo) =>
+      `${group.kind} ${utxo.txHash}#${utxo.outputIndex}`
+    )
+  );
+  if (remaining.length !== 0) {
+    throw new Error(
+      `Reclaim deployment state before removing its scripts or finalizing shutdown: ${
+        remaining.join(", ")
+      }`,
+    );
+  }
+}
+
+function addAssets(
+  total: Record<string, bigint>,
+  assets: Record<string, bigint>,
+  sign = 1n,
+) {
+  for (const [unit, quantity] of Object.entries(assets)) {
+    total[unit] = (total[unit] ?? 0n) + sign * quantity;
+    if (total[unit] === 0n) delete total[unit];
+  }
+}
+
+function decodeHost(hostUtxo: UTxO, walletAddress: string, validFrom: number) {
+  if (!hostUtxo.datum) throw new Error("HostState has no datum");
+  const datum = Data.from(hostUtxo.datum, HostStateDatum);
+  const signer = getAddressDetails(walletAddress).paymentCredential;
+  if (signer?.type !== "Key" || signer.hash !== datum.deployer) {
+    throw new Error("Only the recorded deployer can reclaim deployment state");
+  }
+  if (
+    datum.control.shutdown === "Active" ||
+    BigInt(validFrom) < datum.control.shutdown.ShuttingDown.grace_period_end
+  ) {
+    throw new Error(
+      "Deployment cleanup requires the shutdown grace period to have elapsed",
+    );
+  }
+  return datum;
+}
+
+function stateBurns(
+  group: ShutdownStateGroup,
+  deployment: DeploymentTemplate,
+  host: ReturnType<typeof decodeHost>,
+) {
+  const policies: Partial<Record<StateKind, string>> = {
+    channel: deployment.validators.mintChannelStt.scriptHash,
+    connection: deployment.validators.mintConnectionStt.scriptHash,
+    client: deployment.validators.mintClientStt.scriptHash,
+    trace: deployment.validators.mintIdentifier.scriptHash,
+    metadata: deployment.validators.mintVoucher.scriptHash,
+    "packet-registry": deployment.packetState?.state.scriptHash,
+    "packet-certificates": deployment.packetState?.state.scriptHash,
+    "packet-config": deployment.packetState?.configToken.policyId,
+  };
+  const registeredTokens = new Set(
+    [...host.control.port_registry.values()].flatMap((registration) => [
+      registration.port_token.policy_id + registration.port_token.name,
+      registration.module_token.policy_id + registration.module_token.name,
+    ]),
+  );
+  const burns: Record<string, bigint> = {};
+  for (const utxo of group.utxos) {
+    for (const [unit, quantity] of Object.entries(utxo.assets)) {
+      if (
+        unit !== "lovelace" &&
+        (policies[group.kind]
+          ? unit.startsWith(policies[group.kind]!)
+          : registeredTokens.has(unit))
+      ) {
+        burns[unit] = (burns[unit] ?? 0n) - quantity;
+      }
+    }
+  }
+  return burns;
+}
+
+function applyBurns(
+  tx: ReturnType<LucidEvolution["newTx"]>,
+  burns: Record<string, bigint>,
+  deployment: DeploymentTemplate,
+  redeemers: Record<string, string> = {},
+) {
+  const byPolicy = new Map<string, Record<string, bigint>>();
+  for (const [unit, amount] of Object.entries(burns)) {
+    const policy = unit.slice(0, 56);
+    const assets = byPolicy.get(policy) ?? {};
+    assets[unit] = amount;
+    byPolicy.set(policy, assets);
+  }
+  for (const [policy, assets] of byPolicy) {
+    const validator = [
+      ...Object.values(deployment.validators),
+      deployment.packetState?.state,
+      deployment.packetState?.configuration,
+    ].filter(Boolean).find((candidate) =>
+      "scriptHash" in candidate && candidate.scriptHash === policy
+    ) as Validator | undefined;
+    if (!validator) {
+      throw new Error(`Missing minting reference for ${policy}`);
+    }
+    if (validator.refUtxo) tx.readFrom([validator.refUtxo]);
+    else {tx.attach.MintingPolicy({
+        type: "PlutusV3",
+        script: validator.script,
+      });}
+    tx.mintAssets(
+      assets,
+      redeemers[policy] ??
+        (policy === deployment.validators.mintVoucher.scriptHash
+          ? encode(new Constr(3, []))
+          : Data.void()),
+    );
+  }
+}
+
+function transferWithdrawal(
+  host: HostStateDatum,
+  deployment: DeploymentTemplate,
+): string {
+  const registration = host.control.port_registry.get(fromText("transfer"));
+  if (!registration) throw new Error("Missing transfer module registration");
+  return encode(
+    new Constr(3, [
+      registration.port_token.policy_id + registration.port_token.name,
+      registration.module_token.policy_id + registration.module_token.name,
+      deployment.validators.mintTransferEscrowShard.scriptHash,
+    ]),
+  );
+}
+
+export function buildReclaimStateTx(
+  lucid: LucidEvolution,
+  deployment: DeploymentTemplate,
+  hostUtxo: UTxO,
+  group: ShutdownStateGroup,
+  walletAddress: string,
+  validFrom: number,
+  transferRoot?: UTxO,
+  packetReferences: UTxO[] = [],
+) {
+  if (group.kind === "packet-lanes" || group.kind === "packet-liquidity") {
+    throw new Error(
+      "Retire packet lanes through their channel and return liquidity reserves through the packet retirement builder",
+    );
+  }
+  if (deployment.migration) {
+    throw new Error(
+      "This upgrade-capable deployment retains authenticated inventory; use migration, not state reclamation",
+    );
+  }
+  if (
+    group.utxos.length === 0 ||
+    group.utxos.some((utxo) => utxo.address !== group.validator.address)
+  ) {
+    throw new Error("Cleanup must consume state from one validator address");
+  }
+  const retire = {
+    client: [0n, "live_clients"],
+    connection: [1n, "live_connections"],
+    channel: [2n, "live_channels"],
+  } as const;
+  const retirement = group.kind in retire
+    ? retire[group.kind as keyof typeof retire]
+    : undefined;
+  if (retirement && group.utxos.length !== 1) {
+    throw new Error("Reclaim clients, connections, and channels one at a time");
+  }
+  const host = decodeHost(hostUtxo, walletAddress, validFrom);
+  assertStateDrained([group], deployment);
+  if (group.kind === "transfer") {
+    for (const utxo of group.utxos) {
+      if (
+        !utxo.datum ||
+        datumFields(Data.from(utxo.datum), 2)[0] !== EMPTY_ROOT ||
+        datumFields(Data.from(utxo.datum), 2)[1] !== 0n
+      ) {
+        throw new Error(
+          "Reclaim empty escrow shards before the transfer module root",
+        );
+      }
+    }
+  }
+  const burns = stateBurns(group, deployment, host);
+  const assets: Record<string, bigint> = {};
+  for (const utxo of group.utxos) addAssets(assets, utxo.assets);
+  addAssets(assets, burns);
+  const clientTitle = deployment.validators.spendClient.title;
+  if (
+    group.kind === "client" && ![
+      "spending_client.spend_client.spend",
+      "spending_multitx_client.spend_multitx_client.spend",
+    ].includes(clientTitle)
+  ) {
+    throw new Error(`Unknown client validator for shutdown: ${clientTitle}`);
+  }
+  const requiresDrainedTransfer = group.kind === "channel" ||
+    group.kind === "client" || group.kind === "connection" ||
+    group.kind === "trace" || group.kind === "metadata";
+  if (
+    requiresDrainedTransfer &&
+    transferRoot?.assets[deployment.modules.transfer.identifier] !== 1n
+  ) {
+    throw new Error(
+      "Dependency cleanup requires the retained transfer module root",
+    );
+  }
+  const index: Record<StateKind, number> = {
+    channel: 10,
+    connection: 2,
+    client: clientTitle === "spending_multitx_client.spend_multitx_client.spend"
+      ? 4
+      : 2,
+    transfer: 2,
+    module: 2,
+    trace: 3,
+    metadata: 0,
+    "packet-config": 0,
+    "packet-registry": 0,
+    "packet-certificates": 0,
+    "packet-lanes": 4,
+    "packet-liquidity": 0,
+  };
+  const tx = lucid.newTx();
+  if (packetReferences.length) tx.readFrom(packetReferences);
+  if (retirement) {
+    const [kind, countField] = retirement;
+    const policy = kind === 0n
+      ? deployment.validators.mintClientStt.scriptHash
+      : kind === 1n
+      ? deployment.validators.mintConnectionStt.scriptHash
+      : deployment.validators.mintChannelStt.scriptHash;
+    const retiredUnits = Object.entries(burns).filter(([unit, amount]) =>
+      unit.startsWith(policy) && amount === -1n
+    );
+    if (retiredUnits.length !== 1) {
+      throw new Error(`Reclaim exactly one ${group.kind} state token`);
+    }
+    if (host.control[countField] <= 0n) {
+      throw new Error(`No live ${group.kind} remains in HostState`);
+    }
+    const retiredHost: HostStateDatum = {
+      ...host,
+      state: { ...host.state, version: host.state.version + 1n },
+      control: {
+        ...host.control,
+        [countField]: host.control[countField] - 1n,
+      },
+    };
+    tx.readFrom([deployment.validators.hostStateStt.refUtxo])
+      .collectFrom(
+        [hostUtxo],
+        Data.to(
+          {
+            RetireState: { kind, token_name: retiredUnits[0][0].slice(56) },
+          },
+          HostStateRedeemer,
+          {
+            canonical: true,
+          },
+        ),
+      )
+      .pay.ToContract(hostUtxo.address, {
+        kind: "inline",
+        value: Data.to(retiredHost, HostStateDatum, { canonical: true }),
+      }, hostUtxo.assets);
+  } else if (group.kind === "transfer") {
+    const portRegistry = new Map(host.control.port_registry);
+    if (!portRegistry.delete(fromText("transfer"))) {
+      throw new Error("Missing transfer module registration");
+    }
+    const authorizedHost: HostStateDatum = {
+      ...host,
+      state: { ...host.state, version: host.state.version + 1n },
+      control: { ...host.control, port_registry: portRegistry },
+    };
+    tx.readFrom([deployment.validators.hostStateStt.refUtxo])
+      .collectFrom(
+        [hostUtxo],
+        Data.to("AuthorizeFinalization", HostStateRedeemer, {
+          canonical: true,
+        }),
+      )
+      .pay.ToContract(hostUtxo.address, {
+        kind: "inline",
+        value: Data.to(authorizedHost, HostStateDatum, { canonical: true }),
+      }, hostUtxo.assets);
+  } else {
+    tx.readFrom([hostUtxo]);
+  }
+  if (requiresDrainedTransfer) {
+    tx.readFrom([transferRoot!]);
+  }
+  if (group.validator.refUtxo) tx.readFrom([group.validator.refUtxo]);
+  else {tx.attach.SpendingValidator({
+      type: "PlutusV3",
+      script: group.validator.script,
+    });}
+  tx.collectFrom(group.utxos, encode(new Constr(index[group.kind], [])));
+  if (
+    group.kind === "packet-registry" || group.kind === "packet-certificates"
+  ) {
+    if (
+      !transferRoot ||
+      transferRoot
+          .assets[
+            deployment.packetState.configToken.policyId +
+            deployment.packetState.configToken.name
+          ] !== 1n
+    ) {
+      throw new Error(
+        "Packet registry cleanup requires its configuration reference",
+      );
+    }
+    tx.readFrom([transferRoot]);
+  }
+  applyBurns(
+    tx,
+    burns,
+    deployment,
+    ["packet-registry", "packet-certificates"].includes(group.kind)
+      ? {
+        [deployment.packetState.state.scriptHash]: encode(
+          new Constr(group.kind === "packet-registry" ? 2 : 4, []),
+        ),
+      }
+      : {},
+  );
+  if (group.kind === "channel" || group.kind === "transfer") {
+    const recovery = deployment.validators.recoverClient;
+    if (!recovery) throw new Error("Missing shutdown withdrawal validator");
+    tx.readFrom([recovery.refUtxo]).withdraw(
+      recovery.address,
+      0n,
+      group.kind === "channel"
+        ? encode(new Constr(2, []))
+        : transferWithdrawal(host, deployment),
+    );
+  }
+  return tx.pay.ToAddress(walletAddress, assets).addSignerKey(host.deployer)
+    .validFrom(validFrom).validTo(validFrom + 10 * 60 * 1000);
+}
+
+export async function buildReclaimEscrowTx(
+  lucid: LucidEvolution,
+  deployment: DeploymentTemplate,
+  hostUtxo: UTxO,
+  group: ShutdownStateGroup,
+  shard: UTxO,
+  walletAddress: string,
+  validFrom: number,
+) {
+  if (deployment.migration) {
+    throw new Error(
+      "Escrow retirement is disabled for this migration compatibility profile",
+    );
+  }
+  const host = decodeHost(hostUtxo, walletAddress, validFrom);
+  assertStateDrained([group], deployment);
+  const rootUnit = deployment.modules.transfer.identifier;
+  const roots = group.utxos.filter((utxo) => utxo.assets[rootUnit] === 1n);
+  if (roots.length !== 1) throw new Error("Expected one transfer module root");
+  const root = roots[0];
+  const shardPolicy = deployment.validators.mintTransferEscrowShard.scriptHash;
+  const tree = new DeploymentIbcTree();
+  const shardUnit = Object.keys(shard.assets).find((unit) =>
+    unit.startsWith(shardPolicy)
+  );
+  if (!shardUnit || shard.assets[shardUnit] !== 1n) {
+    throw new Error("Malformed escrow shard token");
+  }
+  for (const utxo of group.utxos) {
+    const units = Object.keys(utxo.assets).filter((unit) =>
+      unit.startsWith(shardPolicy)
+    );
+    if (units.length > 1) throw new Error("Malformed escrow shard holder");
+    if (units.length === 1) {
+      tree.set(`escrowShards/${units[0].slice(56)}`, "01");
+    }
+  }
+  const rootFields = root.datum
+    ? datumFields(Data.from(root.datum), 2)
+    : undefined;
+  if (!rootFields || rootFields[0] !== await tree.getRoot()) {
+    throw new Error(
+      "Escrow shard inventory does not match the transfer module registry",
+    );
+  }
+  const key = `escrowShards/${shardUnit.slice(56)}`;
+  const siblings = await tree.getSiblings(key);
+  tree.set(key, "");
+  const { channelId, denom } = escrowDatum(shard);
+  const redeemer = encode(new Constr(2, []));
+  const mintRedeemer = encode(new Constr(1, [channelId, denom, siblings]));
+  const burns = { [shardUnit]: -1n };
+  const refund = { ...shard.assets };
+  addAssets(refund, burns);
+  if (!group.validator.refUtxo) {
+    throw new Error("Missing transfer module reference");
+  }
+  const tx = lucid.newTx().readFrom([hostUtxo, group.validator.refUtxo])
+    .collectFrom([root, shard], redeemer)
+    .pay.ToContract(root.address, {
+      kind: "inline",
+      value: encode(record(await tree.getRoot(), rootFields[1])),
+    }, root.assets);
+  applyBurns(tx, burns, deployment, { [shardPolicy]: mintRedeemer });
+  const recovery = deployment.validators.recoverClient;
+  if (!recovery) throw new Error("Missing shutdown withdrawal validator");
+  tx.readFrom([recovery.refUtxo]).withdraw(
+    recovery.address,
+    0n,
+    transferWithdrawal(host, deployment),
+  );
+  return tx.pay.ToAddress(walletAddress, refund).addSignerKey(host.deployer)
+    .validFrom(validFrom).validTo(validFrom + 10 * 60 * 1000);
+}
+
+export async function packetShutdownReferences(
+  lucid: LucidEvolution,
+  deployment: DeploymentTemplate,
+  group: ShutdownStateGroup,
+): Promise<UTxO[]> {
+  if (group.kind !== "channel") return [];
+  const packet = deployment.packetState;
+  const configuration = await lucid.utxoByUnit(
+    packet.configToken.policyId + packet.configToken.name,
+  );
+  const registry = await lucid.utxoByUnit(
+    packet.state.scriptHash + fromText("ibc_packet_registry"),
+  );
+  const references = [configuration, registry];
+  for (const channel of group.utxos) {
+    const datum = Data.from(channel.datum!) as Constr<Data>;
+    if (datum.fields[1] !== fromText("transfer")) continue;
+    const token = datum.fields[2] as Constr<Data>;
+    const { blake2b } = await import("@noble/hashes/blake2b");
+    const { fromHex, toHex } = await import("@lucid-evolution/lucid");
+    const name = toHex(
+      blake2b(fromHex(fromText("ibc/retired-lanes/") + token.fields[1]), {
+        dkLen: 32,
+      }),
+    );
+    const certificates = await lucid.utxosAt(packet.state.address);
+    const certificate = certificates.find((u) =>
+      u.assets[packet.state.scriptHash + name] === 1n
+    );
+    if (certificate) references.push(certificate);
+  }
+  return references;
+}
+
+export async function buildRetirePacketLanesTx(
+  lucid: LucidEvolution,
+  deployment: DeploymentTemplate,
+  host: UTxO,
+  channel: UTxO,
+  walletAddress: string,
+  validFrom: number,
+) {
+  const control = decodeHost(host, walletAddress, validFrom);
+  const packet = deployment.packetState;
+  const datum = Data.from(channel.datum!) as Constr<Data>;
+  const token = datum.fields[2] as Constr<Data>;
+  const { packetLaneTokenName, sendSequencerTokenName } = await import(
+    "@cardano-ibc/tx-builder/dist/packet-lanes"
+  );
+  const { fromHex, toHex, toText } = await import("@lucid-evolution/lucid");
+  const { blake2b } = await import("@noble/hashes/blake2b");
+  const port = toText(String(datum.fields[1]));
+  const channelId = `channel-${toText(String(token.fields[1]).slice(48))}`;
+  const available = await lucid.utxosAt(packet.guard.address);
+  const sequence = available.find((u) =>
+    u.assets[
+      packet.state.scriptHash + sendSequencerTokenName(port, channelId)
+    ] === 1n
+  );
+  const name = toHex(
+    blake2b(fromHex(fromText("ibc/retired-lanes/") + token.fields[1]), {
+      dkLen: 32,
+    }),
+  );
+  const certificate = (await lucid.utxosAt(packet.state.address)).find((u) =>
+    u.assets[packet.state.scriptHash + name] === 1n
+  );
+  const start = certificate
+    ? Number((Data.from(certificate.datum!) as Constr<Data>).fields[0])
+    : 0;
+  if (start === packet.laneCount || (!sequence && !certificate)) return null;
+  const end = Math.min(start + 1, packet.laneCount);
+  const references: UTxO[] = [];
+  const lanes: UTxO[] = [];
+  const balances = new Map<string, bigint>();
+  const burns: Record<string, bigint> = {};
+  for (
+    let lane = start;
+    lane < (certificate ? end : packet.laneCount);
+    lane++
+  ) {
+    const unit = packet.state.scriptHash +
+      packetLaneTokenName(port, channelId, lane, packet.laneCount);
+    const input = available.find((u) => u.assets[unit] === 1n);
+    if (!input) throw new Error(`Missing packet lane ${lane}`);
+    const state = Data.from(input.datum!) as Constr<Data>;
+    if ((state.fields[6] as Map<Data, Data>).size) {
+      throw new Error(
+        "Channel still has unsettled packets",
+      );
+    }
+    for (
+      const [denom, amount] of state.fields[11] as Map<string, bigint>
+    ) balances.set(denom, (balances.get(denom) ?? 0n) + amount);
+    if (lane < end) {
+      lanes.push(input);
+      burns[unit] = -1n;
+    } else references.push(input);
+  }
+  if (!certificate && [...balances.values()].some((value) => value !== 0n)) {
+    throw new Error(
+      "Channel still holds user deposits or outstanding vouchers",
+    );
+  }
+  if (!certificate) {
+    if (!sequence) throw new Error("Missing send sequencer");
+    burns[packet.state.scriptHash + sendSequencerTokenName(port, channelId)] =
+      -1n;
+    burns[packet.state.scriptHash + name] = 1n;
+  }
+  const inputs = certificate ? lanes : [...lanes, sequence!];
+  const refund = inputs.reduce((sum, u) => sum + u.assets.lovelace, 0n) -
+    (certificate ? 0n : 2_000_000n);
+  const configuration = await lucid.utxoByUnit(
+    packet.configToken.policyId + packet.configToken.name,
+  );
+  const tx = lucid.newTx().readFrom([
+    host,
+    channel,
+    configuration,
+    ...references,
+    packet.state.refUtxo,
+    packet.guard.refUtxo,
+    packet.batch.refUtxo,
+    packet.operations.retire.refUtxo,
+  ])
+    .collectFrom(inputs, encode(new Constr(4, [])))
+    .mintAssets(burns, encode(new Constr(3, [token])))
+    .mintAssets(
+      { [packet.batch.scriptHash + fromText("retire_channel")]: 1n },
+      encode(record(token, new Constr(8, []), new Constr(1, []))),
+    )
+    .mintAssets({ [packet.operations.retire.scriptHash]: 1n }, Data.void())
+    .pay.ToContract(packet.state.address, {
+      kind: "inline",
+      value: encode(record(BigInt(end))),
+    }, { lovelace: 2_000_000n, [packet.state.scriptHash + name]: 1n })
+    .pay.ToAddress(walletAddress, { lovelace: refund })
+    .addSignerKey(control.deployer).validFrom(validFrom).validTo(
+      validFrom + 60_000,
+    );
+  if (certificate) tx.collectFrom([certificate], Data.void());
+  return tx;
+}

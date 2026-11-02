@@ -55,9 +55,24 @@ pub struct HermesTrustThreshold {
     pub denominator: &'static str,
 }
 
+pub fn hermes_directory() -> Option<PathBuf> {
+    std::env::var_os("CARIBIC_HERMES_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|home| home.join(".hermes")))
+}
+
+pub fn isolated_key_store() -> Option<String> {
+    std::env::var_os("CARIBIC_HERMES_DIR").filter(|value| !value.is_empty())?;
+    let directory = hermes_directory()?.join("keys");
+    Some(format!(
+        "key_store_folder = {}",
+        serde_json::to_string(&directory.to_string_lossy()).ok()?
+    ))
+}
+
 pub fn hermes_config_path() -> Option<PathBuf> {
-    let home_path = home_dir()?;
-    let path = home_path.join(".hermes/config.toml");
+    let path = hermes_directory()?.join("config.toml");
     if path.exists() {
         Some(path)
     } else {
@@ -122,8 +137,7 @@ pub fn ensure_cosmos_chain_in_hermes_config(
     profile: &HermesCosmosChainProfile,
     inserted_block_comment: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let home_path = home_dir().ok_or("Could not determine home directory")?;
-    let hermes_dir = home_path.join(".hermes");
+    let hermes_dir = hermes_directory().ok_or("Could not determine Hermes directory")?;
     if !hermes_dir.exists() {
         fs::create_dir_all(&hermes_dir)?;
     }
@@ -209,6 +223,9 @@ pub fn ensure_cosmos_chain_in_hermes_config(
 fn render_cosmos_chain_block(profile: &HermesCosmosChainProfile) -> String {
     let mut lines = Vec::new();
     lines.push("[[chains]]".to_string());
+    if let Some(setting) = isolated_key_store() {
+        lines.push(setting);
+    }
     lines.push(format!("id = '{}'", profile.id));
     lines.push("type = 'CosmosSdk'".to_string());
     lines.push(format!("rpc_addr = '{}'", profile.rpc_addr));
@@ -322,7 +339,7 @@ fn find_chain_block_bounds(lines: &[&str], target_chain_id: &str) -> Option<(usi
     None
 }
 
-fn extract_chain_block(config: &str, target_chain_id: &str) -> Option<String> {
+pub(crate) fn extract_chain_block(config: &str, target_chain_id: &str) -> Option<String> {
     let lines: Vec<&str> = config.lines().collect();
     let (block_start, block_end) = find_chain_block_bounds(&lines, target_chain_id)?;
     Some(lines[block_start..block_end].join("\n"))

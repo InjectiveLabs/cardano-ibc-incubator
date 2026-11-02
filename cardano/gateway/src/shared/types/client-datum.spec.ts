@@ -8,8 +8,10 @@ describe('client datum codec', () => {
     const newHeight = { revisionNumber: 777n, revisionHeight: 385n };
     const oldHeight = { revisionNumber: 777n, revisionHeight: 154n };
     const datum: ClientDatum = {
+      history_root: '00'.repeat(32),
       state: {
         clientState: {
+          upgradePath: [],
           chainId: Buffer.from('injective-777').toString('hex'),
           trustLevel: { numerator: 1n, denominator: 3n },
           trustingPeriod: 864000000000000n,

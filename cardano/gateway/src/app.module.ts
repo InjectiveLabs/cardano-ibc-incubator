@@ -2,7 +2,6 @@ import { Logger, Module } from '@nestjs/common';
 import * as fs from 'fs';
 import { TxModule } from './tx/tx.module';
 import { QueryModule } from './query/query.module';
-import { HistoryDatabaseConfig } from './config/history-database.config';
 import { GatewayDatabaseConfig } from './config/gateway-database.config';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { ConfigModule } from '@nestjs/config';
@@ -10,7 +9,6 @@ import configuration from './config';
 import { LucidModule } from './shared/modules/lucid/lucid.module';
 import { KupoModule } from './shared/modules/kupo/kupo.module';
 import { ApiModule } from './api/api.module';
-import { MithrilModule } from './shared/modules/mithril/mithril.module';
 import { TreeInitService } from './shared/services/tree-init.service';
 import { IbcTreeModule } from './shared/modules/ibc-tree/ibc-tree.module';
 import { HealthModule } from './health/health.module';
@@ -25,7 +23,6 @@ const bridgeConfigFileReader = {
 
 @Module({
   imports: [
-    TypeOrmModule.forRoot(HistoryDatabaseConfig),
     TypeOrmModule.forRoot(GatewayDatabaseConfig),
     ConfigModule.forRoot({
       load: [
@@ -41,7 +38,6 @@ const bridgeConfigFileReader = {
     LucidModule,
     KupoModule,
     ApiModule,
-    MithrilModule,
   ],
   providers: [Logger, TreeInitService],
 })

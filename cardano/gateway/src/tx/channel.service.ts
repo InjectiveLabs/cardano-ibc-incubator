@@ -24,13 +24,12 @@ import { ConnectionDatum } from 'src/shared/types/connection/connection-datum';
 import { MintChannelRedeemer, SpendChannelRedeemer } from 'src/shared/types/channel/channel-redeemer';
 import { ConfigService } from '@nestjs/config';
 import { AuthToken } from 'src/shared/types/auth-token';
-import { ChannelDatum, encodeChannelEndValue } from 'src/shared/types/channel/channel-datum';
+import { ChannelDatum, encodeChannelEndValue, initialChannelUpgradeState } from 'src/shared/types/channel/channel-datum';
 import { ChannelState } from 'src/shared/types/channel/state';
 import { CHANNEL_ID_PREFIX } from 'src/constant';
 import { IBCModuleRedeemer } from '@shared/types/port/ibc_module_redeemer';
 import { convertHex2String, convertString2Hex, toHex } from '@shared/helpers/hex';
 import { sumLovelaceFromUtxos } from './helper/helper';
-import { ClientDatum } from '@shared/types/client-datum';
 import { isValidProofHeight } from './helper/height.validate';
 import {
   validateAndFormatChannelCloseConfirmParams,
@@ -189,11 +188,16 @@ export class ChannelService {
   /**
    * Ensure the in-memory Merkle tree is aligned with on-chain state
    */
-  private async ensureTreeAligned(onChainRoot: string, hostStateUtxo: Pick<UTxO, 'txHash' | 'outputIndex'>): Promise<void> {
+  private async ensureTreeAligned(
+    onChainRoot: string,
+    hostStateUtxo: Pick<UTxO, 'txHash' | 'outputIndex'>,
+  ): Promise<void> {
     const snapshot = await this.ibcTreeStore.getAlignedSnapshot();
-    if (snapshot.root !== onChainRoot ||
+    if (
+      snapshot.root !== onChainRoot ||
       snapshot.hostState.txHash !== hostStateUtxo.txHash ||
-      snapshot.hostState.outputIndex !== hostStateUtxo.outputIndex) {
+      snapshot.hostState.outputIndex !== hostStateUtxo.outputIndex
+    ) {
       throw new StaleIbcTreeStateError('HostState changed while preparing the transaction, retry with current inputs');
     }
   }
@@ -571,6 +575,7 @@ export class ChannelService {
           ordering: channelOpenInitOperator.ordering,
           connection_hops: [convertString2Hex(channelOpenInitOperator.connectionId)],
           version: convertString2Hex(channelOpenInitOperator.version),
+          upgrade_sequence: 0n,
         },
         next_sequence_send: 1n,
         next_sequence_recv: 1n,
@@ -580,6 +585,7 @@ export class ChannelService {
         packet_commitment: new Map(),
         packet_receipt: new Map(),
         packet_acknowledgement: new Map(),
+        upgrade: initialChannelUpgradeState(),
       },
       port: convertString2Hex(channelOpenInitOperator.port_id),
       token: channelToken,
@@ -607,6 +613,10 @@ export class ChannelService {
         next_channel_sequence: hostStateDatum.state.next_channel_sequence + 1n,
         ibc_state_root: newRoot,
         last_update_time: BigInt(Date.now()),
+      },
+      control: {
+        ...hostStateDatum.control,
+        live_channels: hostStateDatum.control.live_channels + 1n,
       },
     };
 
@@ -636,10 +646,7 @@ export class ChannelService {
         },
       ],
     };
-    const encodedSpendModuleRedeemer: string = await this.lucidService.encode(
-      spendModuleRedeemer,
-      'iBCModuleRedeemer',
-    );
+    const encodedSpendModuleRedeemer: string = await this.lucidService.encode(spendModuleRedeemer, 'iBCModuleRedeemer');
     const unsignedChannelOpenInitParams: UnsignedChannelOpenInitDto = {
       hostStateUtxo,
       encodedHostStateRedeemer,
@@ -655,7 +662,7 @@ export class ChannelService {
       constructedAddress,
     };
     const unsignedUnorderedChannelTx =
-      this.lucidService.createUnsignedChannelOpenInitTransaction(unsignedChannelOpenInitParams);
+      await this.lucidService.createUnsignedChannelOpenInitTransaction(unsignedChannelOpenInitParams);
     return {
       unsignedTx: unsignedUnorderedChannelTx,
       channelId,
@@ -694,7 +701,9 @@ export class ChannelService {
     // Get the token unit associated with the client
     const clientTokenUnit = this.lucidService.getClientTokenUnit(connectionClientSequence);
     const clientUtxo = await this.lucidService.findUtxoByUnit(clientTokenUnit);
-    const clientDatum = await this.lucidService.decodeDatum<ClientDatum>(clientUtxo.datum!, 'client');
+    const { clientDatum, historyWitnesses } = await this.lucidService.resolveClientAtHeights(clientUtxo, [
+      channelOpenTryOperator.proofHeight,
+    ]);
     const heightsArray = Array.from(clientDatum.state.consensusStates.keys());
     if (!isValidProofHeight(heightsArray, channelOpenTryOperator.proofHeight)) {
       throw new GrpcInternalException(
@@ -711,14 +720,8 @@ export class ChannelService {
         `Missing consensus state at proof height ${channelOpenTryOperator.proofHeight.revisionNumber}/${channelOpenTryOperator.proofHeight.revisionHeight}`,
       );
     }
-    const processedTime = getHeightMapValue(
-      clientDatum.state.processedTimes,
-      channelOpenTryOperator.proofHeight,
-    );
-    const processedHeight = getHeightMapValue(
-      clientDatum.state.processedHeights,
-      channelOpenTryOperator.proofHeight,
-    );
+    const processedTime = getHeightMapValue(clientDatum.state.processedTimes, channelOpenTryOperator.proofHeight);
+    const processedHeight = getHeightMapValue(clientDatum.state.processedHeights, channelOpenTryOperator.proofHeight);
     if (processedTime == null || processedHeight == null) {
       throw new GrpcInternalException(
         `Missing processed delay metadata at proof height ${channelOpenTryOperator.proofHeight.revisionNumber}/${channelOpenTryOperator.proofHeight.revisionHeight}`,
@@ -755,6 +758,7 @@ export class ChannelService {
           ordering: channelOpenTryOperator.ordering,
           connection_hops: [convertString2Hex(channelOpenTryOperator.connectionId)],
           version: convertString2Hex(channelOpenTryOperator.version),
+          upgrade_sequence: 0n,
         },
         next_sequence_send: 1n,
         next_sequence_recv: 1n,
@@ -764,6 +768,7 @@ export class ChannelService {
         packet_commitment: new Map(),
         packet_receipt: new Map(),
         packet_acknowledgement: new Map(),
+        upgrade: initialChannelUpgradeState(),
       },
       port: convertString2Hex(channelOpenTryOperator.port_id),
       token: channelToken,
@@ -777,6 +782,7 @@ export class ChannelService {
       },
       connection_hops: [convertHex2String(connectionDatum.state.counterparty.connection_id)],
       version: channelOpenTryOperator.counterpartyVersion,
+      upgrade_sequence: 0n,
     };
     const verifyProofRedeemer: VerifyProofRedeemer = {
       VerifyMembership: {
@@ -806,6 +812,7 @@ export class ChannelService {
     const encodedVerifyProofRedeemer = encodeVerifyProofRedeemer(
       verifyProofRedeemer,
       this.lucidService.LucidImporter,
+      historyWitnesses[0] ?? null,
     );
 
     const { newRoot, channelSiblings, nextSequenceSendSiblings, nextSequenceRecvSiblings, nextSequenceAckSiblings } =
@@ -824,6 +831,10 @@ export class ChannelService {
         next_channel_sequence: hostStateDatum.state.next_channel_sequence + 1n,
         ibc_state_root: newRoot,
         last_update_time: BigInt(Date.now()),
+      },
+      control: {
+        ...hostStateDatum.control,
+        live_channels: hostStateDatum.control.live_channels + 1n,
       },
     };
 
@@ -855,10 +866,7 @@ export class ChannelService {
         },
       ],
     };
-    const encodedSpendModuleRedeemer: string = await this.lucidService.encode(
-      spendModuleRedeemer,
-      'iBCModuleRedeemer',
-    );
+    const encodedSpendModuleRedeemer: string = await this.lucidService.encode(spendModuleRedeemer, 'iBCModuleRedeemer');
     return this.lucidService.createUnsignedChannelOpenTryTransaction({
       moduleKey: moduleConfig.key,
       hostStateUtxo,
@@ -927,7 +935,9 @@ export class ChannelService {
     // Get the token unit associated with the client
     const clientTokenUnit = this.lucidService.getClientTokenUnit(clientSequence);
     const clientUtxo = await this.lucidService.findUtxoByUnit(clientTokenUnit);
-    const clientDatum: ClientDatum = await this.lucidService.decodeDatum<ClientDatum>(clientUtxo.datum!, 'client');
+    const { clientDatum, historyWitnesses } = await this.lucidService.resolveClientAtHeights(clientUtxo, [
+      channelOpenAckOperator.proofHeight,
+    ]);
 
     // Get the keys (heights) of the map and convert them into an array
     const heightsArray = Array.from(clientDatum.state.consensusStates.keys());
@@ -1036,6 +1046,7 @@ export class ChannelService {
       // committed version is the counterparty_version supplied in MsgChannelOpenAck,
       // not our local channel version.
       version: channelOpenAckOperator.counterpartyVersion,
+      upgrade_sequence: 0n,
     };
 
     const verifyProofRedeemer: VerifyProofRedeemer = {
@@ -1066,6 +1077,7 @@ export class ChannelService {
     const encodedVerifyProofRedeemer: string = encodeVerifyProofRedeemer(
       verifyProofRedeemer,
       this.lucidService.LucidImporter,
+      historyWitnesses[0] ?? null,
     );
 
     const moduleConfig = this.getModuleConfig(portId);
@@ -1080,10 +1092,7 @@ export class ChannelService {
         },
       ],
     };
-    const encodedSpendModuleRedeemer: string = await this.lucidService.encode(
-      spendModuleRedeemer,
-      'iBCModuleRedeemer',
-    );
+    const encodedSpendModuleRedeemer: string = await this.lucidService.encode(spendModuleRedeemer, 'iBCModuleRedeemer');
     const unsignedChannelOpenAckParams: UnsignedChannelOpenAckDto = {
       hostStateUtxo,
       encodedHostStateRedeemer,
@@ -1103,7 +1112,7 @@ export class ChannelService {
       verifyProofPolicyId,
       encodedVerifyProofRedeemer,
     };
-    const unsignedTx = this.lucidService.createUnsignedChannelOpenAckTransaction(unsignedChannelOpenAckParams);
+    const unsignedTx = await this.lucidService.createUnsignedChannelOpenAckTransaction(unsignedChannelOpenAckParams);
 
     return {
       unsignedTx,
@@ -1160,7 +1169,9 @@ export class ChannelService {
     // Get the token unit associated with the client
     const clientTokenUnit = this.lucidService.getClientTokenUnit(clientSequence);
     const clientUtxo = await this.lucidService.findUtxoByUnit(clientTokenUnit);
-    const clientDatum: ClientDatum = await this.lucidService.decodeDatum<ClientDatum>(clientUtxo.datum!, 'client');
+    const { clientDatum, historyWitnesses } = await this.lucidService.resolveClientAtHeights(clientUtxo, [
+      channelOpenConfirmOperator.proofHeight,
+    ]);
 
     // ChannelOpenConfirm must prove the counterparty's acknowledged channel end
     // against a concrete client consensus state before we mark the local side Open.
@@ -1258,6 +1269,7 @@ export class ChannelService {
       },
       connection_hops: [convertHex2String(connectionDatum.state.counterparty.connection_id)],
       version: convertHex2String(updatedChannelDatum.state.channel.version),
+      upgrade_sequence: 0n,
     };
     const verifyProofRedeemer: VerifyProofRedeemer = {
       VerifyMembership: {
@@ -1286,6 +1298,7 @@ export class ChannelService {
     const encodedVerifyProofRedeemer: string = encodeVerifyProofRedeemer(
       verifyProofRedeemer,
       this.lucidService.LucidImporter,
+      historyWitnesses[0] ?? null,
     );
     const moduleConfig = this.getModuleConfig(portId);
     const moduleUtxo = await this.lucidService.findUtxoByUnit(moduleConfig.identifier);
@@ -1299,10 +1312,7 @@ export class ChannelService {
         },
       ],
     };
-    const encodedSpendModuleRedeemer: string = await this.lucidService.encode(
-      spendModuleRedeemer,
-      'iBCModuleRedeemer',
-    );
+    const encodedSpendModuleRedeemer: string = await this.lucidService.encode(spendModuleRedeemer, 'iBCModuleRedeemer');
     const unsignedChannelOpenConfirmParams: UnsignedChannelOpenConfirmDto = {
       hostStateUtxo,
       encodedHostStateRedeemer,
@@ -1322,7 +1332,9 @@ export class ChannelService {
       verifyProofPolicyId,
       encodedVerifyProofRedeemer,
     };
-    const unsignedTx = this.lucidService.createUnsignedChannelOpenConfirmTransaction(unsignedChannelOpenConfirmParams);
+    const unsignedTx = await this.lucidService.createUnsignedChannelOpenConfirmTransaction(
+      unsignedChannelOpenConfirmParams,
+    );
     return { unsignedTx, pendingTreeUpdate: { expectedNewRoot: newRoot, commit } };
   }
 
@@ -1441,10 +1453,7 @@ export class ChannelService {
       ],
     };
 
-    const encodedSpendModuleRedeemer: string = await this.lucidService.encode(
-      spendModuleRedeemer,
-      'iBCModuleRedeemer',
-    );
+    const encodedSpendModuleRedeemer: string = await this.lucidService.encode(spendModuleRedeemer, 'iBCModuleRedeemer');
 
     const spendChannelRedeemer: SpendChannelRedeemer = 'ChanCloseInit';
     const encodedSpendChannelRedeemer: string = await this.lucidService.encode(
@@ -1470,7 +1479,8 @@ export class ChannelService {
       constructedAddress,
     };
 
-    const unsignedTx = this.lucidService.createUnsignedChannelCloseInitTransaction(unsignedChannelCloseInitParams);
+    const unsignedTx =
+      await this.lucidService.createUnsignedChannelCloseInitTransaction(unsignedChannelCloseInitParams);
     return { unsignedTx, pendingTreeUpdate: { expectedNewRoot: newRoot, commit } };
   }
 
@@ -1512,7 +1522,9 @@ export class ChannelService {
     const clientSequence = parseClientSequence(convertHex2String(connectionDatum.state.client_id));
     const clientTokenUnit = this.lucidService.getClientTokenUnit(clientSequence);
     const clientUtxo = await this.lucidService.findUtxoByUnit(clientTokenUnit);
-    const clientDatum: ClientDatum = await this.lucidService.decodeDatum<ClientDatum>(clientUtxo.datum!, 'client');
+    const { clientDatum, historyWitnesses } = await this.lucidService.resolveClientAtHeights(clientUtxo, [
+      channelCloseConfirmOperator.proofHeight,
+    ]);
 
     const heightsArray = Array.from(clientDatum.state.consensusStates.keys());
     if (!isValidProofHeight(heightsArray, channelCloseConfirmOperator.proofHeight)) {
@@ -1559,6 +1571,7 @@ export class ChannelService {
       ChanCloseConfirm: {
         proof_init: channelCloseConfirmOperator.proofInit,
         proof_height: channelCloseConfirmOperator.proofHeight,
+        counterparty_upgrade_sequence: channelCloseConfirmOperator.counterpartyUpgradeSequence,
       },
     };
     const encodedSpendChannelRedeemer: string = await this.lucidService.encode(
@@ -1604,6 +1617,7 @@ export class ChannelService {
       },
       connection_hops: [convertHex2String(connectionDatum.state.counterparty.connection_id)],
       version: convertHex2String(updatedChannelDatum.state.channel.version),
+      upgrade_sequence: channelCloseConfirmOperator.counterpartyUpgradeSequence,
     };
     const verifyProofRedeemer: VerifyProofRedeemer = {
       VerifyMembership: {
@@ -1632,6 +1646,7 @@ export class ChannelService {
     const encodedVerifyProofRedeemer: string = encodeVerifyProofRedeemer(
       verifyProofRedeemer,
       this.lucidService.LucidImporter,
+      historyWitnesses[0] ?? null,
     );
 
     const moduleConfig = this.getModuleConfig(portId);
@@ -1646,10 +1661,7 @@ export class ChannelService {
         },
       ],
     };
-    const encodedSpendModuleRedeemer: string = await this.lucidService.encode(
-      spendModuleRedeemer,
-      'iBCModuleRedeemer',
-    );
+    const encodedSpendModuleRedeemer: string = await this.lucidService.encode(spendModuleRedeemer, 'iBCModuleRedeemer');
 
     const unsignedChannelCloseConfirmParams: UnsignedChannelCloseConfirmDto = {
       hostStateUtxo,
@@ -1671,7 +1683,7 @@ export class ChannelService {
       encodedVerifyProofRedeemer,
     };
 
-    const unsignedTx = this.lucidService.createUnsignedChannelCloseConfirmTransaction(
+    const unsignedTx = await this.lucidService.createUnsignedChannelCloseConfirmTransaction(
       unsignedChannelCloseConfirmParams,
     );
     return { unsignedTx, pendingTreeUpdate: { expectedNewRoot: newRoot, commit } };

@@ -1,5 +1,4 @@
 use aiken/collection/list
-use aiken/fuzz
 use aiken/primitive/bytearray
 use cardano/address.{Address, from_script, from_verification_key}
 use cardano/assets.{Value, add, from_asset, quantity_of}
@@ -21,8 +20,8 @@ use ibc/apps/transfer/voucher_flow
 use ibc/client/ics_007_tendermint_client/height as height_mod
 use ibc/core/ics_004/types/acknowledgement as acknowledgement_mod
 use ibc/core/ics_004/types/packet.{Packet}
+use ibc/encoding/hex
 use ibc/testing/fuzz_dsl
-use ibc/utils/string as string_utils
 
 const channel_id = "channel-0"
 
@@ -38,7 +37,8 @@ const native_policy_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 const native_token_name = "coin"
 
-const shard_policy_id = "mock transfer escrow shard policy id"
+const shard_policy_id =
+  #"03dcc42441e396823e8d8ad155c3caf51e50e847fb04c0a977b46957"
 
 const voucher_policy_id = "mock voucher minting policy id"
 
@@ -82,7 +82,7 @@ fn module_input() -> Input {
 }
 
 fn escrow_datum(channel_id: ByteArray, denom: ByteArray) -> TransferEscrowDatum {
-  TransferEscrowDatum { channel_id, denom }
+  TransferEscrowDatum { channel_id, denom, escrowed_amount: 0 }
 }
 
 fn escrow_output(
@@ -96,7 +96,12 @@ fn escrow_output(
     address: from_script("transfer-module"),
     value: from_asset(native_policy_id, native_token_name, quantity)
       |> add(shard_policy_id, shard_token_name, 1),
-    datum: InlineDatum(escrow_datum(channel_id, denom)),
+    datum: InlineDatum(
+      TransferEscrowDatum {
+        ..escrow_datum(channel_id, denom),
+        escrowed_amount: quantity,
+      },
+    ),
     reference_script: None,
   }
 }
@@ -125,7 +130,7 @@ fn empty_mint() -> Value {
 }
 
 fn receiver_address(receiver: ByteArray) -> Option<Address> {
-  when string_utils.hex_string_to_bytes(receiver) is {
+  when hex.decode(receiver) is {
     Some(public_key_hash) -> Some(from_verification_key(public_key_hash))
     None -> None
   }
@@ -225,7 +230,10 @@ fn native_escrow_contract(
   transfer_escrow.validate_module_escrow_transition(
     input,
     EscrowShard {
-      datum: escrow_datum(actual_channel_id, denom),
+      datum: TransferEscrowDatum {
+        ..escrow_datum(actual_channel_id, denom),
+        escrowed_amount: input_quantity,
+      },
       updated_output: Some(output),
     },
     [input],
@@ -235,7 +243,6 @@ fn native_escrow_contract(
     empty_mint(),
     delta,
     native_value(delta),
-    native_policy_id |> bytearray.concat(native_token_name),
   )
 }
 
@@ -256,7 +263,10 @@ fn native_unescrow_contract(
     transfer_escrow.validate_module_escrow_transition(
       input,
       EscrowShard {
-        datum: escrow_datum(channel_id, denom),
+        datum: TransferEscrowDatum {
+          ..escrow_datum(channel_id, denom),
+          escrowed_amount: escrow_quantity,
+        },
         updated_output: Some(output),
       },
       [input],
@@ -266,7 +276,6 @@ fn native_unescrow_contract(
       empty_mint(),
       0 - amount,
       native_value(amount) |> assets.negate(),
-      native_policy_id |> bytearray.concat(native_token_name),
     )?,
     delta == payout_quantity,
     delta == amount,
@@ -370,10 +379,9 @@ fn recv_sink_contract(
   }
 }
 
-test prop_transfer_native_send_escrow_increases_exactly(_seed via fuzz.int()) {
+test regression_transfer_native_send_escrow_increases_exactly() {
   // These accounting checks exercise pure transfer helpers. Full validator-level
   // transition coverage lives in validators/spending_transfer_module.test.ak.
-  fuzz.label(@"regression.unit.transfer.native_send.escrow_increases_exactly")
 
   fuzz_dsl.valid_check(
     "transfer",
@@ -384,9 +392,7 @@ test prop_transfer_native_send_escrow_increases_exactly(_seed via fuzz.int()) {
     |> fuzz_dsl.assert_valid
 }
 
-test prop_transfer_native_timeout_refunds_exactly(_seed via fuzz.int()) {
-  fuzz.label(@"regression.unit.transfer.native_timeout.refund_exactly")
-
+test regression_transfer_native_timeout_refunds_exactly() {
   fuzz_dsl.valid_check(
     "transfer",
     "native_timeout",
@@ -396,9 +402,7 @@ test prop_transfer_native_timeout_refunds_exactly(_seed via fuzz.int()) {
     |> fuzz_dsl.assert_valid
 }
 
-test prop_transfer_native_ack_has_no_refund(_seed via fuzz.int()) {
-  fuzz.label(@"regression.unit.transfer.native_ack.no_refund")
-
+test regression_transfer_native_ack_has_no_refund() {
   let input = module_input()
   let outputs = [input.output]
 
@@ -410,9 +414,7 @@ test prop_transfer_native_ack_has_no_refund(_seed via fuzz.int()) {
     |> fuzz_dsl.assert_valid
 }
 
-test prop_transfer_voucher_send_burns_exactly(_seed via fuzz.int()) {
-  fuzz.label(@"regression.unit.transfer.voucher_send.burns_exactly")
-
+test regression_transfer_voucher_send_burns_exactly() {
   let (data, packet) =
     packet(
       sink_voucher_denom(),
@@ -433,9 +435,7 @@ test prop_transfer_voucher_send_burns_exactly(_seed via fuzz.int()) {
     |> fuzz_dsl.assert_valid
 }
 
-test prop_transfer_voucher_error_ack_remints_exactly(_seed via fuzz.int()) {
-  fuzz.label(@"regression.unit.transfer.voucher_error_ack.remints_exactly")
-
+test regression_transfer_voucher_error_ack_remints_exactly() {
   let (data, packet) =
     packet(
       sink_voucher_denom(),
@@ -456,9 +456,7 @@ test prop_transfer_voucher_error_ack_remints_exactly(_seed via fuzz.int()) {
     |> fuzz_dsl.assert_valid
 }
 
-test prop_transfer_recv_source_unescrows_exactly(_seed via fuzz.int()) {
-  fuzz.label(@"regression.unit.transfer.recv_source.unescrows_exactly")
-
+test regression_transfer_recv_source_unescrows_exactly() {
   fuzz_dsl.valid_check(
     "transfer",
     "recv_source",
@@ -468,9 +466,7 @@ test prop_transfer_recv_source_unescrows_exactly(_seed via fuzz.int()) {
     |> fuzz_dsl.assert_valid
 }
 
-test prop_transfer_recv_sink_mints_voucher_exactly(_seed via fuzz.int()) {
-  fuzz.label(@"regression.unit.transfer.recv_sink.mints_voucher_exactly")
-
+test regression_transfer_recv_sink_mints_voucher_exactly() {
   let (data, packet) =
     packet(
       sink_voucher_denom(),
@@ -491,9 +487,7 @@ test prop_transfer_recv_sink_mints_voucher_exactly(_seed via fuzz.int()) {
     |> fuzz_dsl.assert_valid
 }
 
-test prop_transfer_rejects_extra_voucher_mint(_seed via fuzz.int()) {
-  fuzz.label(@"regression.unit.transfer.invalid_extra_voucher_mint_rejected")
-
+test regression_transfer_rejects_extra_voucher_mint() {
   let (data, packet) =
     packet(
       sink_voucher_denom(),
@@ -516,9 +510,7 @@ test prop_transfer_rejects_extra_voucher_mint(_seed via fuzz.int()) {
     |> fuzz_dsl.assert_rejected
 }
 
-test prop_transfer_rejects_wrong_escrow_delta(_seed via fuzz.int()) {
-  fuzz.label(@"regression.unit.transfer.invalid_wrong_escrow_delta_rejected")
-
+test regression_transfer_rejects_wrong_escrow_delta() {
   fuzz_dsl.mutated_check(
     "transfer",
     "native_send",
@@ -529,11 +521,7 @@ test prop_transfer_rejects_wrong_escrow_delta(_seed via fuzz.int()) {
     |> fuzz_dsl.assert_rejected
 }
 
-test prop_transfer_rejects_wrong_native_refund_amount(_seed via fuzz.int()) {
-  fuzz.label(
-    @"regression.unit.transfer.invalid_wrong_native_refund_amount_rejected",
-  )
-
+test regression_transfer_rejects_wrong_native_refund_amount() {
   fuzz_dsl.mutated_check(
     "transfer",
     "native_timeout",
@@ -544,11 +532,7 @@ test prop_transfer_rejects_wrong_native_refund_amount(_seed via fuzz.int()) {
     |> fuzz_dsl.assert_rejected
 }
 
-test prop_transfer_rejects_wrong_voucher_burn_amount(_seed via fuzz.int()) {
-  fuzz.label(
-    @"regression.unit.transfer.invalid_wrong_voucher_burn_amount_rejected",
-  )
-
+test regression_transfer_rejects_wrong_voucher_burn_amount() {
   let (data, packet) =
     packet(
       sink_voucher_denom(),
@@ -569,15 +553,11 @@ test prop_transfer_rejects_wrong_voucher_burn_amount(_seed via fuzz.int()) {
     |> fuzz_dsl.assert_rejected
 }
 
-test prop_transfer_rejects_wrong_escrow_shard(_seed via fuzz.int()) fail {
-  fuzz.label(@"regression.unit.transfer.invalid_wrong_escrow_shard_rejected")
-
+test regression_transfer_rejects_wrong_escrow_shard() fail {
   native_escrow_contract(100, 120, amount, channel_id, "channel-999")
 }
 
-test prop_transfer_rejects_invalid_receiver_address(_seed via fuzz.int()) {
-  fuzz.label(@"regression.unit.transfer.invalid_receiver_address_rejected")
-
+test regression_transfer_rejects_invalid_receiver_address() {
   fuzz_dsl.mutated_check(
     "transfer",
     "recv_sink",
@@ -586,4 +566,72 @@ test prop_transfer_rejects_invalid_receiver_address(_seed via fuzz.int()) {
     receiver_address("not a hex address") != None,
   )
     |> fuzz_dsl.assert_rejected
+}
+
+fn ada_escrow_transition(
+  delta: Int,
+  reserve_delta: Int,
+  updated_principal: Int,
+) -> Bool {
+  let datum =
+    TransferEscrowDatum {
+      channel_id,
+      denom: "6c6f76656c616365",
+      escrowed_amount: 1000,
+    }
+  let nft = transfer_escrow_shard.shard_token_name(channel_id, datum.denom)
+  let input =
+    Input {
+      ..module_input(),
+      output: Output {
+        ..module_output(
+          assets.from_lovelace(2_001_000) |> assets.add(shard_policy_id, nft, 1),
+        ),
+        datum: InlineDatum(datum),
+      },
+    }
+  let output =
+    Output {
+      ..input.output,
+      value: assets.from_lovelace(2_001_000 + delta + reserve_delta)
+        |> assets.add(shard_policy_id, nft, 1),
+      datum: InlineDatum(
+        TransferEscrowDatum { ..datum, escrowed_amount: updated_principal },
+      ),
+    }
+  transfer_escrow.validate_module_escrow_transition(
+    input,
+    EscrowShard { datum, updated_output: Some(output) },
+    [input],
+    [output],
+    datum,
+    shard_policy_id,
+    assets.zero,
+    delta,
+    assets.from_lovelace(delta),
+  )
+}
+
+test ada_escrow_deposit_tracks_principal_separately_from_reserve() {
+  ada_escrow_transition(500, 0, 1500)
+}
+
+test ada_escrow_full_payout_retains_reserve_and_clears_principal() {
+  ada_escrow_transition(-1000, 0, 0)
+}
+
+test ada_escrow_top_up_changes_reserve_without_increasing_principal() {
+  ada_escrow_transition(-500, 1000, 500)
+}
+
+test ada_escrow_rejects_spending_reserve_as_user_principal() {
+  !ada_escrow_transition(-1001, 0, -1)
+}
+
+test ada_escrow_rejects_dropping_reserve_during_payout() {
+  !ada_escrow_transition(-500, -1, 500)
+}
+
+test ada_escrow_rejects_clearing_principal_without_paying_it_out() {
+  !ada_escrow_transition(0, 0, 0)
 }

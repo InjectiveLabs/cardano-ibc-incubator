@@ -14,12 +14,14 @@ use ibc/client/ics_007_tendermint_client/height.{Height} as height_mod
 use ibc/client/ics_007_tendermint_client/types/verify_proof_redeemer.{
   BatchVerifyMembership, BatchVerifyMembershipAndNonMembership, VerifyMembership,
   VerifyMembershipParams, VerifyNonMembership, VerifyNonMembershipParams,
+  VerifyProofEnvelope,
 }
 use ibc/core/ics_003_connection_semantics/connection_datum.{ConnectionDatum}
 use ibc/core/ics_003_connection_semantics/types/connection_end.{ConnectionEnd}
 use ibc/core/ics_003_connection_semantics/types/counterparty.{Counterparty} as conn_counterparty_mod
-use ibc/core/ics_004/channel_datum.{ChannelDatum,
-  ChannelDatumState} as channel_datum_mod
+use ibc/core/ics_004/channel_datum.{
+  ChannelDatum, ChannelDatumState, initial_upgrade_state,
+} as channel_datum_mod
 use ibc/core/ics_004/channel_redeemer.{TimeoutOnClose, TimeoutPacket}
 use ibc/core/ics_004/types/channel.{Channel}
 use ibc/core/ics_004/types/counterparty.{ChannelCounterparty}
@@ -47,6 +49,26 @@ fn check_timeout_unordered_packet(
   include_callback: Bool,
   callback_packet_matches: Bool,
   use_timeout_on_close: Bool,
+) {
+  check_timeout_unordered_packet_sequences(
+    use_escrow_shard,
+    include_callback,
+    callback_packet_matches,
+    use_timeout_on_close,
+    0,
+    0,
+  )
+}
+
+/// `claimed` is the redeemer's counterparty upgrade sequence and `proven` the
+/// one in the verified closed counterparty channel.
+fn check_timeout_unordered_packet_sequences(
+  use_escrow_shard: Bool,
+  include_callback: Bool,
+  callback_packet_matches: Bool,
+  use_timeout_on_close: Bool,
+  claimed: Int,
+  proven: Int,
 ) {
   let mock_data = setup()
 
@@ -83,6 +105,7 @@ fn check_timeout_unordered_packet(
       },
       connection_hops: [mock_data.connection_id],
       version: "mock-version",
+      upgrade_sequence: 0,
     }
 
   let input_channel_datum =
@@ -97,6 +120,7 @@ fn check_timeout_unordered_packet(
         packet_commitment: [],
         packet_receipt: [],
         packet_acknowledgement: [],
+        upgrade: initial_upgrade_state,
       },
       port_id: mock_data.port_id,
       token: mock_data.channel_token,
@@ -292,6 +316,7 @@ fn check_timeout_unordered_packet(
         proof_close,
         proof_height,
         next_sequence_recv: 0,
+        counterparty_upgrade_sequence: claimed,
       }
     } else {
       TimeoutPacket {
@@ -349,59 +374,63 @@ fn check_timeout_unordered_packet(
       path: merkle_path,
     }
   let verify_proof_redeemer: Redeemer =
-    if use_timeout_on_close {
-      let expected_remote_channel =
-        Channel {
-          state: chan_state_mod.Closed,
-          ordering: chan_order_mod.Unordered,
-          counterparty: ChannelCounterparty {
-            port_id: input_channel_datum.port_id,
-            channel_id,
-          },
-          connection_hops: [connection_datum.state.counterparty.connection_id],
-          version: input_channel_datum.state.channel.version,
-        }
-      let close_membership =
-        VerifyMembershipParams {
-          cs: client_datum.state.client_state,
-          cons_state,
-          height: proof_height,
-          processed_time: 0,
-          processed_height: 0,
-          delay_time_period: 0,
-          delay_block_period: 0,
-          proof: proof_close,
-          path: merkle.apply_prefix(
-            connection_datum.state.counterparty.prefix,
-            merkle.new_merkle_path(
-              [
-                channel_keys.channel_path(
-                  packet.destination_port,
-                  packet.destination_channel,
-                ),
-              ],
+    VerifyProofEnvelope {
+      history_witness: None,
+      proof: if use_timeout_on_close {
+        let expected_remote_channel =
+          Channel {
+            state: chan_state_mod.Closed,
+            ordering: chan_order_mod.Unordered,
+            counterparty: ChannelCounterparty {
+              port_id: input_channel_datum.port_id,
+              channel_id,
+            },
+            connection_hops: [connection_datum.state.counterparty.connection_id],
+            version: input_channel_datum.state.channel.version,
+            upgrade_sequence: proven,
+          }
+        let close_membership =
+          VerifyMembershipParams {
+            cs: client_datum.state.client_state,
+            cons_state,
+            height: proof_height,
+            processed_time: 0,
+            processed_height: 0,
+            delay_time_period: 0,
+            delay_block_period: 0,
+            proof: proof_close,
+            path: merkle.apply_prefix(
+              connection_datum.state.counterparty.prefix,
+              merkle.new_merkle_path(
+                [
+                  channel_keys.channel_path(
+                    packet.destination_port,
+                    packet.destination_channel,
+                  ),
+                ],
+              ),
             ),
-          ),
-          value: channel_pb.marshal_for_channel(
-            channel.convert_to_channel_proto(expected_remote_channel),
-          ).2nd,
+            value: channel_pb.marshal_for_channel(
+              channel.convert_to_channel_proto(expected_remote_channel),
+            ).2nd,
+          }
+        BatchVerifyMembershipAndNonMembership {
+          memberships: [close_membership],
+          non_memberships: [receipt_non_membership],
         }
-      BatchVerifyMembershipAndNonMembership {
-        memberships: [close_membership],
-        non_memberships: [receipt_non_membership],
-      }
-    } else {
-      VerifyNonMembership {
-        cs: receipt_non_membership.cs,
-        cons_state: receipt_non_membership.cons_state,
-        height: receipt_non_membership.height,
-        processed_time: receipt_non_membership.processed_time,
-        processed_height: receipt_non_membership.processed_height,
-        delay_time_period: receipt_non_membership.delay_time_period,
-        delay_block_period: receipt_non_membership.delay_block_period,
-        proof: receipt_non_membership.proof,
-        path: receipt_non_membership.path,
-      }
+      } else {
+        VerifyNonMembership {
+          cs: receipt_non_membership.cs,
+          cons_state: receipt_non_membership.cons_state,
+          height: receipt_non_membership.height,
+          processed_time: receipt_non_membership.processed_time,
+          processed_height: receipt_non_membership.processed_height,
+          delay_time_period: receipt_non_membership.delay_time_period,
+          delay_block_period: receipt_non_membership.delay_block_period,
+          proof: receipt_non_membership.proof,
+          path: receipt_non_membership.path,
+        }
+      },
     }
 
   let timeout_packet_redeemer: Redeemer = mock_data.channel_token
@@ -454,6 +483,16 @@ test succeed_timeout_on_close_unordered_future_packet() {
   check_timeout_unordered_packet(False, True, True, True)
 }
 
+// The closed counterparty may sit at a later sequence after a cancelled
+// upgrade, which the relayer supplies.
+test timeout_on_close_accepts_counterparty_upgrade_sequence() {
+  check_timeout_unordered_packet_sequences(False, True, True, True, 3, 3)
+}
+
+test timeout_on_close_rejects_unproven_counterparty_upgrade_sequence() fail {
+  check_timeout_unordered_packet_sequences(False, True, True, True, 3, 0)
+}
+
 test timeout_packet_accepts_registered_escrow_shard_callback() {
   check_timeout_unordered_packet(True, True, True, False)
 }
@@ -504,6 +543,7 @@ test succeed_timeout_ordered_packet() {
       },
       connection_hops: [mock_data.connection_id],
       version: "mock-version",
+      upgrade_sequence: 0,
     }
 
   let input_channel_datum =
@@ -518,6 +558,7 @@ test succeed_timeout_ordered_packet() {
         packet_commitment: [],
         packet_receipt: [],
         packet_acknowledgement: [],
+        upgrade: initial_upgrade_state,
       },
       port_id: mock_data.port_id,
       token: mock_data.channel_token,
@@ -616,17 +657,20 @@ test succeed_timeout_ordered_packet() {
     )
 
   let verify_proof_redeemer: Redeemer =
-    VerifyMembership {
-      cs: client_datum.state.client_state,
-      cons_state,
-      height: proof_height,
-      processed_time: 0,
-      processed_height: 0,
-      delay_time_period: 0,
-      delay_block_period: 0,
-      proof: proof_unreceived,
-      path: merkle_path,
-      value: from_int_big_endian(next_sequence_recv, 8),
+    VerifyProofEnvelope {
+      history_witness: None,
+      proof: VerifyMembership {
+        cs: client_datum.state.client_state,
+        cons_state,
+        height: proof_height,
+        processed_time: 0,
+        processed_height: 0,
+        delay_time_period: 0,
+        delay_block_period: 0,
+        proof: proof_unreceived,
+        path: merkle_path,
+        value: from_int_big_endian(next_sequence_recv, 8),
+      },
     }
 
   let timeout_packet_redeemer: Redeemer = mock_data.channel_token
@@ -693,6 +737,7 @@ test timeout_on_close_recovers_second_future_packet_from_closed_ordered_channel(
       },
       connection_hops: [mock_data.connection_id],
       version: "mock-version",
+      upgrade_sequence: 0,
     }
   let empty_channel_datum =
     ChannelDatum {
@@ -706,6 +751,7 @@ test timeout_on_close_recovers_second_future_packet_from_closed_ordered_channel(
         packet_commitment: [],
         packet_receipt: [],
         packet_acknowledgement: [],
+        upgrade: initial_upgrade_state,
       },
       port_id: mock_data.port_id,
       token: mock_data.channel_token,
@@ -779,6 +825,7 @@ test timeout_on_close_recovers_second_future_packet_from_closed_ordered_channel(
       proof_close,
       proof_height,
       next_sequence_recv,
+      counterparty_upgrade_sequence: 0,
     }
 
   let channel_id =
@@ -825,6 +872,7 @@ test timeout_on_close_recovers_second_future_packet_from_closed_ordered_channel(
       },
       connection_hops: [connection_datum.state.counterparty.connection_id],
       version: input_channel_datum.state.channel.version,
+      upgrade_sequence: 0,
     }
   let close_membership =
     VerifyMembershipParams {
@@ -846,7 +894,11 @@ test timeout_on_close_recovers_second_future_packet_from_closed_ordered_channel(
       ).2nd,
     }
   let verify_proof_redeemer: Redeemer =
-    BatchVerifyMembership([common_membership, close_membership])
+    VerifyProofEnvelope {
+      history_witness: None,
+      proof: BatchVerifyMembership([common_membership, close_membership]),
+    }
+
   let timeout_packet_redeemer: Redeemer = mock_data.channel_token
   let redeemers: Pairs<ScriptPurpose, Redeemer> =
     [

@@ -1,6 +1,8 @@
 use aiken/collection/list
-use ibc/utils/string
+use ibc/utils/text_bytes
 
+// Frozen public commitment primitive. Keep its fields and order unchanged.
+// Put private metadata in a separate type. See docs/cardano-commitment-codec.md.
 pub type Version {
   identifier: ByteArray,
   features: List<ByteArray>,
@@ -23,9 +25,9 @@ pub fn new_version(identifier: ByteArray, features: List<ByteArray>) -> Version 
 /// validate_version does basic validation of the version identifier and features.
 pub fn validate_version(version: Version) -> Bool {
   and {
-    string.trim_space(version.identifier) != "",
+    text_bytes.trim_ascii_spaces(version.identifier) != "",
     version.features
-      |> list.all(fn(feature) { string.trim_space(feature) != "" }),
+      |> list.all(fn(feature) { text_bytes.trim_ascii_spaces(feature) != "" }),
   }
 }
 

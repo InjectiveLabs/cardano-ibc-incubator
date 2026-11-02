@@ -12,11 +12,16 @@ import {
   encodeConsensusStateValue,
 } from '../../shared/types/client-datum';
 import { initializeHeader } from '../../shared/types/header';
-import { HostStateDatum } from '../../shared/types/host-state-datum';
+import { decodeHostStateDatum, HostStateDatum } from '../../shared/types/host-state-datum';
+import {
+  decodeMintSessionRedeemer,
+  decodeSpendMultitxClientRedeemer,
+} from '../../shared/types/tendermint-update-session';
 import { LucidService } from '../../shared/modules/lucid/lucid.service';
-import { ClientService } from '../client.service';
+import { TendermintClientService as ClientService } from '../tendermint-client.service';
 import { TxOperationRunnerService } from '../tx-operation-runner.service';
 import * as validation from '../helper/client.validate';
+import { validateTendermintStagedFinalization } from '../update-client-session-state';
 import headerMockBuilder from './mock/header';
 
 const validFromMs = 1_700_000_000_000;
@@ -27,9 +32,11 @@ const height = (revisionHeight: bigint) => ({ revisionNumber: 0n, revisionHeight
 
 function initialDatum(): ClientDatum {
   return {
+    history_root: '00'.repeat(32),
     token: { policyId: '11'.repeat(28), name: '01' },
     state: {
       clientState: {
+        upgradePath: [],
         chainId: Buffer.from('delay-0').toString('hex'),
         trustLevel: { numerator: 1n, denominator: 3n },
         trustingPeriod: 1_000_000_000_000n,
@@ -41,18 +48,9 @@ function initialDatum(): ClientDatum {
       },
       consensusStates: new Map([
         [height(2n), { timestamp: validFromNs, next_validators_hash: 'aa', root: { hash: 'bb' } }],
-        // This older state expires inside the validity interval. Pruning must
-        // still use the lower bound, independently of the new processing time.
-        [height(1n), { timestamp: validFromNs - 950_000_000_000n, next_validators_hash: 'cc', root: { hash: 'dd' } }],
       ]),
-      processedTimes: new Map([
-        [height(2n), 101n],
-        [height(1n), 99n],
-      ]),
-      processedHeights: new Map([
-        [height(2n), 11n],
-        [height(1n), 9n],
-      ]),
+      processedTimes: new Map([[height(2n), 101n]]),
+      processedHeights: new Map([[height(2n), 11n]]),
     },
   };
 }
@@ -77,7 +75,7 @@ async function context(input?: ClientDatum) {
   const hostDatum: HostStateDatum = {
     nft_policy: '22'.repeat(28),
     deployer: '33'.repeat(28),
-    control: { port_registry: new Map(), shutdown: 'Active' },
+    control: { port_registry: new Map(), shutdown: 'Active', live_clients: input ? 1n : 0n, live_connections: 0n, live_channels: 0n, last_heartbeat_time: 0n },
     state: {
       version: 1n,
       ibc_state_root: tree.getRoot(),
@@ -99,6 +97,10 @@ async function context(input?: ClientDatum) {
   } as unknown as ConfigService;
   const lucid: any = {
     LucidImporter: Lucid,
+    prepareConsensusHistoryUpdate: jest.fn().mockResolvedValue({
+      newRoot: '66'.repeat(32),
+      siblings: Array(64).fill('00'.repeat(32)),
+    }),
     findUtxoAtHostStateNFT: jest.fn().mockResolvedValue({ ...hostRef, datum: 'host' }),
     decodeDatum: jest.fn().mockResolvedValue(hostDatum),
     encode: jest.fn().mockImplementation(function (data: unknown, type: string) {
@@ -126,6 +128,25 @@ async function context(input?: ClientDatum) {
 describe('ClientService connection-delay processing metadata', () => {
   afterEach(() => jest.restoreAllMocks());
 
+  it('accepts an ordinary recent header despite a two-second Cardano tip lag without widening clock drift', async () => {
+    const { service } = await context();
+    const clientDatum = initialDatum();
+    const tip = validFromMs + 300_000;
+    const headerTimeNs = BigInt(tip + 2_000) * 1_000_000n;
+    const backdate = (service as any).tendermintUpdateSafeBackdateMs(clientDatum);
+    const input = { clientDatum, trustedHeight: height(2n), headerTimeNs, validFromTimeMs: tip - backdate };
+    // Reproduce the old drift-minus-one-second construction against the same
+    // real validation function and datum, then check the corrected window.
+    expect(() => validateTendermintStagedFinalization({ ...input, validFromTimeMs: tip - 9_000 })).toThrow(
+      'max clock drift',
+    );
+    expect(() => validateTendermintStagedFinalization(input)).not.toThrow();
+    expect(() =>
+      validateTendermintStagedFinalization({ ...input, headerTimeNs: BigInt(tip + 10_000) * 1_000_000n }),
+    ).toThrow('max clock drift');
+    expect(input.validFromTimeMs).toBeLessThanOrEqual(tip);
+  });
+
   it('normalizes validity bounds to the exact slot times seen on-chain', async () => {
     const { service } = await context();
     const { zeroTime, zeroSlot } = Lucid.SLOT_CONFIG_NETWORK.Preprod;
@@ -135,6 +156,7 @@ describe('ClientService connection-delay processing metadata', () => {
       validFromTime: zeroTime + 990_500,
       validToSlot: zeroSlot + 1600,
       validToTime: zeroTime + 1_600_999,
+      slotConfig: Lucid.SLOT_CONFIG_NETWORK.Preprod,
     });
 
     const result = await (service as any).computeTxValidityWindow(9500);
@@ -156,6 +178,10 @@ describe('ClientService connection-delay processing metadata', () => {
     expect([...output.state.processedTimes.values()]).toEqual([validToNs]);
     expect([...output.state.processedHeights.values()]).toEqual([validToNs / 4_000_000_000n]);
     expect([...output.state.consensusStates.values()][0].timestamp).toBe(validFromNs);
+    const hostOutput = await decodeHostStateDatum(lucid.createUnsignedCreateClientTransaction.mock.calls[0][4], Lucid);
+    const hostInput = await lucid.decodeDatum();
+    expect(hostOutput.control).toEqual({ ...hostInput.control, live_clients: 1n });
+    expect(hostOutput.state.next_client_sequence).toBe(1n);
   });
 
   it('passes the creation transaction upper bound into datum construction', async () => {
@@ -180,7 +206,7 @@ describe('ClientService connection-delay processing metadata', () => {
     expect(builder.validTo).toHaveBeenCalledWith(validToMs);
   });
 
-  it('records the update upper bound and retains history using the lower bound', async () => {
+  it('records the update upper bound in the singleton live checkpoint', async () => {
     const input = initialDatum();
     const { service, lucid } = await context(input);
     const header = initializeHeader(headerMockBuilder.build());
@@ -202,8 +228,75 @@ describe('ClientService connection-delay processing metadata', () => {
 
     const cbor = lucid.createUnsignedUpdateClientTransaction.mock.calls[0][5];
     const output = await decodeClientDatum(cbor, Lucid);
-    expect([...output.state.consensusStates.keys()]).toEqual([height(3n), height(2n), height(1n)]);
-    expect([...output.state.processedTimes.values()]).toEqual([validToNs, 101n, 99n]);
-    expect([...output.state.processedHeights.values()]).toEqual([validToNs / 4_000_000_000n, 11n, 9n]);
+    expect([...output.state.consensusStates.keys()]).toEqual([height(3n)]);
+    expect([...output.state.processedTimes.values()]).toEqual([validToNs]);
+    expect([...output.state.processedHeights.values()]).toEqual([validToNs / 4_000_000_000n]);
+    expect(output.history_root).toBe('66'.repeat(32));
+    const hostOutput = await decodeHostStateDatum(lucid.createUnsignedUpdateClientTransaction.mock.calls[0][4], Lucid);
+    const hostInput = await lucid.decodeDatum();
+    expect(hostOutput.control).toEqual(hostInput.control);
   });
+
+  it.each([1, 2])(
+    'freezes with %i completed sessions without rewriting retained history or delay metadata',
+    async (count) => {
+      const input = initialDatum();
+      const { service, lucid } = await context(input);
+      const clientUtxo = { txHash: '01'.repeat(32), outputIndex: 0 } as Lucid.UTxO;
+      lucid.queryLedgerStateUtxosAtAddresses = jest
+        .fn()
+        .mockResolvedValue([{ txHash: '00'.repeat(32), outputIndex: 0 }, clientUtxo]);
+      lucid.createUnsignedFinalizeTendermintSessionTransaction = jest.fn().mockReturnValue({});
+      const sessions = Array.from({ length: count }, (_, index) => ({
+        utxo: { txHash: '02'.repeat(32), outputIndex: index },
+        datum: { sessionToken: { policyId: 'ab'.repeat(28), name: `0${index + 1}` } },
+        tokenUnit: 'ab'.repeat(28) + `0${index + 1}`,
+        signerKeyHash: 'cd'.repeat(28),
+        processedTimeNs: validToNs,
+      }));
+      await service.buildUnsignedUpdateOnMisbehaviour(
+        {
+          clientId: '0',
+          constructedAddress: 'addr_test1signer',
+          clientDatum: input,
+          currentClientUtxo: clientUtxo,
+          clientTokenUnit: input.token.policyId + input.token.name,
+          // The final transaction only consumes authenticated receipts, not message signatures.
+          clientMessage: { type_url: '/ibc.lightclients.tendermint.v1.Misbehaviour', value: new Uint8Array() },
+        },
+        sessions as any,
+      );
+      const args = lucid.createUnsignedFinalizeTendermintSessionTransaction.mock.calls[0];
+      const output = await decodeClientDatum(args[8], Lucid);
+      const hostOutput = await decodeHostStateDatum(args[7], Lucid);
+      const hostInput = await lucid.decodeDatum();
+      expect(hostOutput.control).toEqual(hostInput.control);
+      expect(output).toEqual({
+        ...input,
+        state: { ...input.state, clientState: { ...input.state.clientState, frozenHeight: height(1n) } },
+      });
+      expect(decodeSpendMultitxClientRedeemer(args[3], Lucid)).toEqual(
+        count === 1
+          ? {
+              FinalizeUpdate: {
+                sessionToken: sessions[0].datum.sessionToken,
+                historyWitnesses: [],
+                historySiblings: [],
+              },
+            }
+          : {
+              FinalizeMisbehaviour: {
+                sessionToken1: sessions[0].datum.sessionToken,
+                sessionToken2: sessions[1].datum.sessionToken,
+                historyWitnesses: [],
+              },
+            },
+      );
+      expect(decodeMintSessionRedeemer(args[6], Lucid)).toEqual(
+        count === 1 ? { BurnSession: { tokenName: '01' } } : { BurnSessions: { tokenNames: ['01', '02'] } },
+      );
+      expect(args[13]).toEqual(sessions.slice(1));
+      expect(lucid.createUnsignedUpdateClientTransaction).not.toHaveBeenCalled();
+    },
+  );
 });

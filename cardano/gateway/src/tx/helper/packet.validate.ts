@@ -1,9 +1,4 @@
-import { GrpcFailedPreconditionException, GrpcInvalidArgumentException } from '~@/exception/grpc_exceptions';
-import { CHANNEL_ID_PREFIX } from 'src/constant';
-import { decodeMerkleProof } from './helper';
-import { MerkleProof } from '@cardano-ibc/proto-types/build/ibc/core/commitment/v1/commitment';
-import { convertString2Hex, toHex } from '@shared/helpers/hex';
-import { initializeMerkleProof } from '@shared/helpers/merkle-proof';
+import { MsgPrunePacketHistory } from '@cardano-ibc/proto-types/build/ibc/cardano/v1/tx';
 import {
   MsgAcknowledgement,
   MsgRecvPacket,
@@ -11,7 +6,16 @@ import {
   MsgTimeoutOnClose,
   MsgTransfer,
 } from '@cardano-ibc/proto-types/build/ibc/core/channel/v1/tx';
-import { FungibleTokenPacketDatum } from '@shared/types/apps/transfer/types/fungible-token-packet-data';
+import { MerkleProof } from '@cardano-ibc/proto-types/build/ibc/core/commitment/v1/commitment';
+import { MAX_PACKET_ENTRIES_PER_CHANNEL } from '@cardano-ibc/tx-builder';
+import { getAddressDetails } from '@lucid-evolution/lucid';
+import { convertString2Hex, toHex } from '@shared/helpers/hex';
+import { initializeMerkleProof } from '@shared/helpers/merkle-proof';
+import { isSupportedGatewayPortId } from '@shared/helpers/module-port';
+import { ChannelDatum } from '@shared/types/channel/channel-datum';
+import { Order } from '@shared/types/channel/order';
+import { CHANNEL_ID_PREFIX } from 'src/constant';
+import { GrpcFailedPreconditionException, GrpcInvalidArgumentException } from '~@/exception/grpc_exceptions';
 import {
   AckPacketOperator,
   PrunePacketHistoryOperator,
@@ -20,13 +24,8 @@ import {
   TimeoutOnClosePacketOperator,
   TimeoutPacketOperator,
 } from '../dto';
-import { MsgPrunePacketHistory } from '@cardano-ibc/proto-types/build/ibc/cardano/v1/tx';
-import { isSupportedGatewayPortId } from '@shared/helpers/module-port';
-import { ChannelDatum } from '@shared/types/channel/channel-datum';
-import { Order } from '@shared/types/channel/order';
-import { MAX_PACKET_ENTRIES_PER_CHANNEL } from '@cardano-ibc/tx-builder';
-import { ICS20_PACKET_CODEC, type Ics20PacketCodec } from '../../config/bridge-manifest';
-import { decodeIcs20PacketDataForCodec } from '../../shared/helpers/ics20-packet-codec';
+import { decodeMerkleProof } from './helper';
+
 
 function packetCapacityExhausted(channelDatum: ChannelDatum): GrpcFailedPreconditionException {
   return new GrpcFailedPreconditionException(
@@ -115,6 +114,9 @@ export function validateAndFormatPrunePacketHistoryParams(
   if (!data.port_id) {
     throw new GrpcInvalidArgumentException('Invalid argument: "port_id" is required');
   }
+  if (data.port_id === 'transfer') {
+    throw new GrpcFailedPreconditionException('ICS-20 packet history is retained permanently and cannot be pruned');
+  }
   if (!data.channel_id?.startsWith(`${CHANNEL_ID_PREFIX}-`)) {
     throw new GrpcInvalidArgumentException(
       `Invalid argument: "channel_id". Please use the prefix "${CHANNEL_ID_PREFIX}-"`,
@@ -189,7 +191,7 @@ export function validateAndFormatSendPacketParams(data: MsgTransfer): SendPacket
       denom: tokenDenom,
       amount: tokenAmount,
     },
-    sender: data.sender,
+    sender: senderPaymentKeyHash(data.sender),
     receiver: data.receiver,
     signer: data.signer,
     timeoutHeight: {
@@ -202,9 +204,28 @@ export function validateAndFormatSendPacketParams(data: MsgTransfer): SendPacket
   return sendPacketOperator;
 }
 
+function senderPaymentKeyHash(sender: string): string {
+  const normalized = sender.trim();
+  if (/^[0-9a-f]{56}$/i.test(normalized)) {
+    return normalized.toLowerCase();
+  }
+
+  try {
+    const credential = getAddressDetails(normalized).paymentCredential;
+    if (credential?.type === 'Key' && /^[0-9a-f]{56}$/i.test(credential.hash)) {
+      return credential.hash.toLowerCase();
+    }
+  } catch {
+    // Reject malformed addresses at the request boundary, before building a transaction.
+  }
+
+  throw new GrpcInvalidArgumentException(
+    'Invalid argument: "sender" must be a Cardano payment key hash or key address',
+  );
+}
+
 export function validateAndFormatTimeoutPacketParams(
   data: MsgTimeout,
-  ics20PacketCodec: Ics20PacketCodec = ICS20_PACKET_CODEC.STRICT,
 ): {
   constructedAddress: string;
   timeoutPacketOperator: TimeoutPacketOperator;
@@ -217,17 +238,9 @@ export function validateAndFormatTimeoutPacketParams(
     throw new GrpcInvalidArgumentException(
       `Invalid argument: "channel_id". Please use the prefix "${CHANNEL_ID_PREFIX}-"`,
     );
-  let fungibleTokenPacketData: FungibleTokenPacketDatum;
-  try {
-    fungibleTokenPacketData = decodeIcs20PacketDataForCodec(data.packet.data, ics20PacketCodec).data;
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    throw new GrpcInvalidArgumentException(`Invalid ICS-20 packet data: ${message}`);
-  }
   const decodedProofUnreceived: MerkleProof = decodeMerkleProof(data.proof_unreceived);
   // Prepare the timeoutPacketOperator object
   const timeoutPacketOperator: TimeoutPacketOperator = {
-    fungibleTokenPacketData: fungibleTokenPacketData,
     proofUnreceived: initializeMerkleProof(decodedProofUnreceived),
     proofHeight: {
       revisionHeight: BigInt(data.proof_height?.revision_height || 0n),
@@ -253,12 +266,11 @@ export function validateAndFormatTimeoutPacketParams(
 
 export function validateAndFormatTimeoutOnClosePacketParams(
   data: MsgTimeoutOnClose,
-  ics20PacketCodec: Ics20PacketCodec = ICS20_PACKET_CODEC.STRICT,
 ): {
   constructedAddress: string;
   timeoutOnClosePacketOperator: TimeoutOnClosePacketOperator;
 } {
-  const { constructedAddress, timeoutPacketOperator } = validateAndFormatTimeoutPacketParams(data, ics20PacketCodec);
+  const { constructedAddress, timeoutPacketOperator } = validateAndFormatTimeoutPacketParams(data);
   const decodedProofClose: MerkleProof = decodeMerkleProof(data.proof_close);
 
   return {
@@ -266,6 +278,7 @@ export function validateAndFormatTimeoutOnClosePacketParams(
     timeoutOnClosePacketOperator: {
       ...timeoutPacketOperator,
       proofClose: initializeMerkleProof(decodedProofClose),
+      counterpartyUpgradeSequence: BigInt(data.counterparty_upgrade_sequence ?? 0n),
     },
   };
 }

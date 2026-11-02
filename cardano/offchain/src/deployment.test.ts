@@ -1,27 +1,38 @@
+import {
+  DEPLOYMENT_PLAN_FIXTURE,
+  loadDeploymentPlan,
+} from "./deployment-plan.ts";
 import { assertEquals, assertNotEquals } from "@std/assert";
 import {
   Data,
   fromText,
   type LucidEvolution,
   type Script,
+  type UTxO,
 } from "@lucid-evolution/lucid";
 import blueprint from "../../onchain/plutus.json" with { type: "json" };
+import { Buffer } from "node:buffer";
+import collisionFixture from "../../../tests/ibc-state-commitment/collision-buckets.json" with {
+  type: "json",
+};
+import {
+  type BucketEntry,
+  bucketHash,
+  hash,
+  keyHash,
+  sortBucket,
+} from "../../../packages/cardano-ibc-tx-builder-runtime/src/ibcStateCommitment.ts";
 
 import {
-  buildChannelValidators,
   buildReferenceValidatorBatches,
   buildReferenceValidatorSizeReport,
   DeploymentIbcTree,
   GENERIC_MODULE_SPEND_VALIDATOR_TITLE,
-  loadHostStateValidator,
-  loadTransferModuleValidator,
+  loadStagedTendermintValidators,
+  selectDeploymentCollateralHoldback,
   sortPortRegistrations,
 } from "./deployment.ts";
-import {
-  generateIdentifierTokenName,
-  generatePortTokenName,
-  readValidator,
-} from "./utils.ts";
+import { generatePortTokenName, readValidator } from "./utils.ts";
 
 const makeValidator = (byteLength: number): Script => ({
   type: "PlutusV3",
@@ -29,6 +40,23 @@ const makeValidator = (byteLength: number): Script => ({
 });
 
 const EMPTY_HASH = "00".repeat(32);
+
+Deno.test("deployment collateral preserves the large funding UTxO", () => {
+  const utxo = (txHash: string, lovelace: bigint): UTxO =>
+    ({
+      txHash,
+      outputIndex: 0,
+      assets: { lovelace },
+      address: "addr_test1collateral",
+    }) as UTxO;
+  const selected = selectDeploymentCollateralHoldback([
+    utxo("large", 29_000_000_000n),
+    utxo("collateral", 6_000_000n),
+    utxo("small", 2_000_000n),
+  ]);
+
+  assertEquals(selected.map(({ txHash }) => txHash), ["collateral"]);
+});
 
 Deno.test("generatePortTokenName matches the cross-language transfer vector", () => {
   assertEquals(
@@ -52,19 +80,18 @@ Deno.test("generic module deployments pin the spend handler from the blueprint",
   );
 });
 
-Deno.test("every deployed channel operation is a mint-only policy", () => {
+Deno.test("every deployed channel operation is a mint-only policy", async () => {
   const lucid = {
     config: () => ({ network: "Preview" }),
   } as unknown as LucidEvolution;
-  const { referredScripts } = buildChannelValidators(
+  const { spendingChannel: { referredScripts } } = await loadDeploymentPlan(
     lucid,
-    "11".repeat(28),
-    "22".repeat(28),
-    "33".repeat(28),
-    "44".repeat(28),
-    "55".repeat(28),
+    {
+      ...DEPLOYMENT_PLAN_FIXTURE,
+      benchmarkVoucherEnabled: false,
+    },
   );
-  assertEquals(Object.keys(referredScripts).length, 9);
+  assertEquals(Object.keys(referredScripts).length, 12);
   for (const name of Object.keys(referredScripts)) {
     const prefix = `spending_channel/${name}.${name}`;
     assertEquals(
@@ -77,7 +104,22 @@ Deno.test("every deployed channel operation is a mint-only policy", () => {
   }
 });
 
-Deno.test("client deployment pins the recovery withdrawal validator", () => {
+Deno.test("chan_close_confirm is a mint-only policy in the compiled blueprint", () => {
+  assertEquals(
+    blueprint.validators
+      .map(({ title }) => title)
+      .filter((title) =>
+        title.startsWith("spending_channel/chan_close_confirm.")
+      )
+      .sort(),
+    [
+      "spending_channel/chan_close_confirm.chan_close_confirm.else",
+      "spending_channel/chan_close_confirm.chan_close_confirm.mint",
+    ],
+  );
+});
+
+Deno.test("legacy client validator pins the recovery withdrawal validator", () => {
   const recoveryValidator = blueprint.validators.find(
     ({ title }) => title === "recover_client.recover_client.withdraw",
   ) as { title: string; parameters?: Array<{ title: string }> } | undefined;
@@ -87,7 +129,7 @@ Deno.test("client deployment pins the recovery withdrawal validator", () => {
 
   assertEquals(
     recoveryValidator?.parameters?.map(({ title }) => title) ?? [],
-    ["host_state_nft_policy_id"],
+    ["host_state_nft_policy_id", "upgrade_proof_policy"],
   );
   assertEquals(
     spendClientValidator?.parameters?.map(({ title }) => title) ?? [],
@@ -104,17 +146,18 @@ Deno.test("HostState deployment pins the state-token minting policies", () => {
     hostStateValidator?.parameters?.map(({ title }) => title) ?? [],
     [
       "nft_policy",
-      "spend_client_script_hash",
+      "client_registry",
       "spend_connection_script_hash",
       "spend_channel_script_hash",
       "client_policy_id",
       "connection_policy_id",
       "channel_policy_id",
+      "backup_operator",
     ],
   );
 });
 
-Deno.test("applied client validator fits a mainnet reference-script transaction", () => {
+Deno.test("applied legacy client validator fits a mainnet reference-script transaction", () => {
   const lucid = {
     config: () => ({ network: "Preview" }),
   } as unknown as LucidEvolution;
@@ -122,8 +165,8 @@ Deno.test("applied client validator fits a mainnet reference-script transaction"
   const [recoveryValidator, recoveryScriptHash] = readValidator(
     "recover_client.recover_client.withdraw",
     lucid,
-    [hostPolicy],
-    Data.Tuple([Data.Bytes()]) as unknown as [string],
+    [hostPolicy, "22".repeat(28)],
+    Data.Tuple([Data.Bytes(), Data.Bytes()]) as unknown as [string, string],
   );
   const [spendClientValidator, spendClientScriptHash] = readValidator(
     "spending_client.spend_client.spend",
@@ -145,50 +188,70 @@ Deno.test("applied client validator fits a mainnet reference-script transaction"
     ({ scriptHash }) => scriptHash === spendClientScriptHash,
   );
 
-  assertEquals(spendClientReport?.oversized, false);
+  assertEquals(spendClientReport?.exceedsEstimatedSingleTxBudget, false);
 });
 
-Deno.test("fully applied production HostState fits the reference publication guard", () => {
+Deno.test("fully applied production HostState with backup fits the reference publication guard", async () => {
   const lucid = {
     config: () => ({ network: "Preview" }),
   } as unknown as LucidEvolution;
-  const [validator] = loadHostStateValidator(
-    lucid,
-    "11".repeat(28),
-    "22".repeat(28),
-    "33".repeat(28),
-    "44".repeat(28),
-    "55".repeat(28),
-    "66".repeat(28),
-    "77".repeat(28),
+  const plan = await loadDeploymentPlan(lucid, {
+    ...DEPLOYMENT_PLAN_FIXTURE,
+    backupOperatorKeyHash: "55".repeat(28),
+    benchmarkVoucherEnabled: false,
+  });
+  const [report] = buildReferenceValidatorSizeReport(
+    [plan.hostState.script],
+    16_384 - 75,
   );
-  const [report] = buildReferenceValidatorSizeReport([validator], 16_384);
-  assertEquals(report.oversized, false, JSON.stringify(report));
+  // As with the staged client, the signed publication test is the ledger gate;
+  // the conservative batching estimate can overstate a dedicated publication.
+  assertEquals(
+    report.intrinsicallyOversized,
+    false,
+    JSON.stringify(report),
+  );
 });
 
 Deno.test("fully applied production transfer module fits the reference publication guard", async () => {
   const lucid = {
     config: () => ({ network: "Preview" }),
   } as unknown as LucidEvolution;
-  const portId = fromText("transfer");
-  const [validator] = loadTransferModuleValidator(
+  const plan = await loadDeploymentPlan(
     lucid,
-    { policy_id: "11".repeat(28), name: generatePortTokenName(portId) },
     {
-      policy_id: "22".repeat(28),
-      name: await generateIdentifierTokenName({
-        transaction_id: "aa".repeat(32),
-        output_index: 0n,
-      }),
+      ...DEPLOYMENT_PLAN_FIXTURE,
+      benchmarkVoucherEnabled: false,
     },
-    portId,
-    "33".repeat(28),
-    "44".repeat(28),
-    "55".repeat(28),
-    "66".repeat(28),
   );
-  const [report] = buildReferenceValidatorSizeReport([validator], 16_384);
-  assertEquals(report.oversized, false, JSON.stringify(report));
+  const [report] = buildReferenceValidatorSizeReport(
+    [plan.spendTransferModule.script],
+    16_384,
+  );
+  assertEquals(
+    report.exceedsEstimatedSingleTxBudget,
+    false,
+    JSON.stringify(report),
+  );
+});
+
+Deno.test("fully applied multitx client reserves 200 bytes for its signed publication", async () => {
+  const lucid = {
+    config: () => ({ network: "Preview" }),
+  } as unknown as LucidEvolution;
+  const plan = await loadDeploymentPlan(lucid, {
+    ...DEPLOYMENT_PLAN_FIXTURE,
+    benchmarkVoucherEnabled: false,
+  });
+  // Check script bytes with room for transaction overhead. Conservative size
+  // estimates are advisory; signed production publications are the ledger gate.
+  // The transaction suite separately signs and submits the production builder's
+  // reference publication to an emulator with the real 16,384-byte limit.
+  const [report] = buildReferenceValidatorSizeReport(
+    [plan.spendClient.script],
+    16_384 - 200,
+  );
+  assertEquals(report.intrinsicallyOversized, false, JSON.stringify(report));
 });
 
 Deno.test("mock and icq share the host-policy-bound generic module hash", () => {
@@ -218,6 +281,84 @@ Deno.test("mock and icq share the host-policy-bound generic module hash", () => 
 
   assertEquals(mockHash, icqHash);
   assertNotEquals(mockHash, otherHostHash);
+});
+
+Deno.test("staged Tendermint validators preserve their hash dependencies", () => {
+  const lucid = {
+    config: () => ({ network: "Preview" }),
+  } as unknown as LucidEvolution;
+  const hostPolicy = "11".repeat(28);
+  const recoveryScriptHash = "33".repeat(28);
+  const staged = loadStagedTendermintValidators(
+    lucid,
+    hostPolicy,
+    recoveryScriptHash,
+  );
+
+  const [, expectedSessionMintPolicyId] = readValidator(
+    "minting_tendermint_update_session.mint_tendermint_update_session.mint",
+    lucid,
+    [staged.sessionSpend.scriptHash],
+    Data.Tuple([Data.Bytes()]) as unknown as [string],
+  );
+  const [, expectedClientSpendScriptHash] = readValidator(
+    "spending_multitx_client.spend_multitx_client.spend",
+    lucid,
+    [hostPolicy, staged.updateClient.scriptHash, {
+      Script: [recoveryScriptHash],
+    }],
+    Data.Tuple([
+      Data.Bytes(),
+      Data.Bytes(),
+      Data.Enum([
+        Data.Object({ VerificationKey: Data.Tuple([Data.Bytes()]) }),
+        Data.Object({ Script: Data.Tuple([Data.Bytes()]) }),
+      ]),
+    ]) as unknown as [string, string, { Script: [string] }],
+  );
+
+  assertEquals(staged.sessionMint.policyId, expectedSessionMintPolicyId);
+  assertEquals(staged.clientSpend.scriptHash, expectedClientSpendScriptHash);
+
+  const otherHost = loadStagedTendermintValidators(
+    lucid,
+    "22".repeat(28),
+    recoveryScriptHash,
+  );
+  assertNotEquals(
+    staged.sessionSpend.scriptHash,
+    otherHost.sessionSpend.scriptHash,
+  );
+  assertNotEquals(staged.sessionMint.policyId, otherHost.sessionMint.policyId);
+  assertNotEquals(
+    staged.clientSpend.scriptHash,
+    otherHost.clientSpend.scriptHash,
+  );
+  const otherRecovery = loadStagedTendermintValidators(
+    lucid,
+    hostPolicy,
+    "44".repeat(28),
+  );
+  assertEquals(
+    staged.sessionSpend.scriptHash,
+    otherRecovery.sessionSpend.scriptHash,
+  );
+  assertEquals(staged.sessionMint.policyId, otherRecovery.sessionMint.policyId);
+  assertNotEquals(
+    staged.clientSpend.scriptHash,
+    otherRecovery.clientSpend.scriptHash,
+  );
+  assertEquals(
+    buildReferenceValidatorSizeReport(
+      [
+        staged.sessionSpend.validator,
+        staged.sessionMint.validator,
+        staged.clientSpend.validator,
+      ],
+      16_384,
+    ).map(({ intrinsicallyOversized }) => intrinsicallyOversized),
+    [false, false, false],
+  );
 });
 
 Deno.test("sortPortRegistrations uses canonical bytes-key ordering", () => {
@@ -344,8 +485,8 @@ Deno.test("buildReferenceValidatorSizeReport allows single validators that excee
   assertEquals(report[0].index, 0);
   assertEquals(report[0].scriptBytes, 1_200);
   assertEquals(report[0].estimatedReferenceOutputBytes, 1_400);
-  assertEquals(report[0].oversized, false);
-  assertEquals(report[1].oversized, false);
+  assertEquals(report[0].exceedsEstimatedSingleTxBudget, false);
+  assertEquals(report[1].exceedsEstimatedSingleTxBudget, false);
 });
 
 Deno.test("buildReferenceValidatorSizeReport flags validators that cannot fit alone", () => {
@@ -359,8 +500,8 @@ Deno.test("buildReferenceValidatorSizeReport flags validators that cannot fit al
   assertEquals(report[0].index, 0);
   assertEquals(report[0].scriptBytes, 5_000);
   assertEquals(report[0].estimatedReferenceOutputBytes, 5_200);
-  assertEquals(report[0].oversized, true);
-  assertEquals(report[1].oversized, false);
+  assertEquals(report[0].exceedsEstimatedSingleTxBudget, true);
+  assertEquals(report[1].exceedsEstimatedSingleTxBudget, false);
 });
 
 Deno.test("DeploymentIbcTree commits leaves with key hash included", async () => {
@@ -373,4 +514,59 @@ Deno.test("DeploymentIbcTree commits leaves with key hash included", async () =>
   tree.set(key, value);
 
   assertEquals(await tree.getRoot(), await expectedSingleLeafRoot(key, value));
+});
+
+Deno.test("collateral holdback keeps the main deployment funding output spendable", () => {
+  const utxos = [99_176_454_853n, 5_158_925n, 5_936_517n, 2_358_421n].map((
+    lovelace,
+    outputIndex,
+  ) => ({
+    txHash: "11".repeat(32),
+    outputIndex,
+    address: "test",
+    assets: { lovelace },
+  } as UTxO));
+  assertEquals(selectDeploymentCollateralHoldback(utxos), [utxos[1]]);
+});
+
+Deno.test("deployment collision witnesses and incremental removal preserve the other key", async () => {
+  const populated = collisionFixture.vectors.find((v) =>
+    v.name === "insert_collision"
+  )!;
+  const missing = collisionFixture.vectors.find((v) =>
+    v.name === "missing_in_singleton"
+  )!;
+  const tree = new DeploymentIbcTree();
+  tree.set("ports/transfer", "d8799f01ff");
+  tree.set(populated.key, populated.committed);
+  await tree.getRoot();
+
+  // Simulate a peer digest sharing the route. All hashing and the requested
+  // key remain native, as in the Gateway/Go/Aiken collision vectors.
+  const digest = keyHash(populated.key);
+  const index = digest.readBigUInt64BE();
+  const cache = tree as unknown as {
+    leaves: Map<string, string>;
+    buckets: Map<bigint, BucketEntry[]>;
+    nodesByHeight: Array<Map<bigint, string>>;
+    root: string;
+  };
+  cache.leaves.set("synthetic-collision-peer-0", "aabb");
+  const entries = sortBucket([
+    {
+      keyHash: digest,
+      valueHash: hash(Buffer.from(populated.committed, "hex")),
+    },
+    {
+      keyHash: Buffer.from(collisionFixture.syntheticPeerDigests[0], "hex"),
+      valueHash: hash(Buffer.from("aabb", "hex")),
+    },
+  ]);
+  cache.buckets.set(index, entries);
+  cache.nodesByHeight[0].set(index, bucketHash(entries).toString("hex"));
+  cache.root = populated.root;
+  assertEquals(await tree.getSiblings(populated.key), populated.siblings);
+  await tree.remove(populated.key);
+  assertEquals(await tree.getRoot(), missing.root);
+  assertEquals(await tree.getSiblings(populated.key), missing.siblings);
 });
