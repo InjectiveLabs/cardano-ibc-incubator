@@ -15,6 +15,8 @@ import {
   fromText,
   getAddressDetails,
   type LucidEvolution,
+  toScriptRef,
+  toText,
   type TxSigned,
   type UTxO,
   validatorToScriptHash,
@@ -50,6 +52,102 @@ const scriptFailureMessage = Deno.env.get("PACKET_LANE_NODE_URL")
   ? "validator"
   : "failed script execution";
 
+function assertCompactLaneUpdate(lane: Constr<Data>) {
+  for (const update of lane.fields[1] as Constr<Data>[]) {
+    for (const siblings of update.fields[1] as string[][]) {
+      const path = siblings.length === 65 ? siblings.slice(1) : siblings;
+      assertEquals(path.length, 64);
+      assert(path.includes(""));
+      assert(!path.includes("00".repeat(32)));
+      assert(path.every((sibling) => sibling === "" || sibling.length === 64));
+    }
+  }
+}
+
+async function checkAcknowledgementPolicies(
+  f: Awaited<ReturnType<typeof packetLaneFixture>>,
+  lucid: LucidEvolution,
+  signed: TxSigned,
+) {
+  const transaction = signed.toTransaction();
+  const mint = transaction.body().mint()!;
+  const policies = Array.from(
+    { length: mint.keys().len() },
+    (_, i) => mint.keys().get(i).to_hex(),
+  );
+  assertEquals(
+    policies.sort(),
+    [
+      f.deployment.batchPolicy,
+      f.deployment.operations.acknowledge.policy,
+      (f.deployment.membershipVerifier ?? f.deployment.proofVerifier).policy,
+    ].sort(),
+  );
+  const references = await resolveInputs(
+    lucid,
+    transaction.body().reference_inputs(),
+  );
+  assert(
+    !references.some((input) =>
+      input.txHash === f.deployment.operations.funds.reference.txHash &&
+      input.outputIndex === f.deployment.operations.funds.reference.outputIndex
+    ),
+  );
+  const units = CML.compute_total_ex_units(
+    transaction.witness_set().redeemers()!,
+  );
+  console.log(
+    "acknowledgement-cost " + JSON.stringify({
+      fee: transaction.body().fee().toString(),
+      bytes: signed.toCBOR().length / 2,
+      referencedScriptBytes: references.reduce(
+        (total, input) =>
+          total +
+          (input.scriptRef
+            ? toScriptRef(input.scriptRef).as_plutus_v3()!.to_raw_bytes().length
+            : 0),
+        0,
+      ),
+      memory: units.mem().toString(),
+      cpu: units.steps().toString(),
+    }),
+  );
+  // Evaluate the compiled scripts directly so an unbalanced token mutation
+  // cannot pass this regression merely by failing the ledger's value check.
+  for (
+    const entries of [
+      [["acknowledge", 2n]],
+      [["acknowledge", -1n]],
+      [["receive", 1n]],
+      [["acknowledge", 1n], ["extra", 1n]],
+    ] as [string, bigint][][]
+  ) {
+    const invalid = signed.toTransaction();
+    const body = invalid.body();
+    const mint = body.mint()!;
+    const assets = CML.MapAssetNameToNonZeroInt64.new();
+    for (const [name, quantity] of entries) {
+      assets.insert(CML.AssetName.from_hex(fromText(name)), quantity);
+    }
+    mint.insert_assets(
+      CML.ScriptHash.from_hex(f.deployment.batchPolicy),
+      assets,
+    );
+    body.set_mint(mint);
+    const cbor = CML.Transaction.new(
+      body,
+      invalid.witness_set(),
+      true,
+      invalid.auxiliary_data(),
+    ).to_cbor_hex();
+    await assertRejects(
+      () => f.emulator.evaluateTx(cbor),
+      Error,
+      scriptFailureMessage,
+    );
+  }
+}
+
 async function resolveInputs(
   lucid: LucidEvolution,
   inputs: CML.TransactionInputList | undefined,
@@ -71,8 +169,54 @@ async function resolveInputs(
 async function signMeasured(...args: Parameters<typeof signFixtureMeasured>) {
   const signed = await signFixtureMeasured(...args);
   const lucid = args[0], body = signed.toTransaction().body();
+  const redeemers = signed.toTransaction().witness_set().redeemers()!
+    .to_flat_format();
+  for (let i = 0; i < redeemers.len(); i++) {
+    const redeemer = redeemers.get(i);
+    const data = Data.from(redeemer.data().to_cbor_hex()) as Constr<Data>;
+    if (redeemer.tag() !== CML.RedeemerTag.Mint || data.fields?.length !== 3) {
+      continue;
+    }
+    const operation = data.fields[1] as Constr<Data>;
+    const packets = operation.index === 0
+      ? operation.fields[2] as Constr<Data>[]
+      : operation.index === 9
+      ? (operation.fields[0] as Constr<Data>[]).map((op) =>
+        op.fields[0] as Constr<Data>
+      )
+      : [1, 2, 5, 6, 7].includes(operation.index)
+      ? [operation.fields[0] as Constr<Data>]
+      : [];
+    for (const packet of packets) {
+      assertSinglePayloadCopy(signed, packet, "packet");
+    }
+  }
+  const units = CML.compute_total_ex_units(
+    signed.toTransaction().witness_set().redeemers()!,
+  );
+  const inputs = await resolveInputs(lucid, body.inputs());
+  const references = await resolveInputs(lucid, body.reference_inputs());
+  const scriptBytes = (utxos: UTxO[]) =>
+    utxos.reduce(
+      (sum, input) =>
+        sum + (input.scriptRef
+          ? toScriptRef(input.scriptRef).as_plutus_v3()!.to_raw_bytes().length
+          : 0),
+      0,
+    );
+  console.log(JSON.stringify({
+    profile: args[2],
+    totalReferencedScriptBytes: scriptBytes([...inputs, ...references]),
+    spentInputScriptBytes: scriptBytes(inputs),
+    referenceInputCount: references.length,
+    referenceScriptCount: references.filter((input) => input.scriptRef).length,
+    signedBytes: signed.toCBOR().length / 2,
+    feeLovelace: body.fee().toString(),
+    memory: units.mem().toString(),
+    cpu: units.steps().toString(),
+  }));
   const required = new Set<string>();
-  for (const input of await resolveInputs(lucid, body.inputs())) {
+  for (const input of inputs) {
     const credential = getAddressDetails(input.address).paymentCredential;
     if (credential?.type === "Script") required.add(credential.hash);
   }
@@ -80,7 +224,7 @@ async function signMeasured(...args: Parameters<typeof signFixtureMeasured>) {
   for (let i = 0; mint && i < mint.len(); i++) {
     required.add(mint.get(i).to_hex());
   }
-  for (const reference of await resolveInputs(lucid, body.reference_inputs())) {
+  for (const reference of references) {
     if (
       !reference.scriptRef ||
       Object.entries(reference.assets).some(([unit, amount]) =>
@@ -209,6 +353,9 @@ Deno.test("native ADA send and acknowledgement omit unused references with recon
       f.emulator.now(),
       f.emulator.now() + 60_000,
     );
+    for (const lane of batch.operation.fields[3] as Constr<Data>[]) {
+      assertCompactLaneUpdate(lane);
+    }
     if (control) batch.tx.readFrom(extra);
     const sent = await submitReconciled(
       f,
@@ -230,17 +377,21 @@ Deno.test("native ADA send and acknowledgement omit unused references with recon
       f.emulator.now() + 60_000,
     );
     if (control) ack.tx.readFrom(extra);
-    const acknowledged = await submitReconciled(
-      f,
+    const signedAck = await sign(
       wallet,
-      await sign(
-        wallet,
-        ack.tx,
-        control
-          ? "full-reference acknowledgement"
-          : "minimal-reference acknowledgement",
-      ),
+      ack.tx,
+      control
+        ? "full-reference acknowledgement"
+        : "minimal-reference acknowledgement",
     );
+    changeMintRedeemer(signedAck.toTransaction(), (operation) => {
+      assertCompactLaneUpdate(operation.fields[3] as Constr<Data>);
+    });
+    if (!control) {
+      await checkAcknowledgementPolicies(f, wallet, signedAck);
+      await rejectInvalidPacketReferences(f, signedAck, 3);
+    }
+    const acknowledged = await submitReconciled(f, wallet, signedAck);
     return {
       sent,
       acknowledged,
@@ -352,11 +503,16 @@ Deno.test("forty receives on one lane retain bounded live state and rebuild dela
       f.emulator.now(),
       f.emulator.now() + 60_000,
     );
-    await submitReconciled(
-      f,
+    const signed = await signMeasured(
       wallet,
-      await signMeasured(wallet, receive.tx, `history receive ${sequence}`),
+      receive.tx,
+      `history receive ${sequence}`,
     );
+    changeMintRedeemer(signed.toTransaction(), (operation) => {
+      assertCompactLaneUpdate(operation.fields[4] as Constr<Data>);
+    });
+    if (sequence === 1n) await rejectInvalidPacketReferences(f, signed, 4);
+    await submitReconciled(f, wallet, signed);
     const unit = Object.keys(receive.input.assets).find((unit) =>
       unit.startsWith(f.deployment.statePolicy)
     )!;
@@ -608,11 +764,28 @@ Deno.test("two ready acknowledgements share fees with reconciled balances and ex
     f.emulator.now(),
     f.emulator.now() + 60_000,
   );
-  await submitReconciled(
-    f,
+  const sourceSend = await signMeasured(
     wallet,
-    await signMeasured(wallet, sent.tx, "ready acknowledgement source send"),
+    sent.tx,
+    "ready acknowledgement source send",
   );
+  const wrongLane = changeMintRedeemer(
+    sourceSend.toTransaction(),
+    (operation) => {
+      const lanes = operation.fields[3] as Constr<Data>[];
+      assertEquals(lanes.length, 2);
+      for (const lane of lanes) {
+        const update = (lane.fields[1] as Constr<Data>[])[0];
+        update.fields[0] = 1n - (update.fields[0] as bigint);
+      }
+    },
+  );
+  await assertRejects(
+    () => f.emulator.evaluateTx(wrongLane),
+    Error,
+    scriptFailureMessage,
+  );
+  await submitReconciled(f, wallet, sourceSend);
   const requests = sent.packets.map((packet) => {
     const proof = f.proofs.get(packet.fields[0] as bigint)!;
     return { packet, proofHeight: proof.height, proof: proof.proof };
@@ -678,6 +851,47 @@ Deno.test("two ready acknowledgements share fees with reconciled balances and ex
     combined.tx,
     "two ready acknowledgements",
   );
+  await checkAcknowledgementPolicies(f, wallet, signed);
+  for (const request of requests) assertSingleProofCopy(signed, request.proof);
+  for (const indexes of [[1n, 0n], [0n, 0n], [-1n, 1n], [0n, 2n]]) {
+    const invalid = changeMintRedeemer(signed.toTransaction(), (operation) => {
+      const packets = operation.fields[0] as Constr<Data>[];
+      packets.forEach((packet, i) => packet.fields[2] = indexes[i]);
+    });
+    await assertRejects(
+      () => f.emulator.evaluateTx(invalid),
+      Error,
+      scriptFailureMessage,
+    );
+  }
+  // Both proofs remain cryptographically valid after reordering. The packet
+  // operation must reject their association with different request indexes.
+  const reordered = changeMintRedeemer(
+    signed.toTransaction(),
+    () => {},
+    (request) => {
+      (request.fields[0] as Data[]).reverse();
+    },
+  );
+  await assertRejects(
+    () => f.emulator.evaluateTx(reordered),
+    Error,
+    scriptFailureMessage,
+  );
+  const singleton = changeMintRedeemer(
+    signed.toTransaction(),
+    () => {},
+    (request) => {
+      const [first] = request.fields[0] as Constr<Data>[];
+      request.index = 0;
+      request.fields = first.fields;
+    },
+  );
+  await assertRejects(
+    () => f.emulator.evaluateTx(singleton),
+    Error,
+    scriptFailureMessage,
+  );
   const units = CML.compute_total_ex_units(
     signed.toTransaction().witness_set().redeemers()!,
   );
@@ -711,8 +925,23 @@ Deno.test("same-lane sends use sequential witnesses and stale packet completions
   assertEquals(lanes.length, 1);
   const updates = lanes[0].fields[1] as Constr<Data>[];
   assertEquals(updates.length, 2);
+  assertCompactLaneUpdate(lanes[0]);
   assert(encode(updates[0].fields[1]) !== encode(updates[1].fields[1]));
   const signed = await signMeasured(builder, batch.tx, "two sends in one lane");
+  for (const indexes of [[1n, 0n], [0n, 0n], [-1n, 1n], [0n, 2n], [0n], []]) {
+    const invalid = changeMintRedeemer(signed.toTransaction(), (operation) => {
+      const lane = (operation.fields[3] as Constr<Data>[])[0];
+      const updates = lane.fields[1] as Constr<Data>[];
+      lane.fields[1] = indexes.map((index, i) =>
+        record(index, updates[Math.min(i, 1)].fields[1])
+      );
+    });
+    await assertRejects(
+      () => f.emulator.evaluateTx(invalid),
+      Error,
+      scriptFailureMessage,
+    );
+  }
   const corrupted = changeMintRedeemer(signed.toTransaction(), (operation) => {
     const lanes = operation.fields[3] as Constr<Data>[];
     const updates = lanes[0].fields[1] as Constr<Data>[];
@@ -1016,20 +1245,86 @@ Deno.test("authenticated timeout drains liquidity, burns its identity and refund
   );
 });
 
+function assertSinglePayloadCopy(
+  signed: TxSigned,
+  value: Constr<Data>,
+  label: string,
+) {
+  const payload = encode(value);
+  const redeemers = signed.toTransaction().witness_set().redeemers()!
+    .to_flat_format();
+  let copies = 0;
+  for (let i = 0; i < redeemers.len(); i++) {
+    copies += redeemers.get(i).data().to_cbor_hex().split(payload).length - 1;
+  }
+  assertEquals(
+    copies,
+    1,
+    `${label} must occur in exactly one redeemer`,
+  );
+}
+
+function assertSingleProofCopy(signed: TxSigned, proof: Constr<Data>) {
+  assertSinglePayloadCopy(signed, proof, "ICS-23 payload");
+}
+
+async function rejectInvalidPacketReferences(
+  f: Awaited<ReturnType<typeof packetLaneFixture>>,
+  signed: TxSigned,
+  laneField: number,
+) {
+  for (const indexes of [[-1n], [1n], [], [0n, 0n]]) {
+    const invalid = changeMintRedeemer(signed.toTransaction(), (operation) => {
+      const lane = operation.fields[laneField] as Constr<Data>;
+      const original = (lane.fields[1] as Constr<Data>[])[0];
+      lane.fields[1] = indexes.map((index) =>
+        record(index, original.fields[1])
+      );
+    });
+    await assertRejects(
+      () => f.emulator.evaluateTx(invalid),
+      Error,
+      scriptFailureMessage,
+    );
+  }
+  // A legacy full mutation cannot be smuggled into the compact reference slot.
+  const legacy = changeMintRedeemer(signed.toTransaction(), (operation) => {
+    const lane = operation.fields[laneField] as Constr<Data>;
+    (lane.fields[1] as Constr<Data>[])[0].fields[0] = variant(
+      2,
+      operation.fields[0],
+    );
+  });
+  await assertRejects(
+    () => f.emulator.evaluateTx(legacy),
+    Error,
+    scriptFailureMessage,
+  );
+}
+
 function changeMintRedeemer(
   transaction: CML.Transaction,
   mutate: (operation: Constr<Data>, authorized: Constr<Data>) => void,
+  mutateProof?: (request: Constr<Data>) => void,
 ): string {
   const witnesses = transaction.witness_set();
   const original = witnesses.redeemers()!.to_flat_format();
   const redeemers = CML.MapRedeemerKeyToRedeemerVal.new();
   let found = false;
+  let proofRequests = 0;
   for (let i = 0; i < original.len(); i++) {
     const redeemer = original.get(i);
     const data = Data.from(redeemer.data().to_cbor_hex()) as Constr<Data>;
     if (redeemer.tag() === CML.RedeemerTag.Mint && data.fields?.length === 3) {
       mutate(data.fields[1] as Constr<Data>, data);
       found = true;
+    }
+    if (
+      mutateProof && redeemer.tag() === CML.RedeemerTag.Mint &&
+      data.fields?.length === 2
+    ) {
+      mutateProof(data.fields[0] as Constr<Data>);
+      proofRequests++;
     }
     redeemers.insert(
       CML.RedeemerKey.new(redeemer.tag(), redeemer.index()),
@@ -1040,6 +1335,7 @@ function changeMintRedeemer(
     );
   }
   assert(found);
+  if (mutateProof) assertEquals(proofRequests, 1);
   witnesses.set_redeemers(
     CML.Redeemers.new_map_redeemer_key_to_redeemer_val(redeemers),
   );
@@ -1052,6 +1348,151 @@ function changeMintRedeemer(
     transaction.auxiliary_data(),
   ).to_cbor_hex();
 }
+
+Deno.test("packet proof statements bind the verifier's only copy of each payload", async () => {
+  const f = await packetLaneFixture();
+  const { intents } = await f.admit(1);
+  const wallet = await f.wallet();
+  const sent = await buildPacketSendBatch(
+    wallet,
+    f.deployment,
+    intents,
+    f.emulator.now(),
+    f.emulator.now() + 60_000,
+  );
+  await submitReconciled(
+    f,
+    wallet,
+    await signMeasured(wallet, sent.tx, "proof-statement source send"),
+  );
+  const packet = sent.packets[0];
+  const proof = f.proofs.get(packet.fields[0] as bigint)!;
+  const ack = await buildPacketAcknowledgement(
+    wallet,
+    f.deployment,
+    packet,
+    proof.height,
+    proof.proof,
+    f.emulator.now(),
+    f.emulator.now() + 60_000,
+  );
+  if (f.deployment.membershipVerifier) {
+    const wrongRoute = await buildPacketAcknowledgement(
+      wallet,
+      { ...f.deployment, membershipVerifier: f.deployment.proofVerifier },
+      packet,
+      proof.height,
+      proof.proof,
+      f.emulator.now(),
+      f.emulator.now() + 60_000,
+    );
+    await assertRejects(
+      () => wrongRoute.tx.complete(),
+      Error,
+      scriptFailureMessage,
+    );
+  }
+  const signed = await signMeasured(
+    wallet,
+    ack.tx,
+    "proof-statement acknowledgement",
+  );
+  assertSingleProofCopy(signed, proof.proof);
+  const transaction = () => CML.Transaction.from_cbor_hex(signed.toCBOR());
+  const mutations: Array<(request: Constr<Data>) => void> = [
+    (request) => {
+      (request.fields[0] as Constr<Data>).fields[0] = fromText("other-chain-1");
+    },
+    (request) => {
+      (request.fields[1] as Constr<Data>).fields[2] = record("00".repeat(32));
+    },
+    (request) => request.fields[2] = record(1n, 1n),
+    ...[3, 4, 5, 6].map((field) => (request: Constr<Data>) => {
+      request.fields[field] = (request.fields[field] as bigint) + 1n;
+    }),
+    (request) =>
+      request.fields[8] = record([fromText("ibc"), fromText("wrong")]),
+    (request) => request.fields[9] = "00".repeat(32),
+  ];
+  for (const mutate of mutations) {
+    const invalid = changeMintRedeemer(transaction(), () => {}, mutate);
+    await assertRejects(
+      () => f.emulator.evaluateTx(invalid),
+      Error,
+      scriptFailureMessage,
+    );
+  }
+  const ackPath = fromText(
+    `acks/ports/${toText(String(packet.fields[3]))}/channels/${
+      toText(String(packet.fields[4]))
+    }/sequences/${packet.fields[0]}`,
+  );
+  const ackValue = await sha256(fromText('{"result":"AQ=="}'));
+  const otherRoot = await membershipProof(ackPath, ackValue);
+  // This proof is valid for the same path and value under a different root.
+  // Only the authenticated client reference may select the consensus root.
+  const unauthenticated = changeMintRedeemer(
+    transaction(),
+    () => {},
+    (request) => {
+      assertEquals(request.fields[8], record([fromText("ibc"), ackPath]));
+      assertEquals(request.fields[9], ackValue);
+      const consensus = request.fields[1] as Constr<Data>;
+      assert(
+        (consensus.fields[2] as Constr<Data>).fields[0] !== otherRoot.root,
+      );
+      consensus.fields[2] = record(otherRoot.root);
+      request.fields[7] = otherRoot.proof;
+    },
+  );
+  await assertRejects(
+    () => f.emulator.evaluateTx(unauthenticated),
+    Error,
+    scriptFailureMessage,
+  );
+  const altered = Data.from(encode(proof.proof)) as Constr<Data>;
+  const layers = altered.fields[0] as Constr<Data>[];
+  const leaf = (layers[0].fields[0] as Constr<Data>).fields[0] as Constr<Data>;
+  leaf.fields[1] = "00".repeat(32);
+  // The operation statement is unchanged when only the verifier payload changes.
+  // Malformed and corrupted proofs must still fail cryptographic verification.
+  for (const payload of [0n, record([]), altered]) {
+    const invalid = changeMintRedeemer(
+      transaction(),
+      () => {},
+      (request) => request.fields[7] = payload,
+    );
+    await assertRejects(
+      () => f.emulator.evaluateTx(invalid),
+      Error,
+      scriptFailureMessage,
+    );
+  }
+  for (const index of [-1n, 1n, 1000n]) {
+    const mismatched = changeMintRedeemer(
+      transaction(),
+      (operation) => operation.fields[2] = index,
+    );
+    await assertRejects(
+      () => f.emulator.evaluateTx(mismatched),
+      Error,
+      scriptFailureMessage,
+    );
+  }
+  const units = CML.compute_total_ex_units(
+    transaction().witness_set().redeemers()!,
+  );
+  const result = await submitReconciled(f, wallet, signed);
+  console.log(JSON.stringify({
+    profile: "single-copy packet proof acknowledgement",
+    proofPayloadBytes: encode(proof.proof).length / 2,
+    feePerByteLovelace: wallet.config().protocolParameters!.minFeeA,
+    feeLovelace: result.fee.toString(),
+    memory: units.mem().toString(),
+    cpu: units.steps().toString(),
+    signedBytes: signed.toCBOR().length / 2,
+  }));
+});
 
 Deno.test("a funded intent can be cancelled by its owner before batching", async () => {
   const f = await packetLaneFixture();
@@ -1377,10 +1818,10 @@ for (const firstSeen of [false, true]) {
     );
     const height = record(1n, 19n);
     checkpoint(f, height, proof.root);
-    const buildReceive = async () => {
+    const buildReceive = async (deployment = f.deployment) => {
       const receive = await buildPacketReceive(
         wallet,
-        f.deployment,
+        deployment,
         packet,
         height,
         proof.proof,
@@ -1409,12 +1850,24 @@ for (const firstSeen of [false, true]) {
       }
       return receive;
     };
+    if (!firstSeen && f.deployment.membershipVerifier) {
+      const wrongRoute = await buildReceive({
+        ...f.deployment,
+        membershipVerifier: f.deployment.proofVerifier,
+      });
+      await assertRejects(
+        () => wrongRoute.tx.complete(),
+        Error,
+        scriptFailureMessage,
+      );
+    }
     const receive = await buildReceive();
     const reduced = await signMeasured(
       wallet,
       receive.tx,
       "minimal-reference voucher receive",
     );
+    assertSingleProofCopy(reduced, proof.proof);
     const control = await buildReceive();
     const stateReference = scriptPool.find((u) =>
       u.scriptRef &&
@@ -1447,6 +1900,20 @@ for (const firstSeen of [false, true]) {
       controlCosts.fee,
       reducedCosts.fee,
     );
+    const receiveUnits = CML.compute_total_ex_units(
+      reduced.toTransaction().witness_set().redeemers()!,
+    );
+    console.log(JSON.stringify({
+      profile: firstSeen
+        ? "first-seen voucher receive"
+        : "existing voucher receive",
+      proofPayloadBytes: encode(proof.proof).length / 2,
+      feePerByteLovelace: wallet.config().protocolParameters!.minFeeA,
+      feeLovelace: reducedCosts.fee.toString(),
+      memory: receiveUnits.mem().toString(),
+      cpu: receiveUnits.steps().toString(),
+      signedBytes: reduced.toCBOR().length / 2,
+    }));
     assertEquals(
       (await wallet.wallet().getUtxos()).reduce(
         (sum, u) => sum + (u.assets[unit] ?? 0n),
@@ -1781,6 +2248,18 @@ Deno.test("timeout on close proves closure and receipt absence at the same authe
     f.emulator.now() + 60_000,
   );
   const signed = await signMeasured(wallet, refund.tx, "timeout on close");
+  assertSingleProofCopy(signed, absence);
+  assertSingleProofCopy(signed, membership.proof);
+  for (const field of [3, 6]) {
+    const invalid = changeMintRedeemer(signed.toTransaction(), (operation) => {
+      operation.fields[field] = 1n;
+    });
+    await assertRejects(
+      () => f.emulator.evaluateTx(invalid),
+      Error,
+      scriptFailureMessage,
+    );
+  }
   await signed.submit();
   f.emulator.awaitBlock();
   assertEquals((await wallet.utxosAt(f.deployment.batchAddress)).length, 0);
@@ -2023,5 +2502,39 @@ Deno.test("full accounting maps reserve pending sends then swap assets after set
   }
   await (await signMeasured(wallet, compact.tx, "full-map redistribution"))
     .submit();
+  f.emulator.awaitBlock();
+});
+
+Deno.test("existing packet deployments keep the general proof verifier route", async () => {
+  const f = await packetLaneFixture(16, 8, false);
+  const { intents } = await f.admit(1);
+  const wallet = await f.wallet();
+  assertEquals(f.deployment.membershipVerifier, undefined);
+  const sent = await buildPacketSendBatch(
+    wallet,
+    f.deployment,
+    intents,
+    f.emulator.now(),
+    f.emulator.now() + 60_000,
+  );
+  await (await signMeasured(wallet, sent.tx, "legacy verifier send")).submit();
+  f.emulator.awaitBlock();
+  const proof = f.proofs.get(1n)!;
+  const ack = await buildPacketAcknowledgement(
+    wallet,
+    f.deployment,
+    sent.packets[0],
+    proof.height,
+    proof.proof,
+    f.emulator.now(),
+    f.emulator.now() + 60_000,
+  );
+  const signed = await signMeasured(
+    wallet,
+    ack.tx,
+    "legacy verifier acknowledgement",
+  );
+  await checkAcknowledgementPolicies(f, wallet, signed);
+  await signed.submit();
   f.emulator.awaitBlock();
 });

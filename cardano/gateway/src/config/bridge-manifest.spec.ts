@@ -139,6 +139,41 @@ function buildStagedHandlerJsonDeployment() {
 }
 
 describe('bridge manifest normalization', () => {
+  it('retains an optional membership verifier through both manifest formats', () => {
+    const source = buildHandlerJsonDeployment();
+    const membership = buildValidator('verifyMembership');
+    const deployment = { ...source, validators: { ...source.validators, verifyMembership: membership } };
+    const normalized = normalizeHandlerJsonDeploymentConfig(deployment, { chain_id: 'cardano-devnet', network_magic: 42, network: 'Custom' });
+    expect(normalized.deployment.validators.verifyMembership).toEqual(expect.objectContaining({ scriptHash: membership.scriptHash, refUtxo: membership.refUtxo }));
+    expect(normalized.bridgeManifest.validators.verify_membership).toEqual(expect.objectContaining({ script_hash: membership.scriptHash }));
+    expect(normalizeBridgeManifestConfig(normalized.bridgeManifest).deployment.validators.verifyMembership).toEqual(normalized.deployment.validators.verifyMembership);
+    const legacy = normalizeHandlerJsonDeploymentConfig(source, { chain_id: 'cardano-devnet', network_magic: 42, network: 'Custom' });
+    expect(legacy.bridgeManifest.validators.verify_membership).toBeUndefined();
+    expect(normalizeBridgeManifestConfig(legacy.bridgeManifest).deployment.validators.verifyMembership).toBeUndefined();
+  });
+
+  it('rejects malformed membership verifier entries in either format', () => {
+    const source = buildHandlerJsonDeployment();
+    expect(() => normalizeHandlerJsonDeploymentConfig({ ...source, validators: { ...source.validators, verifyMembership: null } }, { chain_id: 'cardano-devnet', network_magic: 42, network: 'Custom' })).toThrow('validators.verifyMembership');
+    const normalized = normalizeHandlerJsonDeploymentConfig(source, { chain_id: 'cardano-devnet', network_magic: 42, network: 'Custom' });
+    expect(() => normalizeBridgeManifestConfig({ ...normalized.bridgeManifest, validators: { ...normalized.bridgeManifest.validators, verify_membership: {} } })).toThrow('validators.verify_membership');
+  });
+
+  it('retains the applied heartbeat timing through both deployment formats', () => {
+    const heartbeatSchedule = { epochOriginMs: 1_700_000_000_000, epochLengthMs: 432_000_000 };
+    const normalized = normalizeHandlerJsonDeploymentConfig(
+      { ...buildHandlerJsonDeployment(), heartbeatSchedule },
+      { chain_id: 'cardano-devnet', network_magic: 42, network: 'Custom' },
+    );
+    const restored = normalizeBridgeManifestConfig(normalized.bridgeManifest);
+    expect(restored.deployment.heartbeatSchedule).toEqual(heartbeatSchedule);
+    expect(restored.bridgeManifest.heartbeat_schedule).toEqual({ epoch_origin_ms: heartbeatSchedule.epochOriginMs, epoch_length_ms: heartbeatSchedule.epochLengthMs });
+    expect(() => normalizeHandlerJsonDeploymentConfig(
+      { ...buildHandlerJsonDeployment(), heartbeatSchedule: { ...heartbeatSchedule, epochLengthMs: 0 } },
+      { chain_id: 'cardano-devnet', network_magic: 42, network: 'Custom' },
+    )).toThrow('heartbeat epoch timing');
+  });
+
   it('rejects legacy packet receipt storage rather than interpreting it as history-backed state', () => {
     const deployment = buildHandlerJsonDeployment();
     delete (deployment.packetState as any).receiptStorage;
@@ -369,6 +404,20 @@ console.log(JSON.stringify(smokeManifest()))`,
     const manifestLoaded = normalizeBridgeManifestConfig(staged.bridgeManifest);
     expect(manifestLoaded.deployment).toEqual(staged.deployment);
     expect(bridgeManifestsEqual(manifestLoaded.bridgeManifest, staged.bridgeManifest)).toBe(true);
+  });
+
+  it('retains all cached and staged scripts across both manifest formats', () => {
+    const deployment = buildStagedHandlerJsonDeployment();
+    const roles = ['update', 'updateCore', 'generalUpdateCore', 'stagedUpdate', 'cacheSpend', 'cacheMint'];
+    const cachedTendermint = { format: 'authenticated-validator-cache-v1', validators: Object.fromEntries(roles.map((role) => [role, role === 'stagedUpdate' ? deployment.validators.updateClient : buildValidator(role)])) };
+    const loaded = normalizeHandlerJsonDeploymentConfig({ ...deployment, cachedTendermint }, { chain_id: 'cardano-devnet', network_magic: 42, network: 'Custom' });
+    expect(loaded.deployment.cachedTendermint?.validators.cacheMint.scriptHash).toBe('cacheMint-hash');
+    expect(normalizeBridgeManifestConfig(loaded.bridgeManifest).deployment).toEqual(loaded.deployment);
+    for (const role of roles) {
+      const incomplete = { ...cachedTendermint, validators: { ...cachedTendermint.validators, [role]: undefined } };
+      expect(() => normalizeHandlerJsonDeploymentConfig({ ...deployment, cachedTendermint: incomplete }, { chain_id: 'cardano-devnet', network_magic: 42, network: 'Custom' })).toThrow();
+    }
+    expect(() => normalizeHandlerJsonDeploymentConfig({ ...deployment, cachedTendermint: { ...cachedTendermint, validators: { ...cachedTendermint.validators, stagedUpdate: buildValidator('another-staged-verifier') } } }, { chain_id: 'cardano-devnet', network_magic: 42, network: 'Custom' })).toThrow('different staged verifier');
   });
 
   it('rejects ordinary forwarding support without staged sessions', () => {

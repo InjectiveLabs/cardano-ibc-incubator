@@ -34,6 +34,7 @@ use ibc/core/ics_023_vector_commitments/merkle.{MerkleRoot}
 use ibc/core/ics_023_vector_commitments/merkle_prefix
 use ibc/core/ics_024_host_requirements/client_keys as host_client_keys
 use ibc/core/ics_024_host_requirements/connection_keys as host_connection_keys
+use ibc/core/ics_025_handler_interface/heartbeat.{HeartbeatSchedule}
 use ibc/core/ics_025_handler_interface/host_state.{
   Active, HostState, HostStateControl, HostStateDatum, empty_ibc_state_root,
   host_state_token_name,
@@ -444,6 +445,7 @@ fn run_conn_open_try_transition(
           fixture.connection_minting_policy_id,
           "unused channel minting policy",
           "",
+          HeartbeatSchedule { epoch_origin_ms: 0, epoch_length_ms: 2001 },
           None,
           fixture.host_redeemer,
           fixture.host_input.output_reference,

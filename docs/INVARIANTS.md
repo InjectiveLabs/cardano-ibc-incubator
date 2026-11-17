@@ -515,6 +515,67 @@ same-lane sequential witnesses, stale completion rebuilding, rollback reload,
 native returns, voucher mint/refund and timeout-on-close. Repeated multi-asset
 round trips check accounting reclamation at capacity.
 
+Packet operations carry proof request indexes. Each ICS-23 payload appears
+only in the pinned verifier's redeemer. The operation binds the complete
+statement to its authenticated client and consensus root. This includes the
+proof height, processed metadata, connection delay, request kind, IBC path and
+value. Singleton requests use index zero. Acknowledgement batches use indexes
+zero and one in operation order. Timeout-on-close binds index zero in each of
+the membership and non-membership tables. Table order and length must match.
+
+The verifier still decodes and cryptographically verifies every proof. Compiled
+packet regressions reject changed statements, invalid indexes, reordered valid
+proof requests and malformed or corrupted proofs. Historical checkpoint
+witnesses remain authenticated against the client history root. This changes
+the packet-operation redeemer format. Packet policies and transaction builders
+must be upgraded together.
+
+The [retained signed-transaction comparison](../tests/packet-proof-deduplication/evidence/report.json)
+records byte, fee and execution measurements against `6a69411e`.
+
+Each packet is serialized once in its operation. A lane update carries only
+`packet_index` and opaque Merkle witnesses. Send indexes address the batch's
+canonical packet list. Each lane must include exactly its assigned indexes in
+operation order. Single-packet operations and each acknowledgement batch child
+use index zero. The lane guard derives `CommitPacket`, `ReceivePacket` or
+`CompletePacket` from the operation. Receive proof height and the fixed success
+acknowledgement hash are derived too. The existing lane transition still checks
+packet identity, lane routing, commitments, witnesses and the continuation root.
+
+Compiled packet regressions reject swapped lanes, invalid indexes, reordered,
+missing or repeated send updates and legacy full mutations in reference slots.
+They count each complete packet once across the serialized redeemers. History
+replay resolves the same packet references and can still read full mutations
+from earlier deployments. This is another packet redeemer format change.
+The lane guard, packet policies and transaction builders must be deployed
+together. Lane datums and the destination wire schema remain unchanged.
+
+The [retained packet-payload comparison](../tests/packet-payload-deduplication/evidence/report.json)
+records signed bytes, total fees, execution use and validator sizes against
+`44c50a72`. Raw ICS-20 JSON and its separately structured fields are unchanged.
+
+New deployments publish a membership verifier alongside the existing general
+verifier. Receive and successful acknowledgement policies pin the membership
+verifier through their existing `verify_policy` parameter. That script accepts
+single membership requests and nonempty membership batches. Timeouts,
+timeout-on-close, error acknowledgements, client upgrades and existing channel
+operations retain the general verifier. Statement authentication and proof
+request encodings are unchanged. A valid marker from another verifier cannot
+satisfy the policy's pinned route.
+
+The optional manifest entry `validators.verify_membership` identifies the new
+reference. The Gateway loads both advertised references and the shared builder
+attaches only the verifier needed by its operation. Older manifests omit this
+entry and continue using the general verifier. Deployment publication,
+migration checks and shutdown inventory include the membership reference.
+The relayer signing policy also requires the membership policy and its exact
+reference from the operator-pinned manifest.
+The packet policies and their dependent router and lane guard must be deployed
+together. This changes their policy graph without changing datums or redeemers.
+
+The [retained verifier comparison](../tests/membership-verifier-split/evidence/report.json)
+records complete signed transaction fees and all referenced script bytes.
+
 Normal lane packet transactions do not spend HostState or the channel datum.
 Their packet policies still authenticate the channel, client, callback and
 counterparty proofs. Send sequencing is a separate authenticated output.
@@ -1142,9 +1203,11 @@ Fixed regressions in `validators/host_state_stt.test.ak` check root-preserving
 heartbeats, independent relayer authorization, missing clock rejection and
 shutdown restrictions. Wire-version-5 heartbeats preserve the IBC root and
 counters. A funded payment-key signer need not be the deployment authority.
-The dedicated ledger-bound heartbeat clock enforces a six-hour minimum interval
-and is preserved by ordinary operations. Gateway schedules idle heartbeats and
-Hermes follows its suggested delay. See the
+The dedicated ledger-bound heartbeat clock enforces one heartbeat per epoch after its midpoint
+and is preserved by ordinary operations. Automatic submission is disabled in the
+default profile. Manual heartbeats and the optional Hermes worker still follow
+Gateway's eligibility checks. Snapshot observations can publish fresh packet-proof
+heights without a HostState write. Checkpoint maintenance remains enabled. See the
 [heartbeat rules](probabilistic-light-client.md#permissionless-hoststate-heartbeats).
 
 ### Client Root Updates

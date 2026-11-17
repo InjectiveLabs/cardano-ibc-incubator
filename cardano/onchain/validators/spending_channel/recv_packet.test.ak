@@ -54,6 +54,7 @@ use ibc/core/ics_023_vector_commitments/merkle.{
 }
 use ibc/core/ics_023_vector_commitments/merkle_prefix.{MerklePrefix}
 use ibc/core/ics_024_host_requirements/packet_keys
+use ibc/core/ics_025_handler_interface/heartbeat.{HeartbeatSchedule}
 use ibc/core/ics_025_handler_interface/host_state.{
   Active, HostState, HostStateControl, HostStateDatum, ModuleRegistration,
   empty_ibc_state_root, host_state_token_name,
@@ -714,6 +715,7 @@ fn check_recv_packet_with_proof(
         mock_data.connection_minting_policy_id,
         mock_data.channel_minting_policy_id,
         "",
+        HeartbeatSchedule { epoch_origin_ms: 0, epoch_length_ms: 2001 },
         None,
         host_state_redeemer,
         host_input.output_reference,

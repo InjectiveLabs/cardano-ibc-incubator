@@ -288,6 +288,8 @@ function assertFileInventory() {
     // Persistent live acceptance currently targets only the local v8 profile.
     "acceptance_host_test.go",
     "acceptance_source_test.go",
+    // The heartbeat-free route regression uses v8 transfer and channel keepers.
+    "heartbeat_free_route_test.go",
     "internal/cardanodatum/channel_upgrade_sequence.go",
     // Channel upgrades exist only in ibc-go v8. v10 must still verify
     // upgradable Cardano channel ends.
@@ -462,7 +464,7 @@ function assertModuleTargets() {
     ],
     [
       v8Mod,
-      "github.com/cardano-foundation/cardano-ibc-incubator/cosmos/cardano-probabilistic-light-client-core v0.1.6",
+      "github.com/cardano-foundation/cardano-ibc-incubator/cosmos/cardano-probabilistic-light-client-core v0.1.7",
     ],
     [v8Mod, "github.com/cosmos/ibc-go/v8 v8.7.0"],
     [
@@ -471,7 +473,7 @@ function assertModuleTargets() {
     ],
     [
       v10Mod,
-      "github.com/cardano-foundation/cardano-ibc-incubator/cosmos/cardano-probabilistic-light-client-core v0.1.6",
+      "github.com/cardano-foundation/cardano-ibc-incubator/cosmos/cardano-probabilistic-light-client-core v0.1.7",
     ],
     [v10Mod, "github.com/cosmos/ibc-go/v10 v10.2.0"],
   ];

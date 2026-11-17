@@ -970,7 +970,32 @@ type Module = "transfer" | "mock" | "icq";
 
 type Tokens = "mock";
 
+export type DeployedScriptReference = {
+  title: string;
+  script: string;
+  scriptHash: string;
+  address: string;
+  refUtxo: UTxO;
+};
+
+/** Finite script inventory shared by direct and staged client updates. */
+export type CachedTendermintDeployment = {
+  format: "authenticated-validator-cache-v1";
+  validators: Record<
+    | "update"
+    | "updateCore"
+    | "generalUpdateCore"
+    | "stagedUpdate"
+    | "cacheSpend"
+    | "cacheMint",
+    DeployedScriptReference
+  >;
+};
+
 export type DeploymentTemplate = {
+  heartbeatSchedule?:
+    import("../../../packages/cardano-ibc-tx-builder-runtime/src/heartbeatSchedule.ts").HeartbeatSchedule;
+  cachedTendermint?: CachedTendermintDeployment;
   packetState: {
     acknowledgementBatchSize?: 2;
     configuration: {
@@ -1028,6 +1053,7 @@ export type DeploymentTemplate = {
     originalAddresses: string[];
     registryAddress: string;
     registryReference: UTxO;
+    governanceAuthority?: DeployedScriptReference;
     registryDatum: string;
     baseline: unknown;
     lineage: Array<
@@ -1162,6 +1188,7 @@ export type DeploymentTemplate = {
       address: string;
       refUtxo: UTxO;
     };
+    verifyMembership?: DeployedScriptReference;
     verifyProof: {
       title: string;
       script: string;

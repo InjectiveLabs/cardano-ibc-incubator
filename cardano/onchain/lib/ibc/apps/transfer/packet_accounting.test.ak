@@ -1,6 +1,7 @@
 use aiken/collection/list
 use aiken/collection/pairs
 use aiken/crypto
+use aiken/primitive/bytearray
 use cardano/address
 use cardano/assets
 use cardano/transaction.{InlineDatum, Input, Output, OutputReference}
@@ -14,7 +15,6 @@ use ibc/client/ics_007_tendermint_client/height.{Height}
 use ibc/core/ics_004/packet_balances
 use ibc/core/ics_004/packet_lane_datum.{PacketLaneDatum}
 use ibc/core/ics_004/types/packet.{Packet}
-use ibc/core/ics_023_vector_commitments/merkle.{MerkleProof}
 
 const denom = "transfer/channel-0/X"
 
@@ -26,7 +26,7 @@ const ref =
 
 const height = Height { revision_number: 0, revision_height: 0 }
 
-const proof = MerkleProof { proofs: [] }
+const proof_index = 0
 
 const lane = LaneInputUpdate { input_ref: ref, updates: [] }
 
@@ -58,6 +58,7 @@ fn burned() -> PacketLaneDatum {
       ["A", "B", "C", "D", "E", "F", "G", denom],
       fn(d) { Pair(crypto.sha2_256(d), 10) },
     )
+      |> list.sort(fn(a, b) { bytearray.compare(a.1st, b.1st) })
   let intent =
     TransferIntent {
       port_id: "transfer",
@@ -105,7 +106,7 @@ test full_capacity_burn_reserves_slot_against_a_new_asset() {
         packet,
         data: FungibleTokenPacketData { ..data, denom: "Y" },
         proof_height: height,
-        proof,
+        proof_index,
         lane,
         liquidity_refs: [],
       },
@@ -125,7 +126,7 @@ test full_capacity_timeout_restores_reserved_slot() {
         packet,
         data,
         proof_height: height,
-        proof,
+        proof_index,
         lane,
         liquidity_refs: [],
       },
@@ -145,7 +146,7 @@ test full_capacity_error_ack_restores_reserved_slot() {
         data,
         err: "rejected",
         proof_height: height,
-        proof,
+        proof_index,
         lane,
         liquidity_refs: [],
       },
@@ -160,7 +161,7 @@ test successful_last_ack_releases_reservation() {
     packet_accounting.balance_after(
       transaction.placeholder,
       burned(),
-      Acknowledge { packet, proof_height: height, proof, lane },
+      Acknowledge { packet, proof_height: height, proof_index, lane },
     )
   list.length(next) == 7 && pairs.get_first(next, crypto.sha2_256(denom)) == None
 }
@@ -171,7 +172,7 @@ test partial_ack_keeps_reservation_for_other_unresolved_sends() {
     packet_accounting.balance_after(
       transaction.placeholder,
       PacketLaneDatum { ..old, commitments: [Pair(1, #"ab"), Pair(17, #"cd")] },
-      Acknowledge { packet, proof_height: height, proof, lane },
+      Acknowledge { packet, proof_height: height, proof_index, lane },
     )
   next == old.balances
 }

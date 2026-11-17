@@ -128,12 +128,21 @@ export class PacketLaneService {
       if (!reference) throw new Error(`Missing packet operation reference: ${name}`);
       operations[name] = { policy: validator.scriptHash, reference };
     }
-    const verifier = manifest.validators.verifyProof;
-    const [proofReference] = await this.lucid.lucid.utxosByOutRef([verifier.refUtxo]);
-    if (!proofReference) throw new Error('Missing packet proof verifier reference');
+    const resolveVerifier = async (validator: DeploymentConfig['validators']['verifyProof'], name: string) => {
+      const [reference] = await this.lucid.lucid.utxosByOutRef([validator.refUtxo]);
+      if (!reference) throw new Error(`Missing packet ${name} verifier reference`);
+      return { policy: validator.scriptHash, reference };
+    };
+    const [proofVerifier, membershipVerifier] = await Promise.all([
+      resolveVerifier(manifest.validators.verifyProof, 'proof'),
+      manifest.validators.verifyMembership
+        ? resolveVerifier(manifest.validators.verifyMembership, 'membership')
+        : undefined,
+    ]);
     return {
       operations,
-      proofVerifier: { policy: verifier.scriptHash, reference: proofReference },
+      proofVerifier,
+      ...(membershipVerifier ? { membershipVerifier } : {}),
       voucherPolicy: manifest.validators.mintVoucher.scriptHash,
       batchPolicy: config.batch.scriptHash,
       batchAddress: config.batch.address!,
@@ -181,7 +190,7 @@ export class PacketLaneService {
     // never inherit another request's wallet selection.
     const result = await this.runner.runChain({
       operationName: name,
-      ...(name !== 'transferIntent'
+      ...(name !== 'transferIntent' && name !== 'cancelTransferIntent'
         ? { reservation: { now: window.validFromTime, expiresAt: window.validToTime } }
         : {}),
       wallet: { mode: 'refresh_from_address', address: signer, context: name },

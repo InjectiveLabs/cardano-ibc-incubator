@@ -19,6 +19,16 @@ import (
 
 const maxSupportedKesEvolutions = uint64(1 << 6)
 
+// Raw fields can contain valid Plutus data deeper than the CBOR default.
+// Keep the same finite nesting bound as the ledger decoder.
+var rawBlockDecMode = func() fxcbor.DecMode {
+	mode, err := (fxcbor.DecOptions{MaxNestedLevels: cbor.MaxNestedLevels}).DecMode()
+	if err != nil {
+		panic(err)
+	}
+	return mode
+}()
+
 // ErrDecodePanicked marks a panic while decoding relayer-supplied Cardano
 // CBOR. gouroboros decoders panicked on malformed blocks before v0.205.4
 // (#687), so the entry points that decode such bytes return this error
@@ -64,6 +74,7 @@ type rawBabbageBlock struct {
 	bodyFields             rawBlockBodyFields
 	legacyDatums           [][]*common.Datum
 	legacyCollateralDatums []*common.Datum
+	primaryDecodeErr       error
 }
 
 func (b *rawBabbageBlock) rawBlockBodyFields() rawBlockBodyFields {
@@ -76,8 +87,9 @@ func (b *rawBabbageBlock) Transactions() []ledger.Transaction {
 
 type rawConwayBlock struct {
 	*ledger.ConwayBlock
-	bodyFields   rawBlockBodyFields
-	legacyDatums [][]*common.Datum
+	bodyFields       rawBlockBodyFields
+	legacyDatums     [][]*common.Datum
+	primaryDecodeErr error
 }
 
 func (b *rawConwayBlock) rawBlockBodyFields() rawBlockBodyFields {
@@ -134,26 +146,60 @@ func attachLegacyDatums(transactions []ledger.Transaction, datums [][]*common.Da
 
 func DecodeLedgerBlock(blockCbor []byte) (block ledger.Block, err error) {
 	defer recoverDecodePanic(&block, &err)
-	blockType, err := ledger.DetermineBlockType(blockCbor)
+	decodedBlock, err := decodePrimaryBlock(blockCbor)
 	if err == nil {
-		decodedBlock, decodeErr := ledger.NewBlockFromCbor(blockType, blockCbor)
-		if decodeErr != nil {
-			return nil, decodeErr
+		bodyFields, rawErr := extractRawBlockBodyFields(blockCbor)
+		if rawErr != nil {
+			return nil, rawErr
 		}
-		if bodyFields, rawErr := extractRawBlockBodyFields(blockCbor); rawErr == nil {
-			if wrappedBlock := wrapRawBodyFields(decodedBlock, bodyFields); wrappedBlock != nil {
-				return wrappedBlock, nil
-			}
+		if wrappedBlock := wrapRawBodyFields(decodedBlock, bodyFields); wrappedBlock != nil {
+			return wrappedBlock, nil
 		}
 		return decodedBlock, nil
 	}
 
 	decodedBlock, fallbackErr := decodeRawBodyBlock(blockCbor)
 	if fallbackErr == nil {
+		switch block := decodedBlock.(type) {
+		case *rawBabbageBlock:
+			block.primaryDecodeErr = err
+		case *rawConwayBlock:
+			block.primaryDecodeErr = err
+		}
 		return decodedBlock, nil
 	}
 
 	return nil, fmt.Errorf("%w; raw block fallback failed: %v", err, fallbackErr)
+}
+
+// BlockDecodeFallbackCause returns the gouroboros error recovered by the raw
+// decoder. It is nil when ordinary decoding succeeded. It does not indicate
+// whether the block has passed cryptographic verification.
+func BlockDecodeFallbackCause(block ledger.Block) error {
+	switch block := block.(type) {
+	case *rawBabbageBlock:
+		return block.primaryDecodeErr
+	case *rawConwayBlock:
+		return block.primaryDecodeErr
+	default:
+		return nil
+	}
+}
+
+// decodePrimaryBlock accepts the two supported block layouts, just as the raw
+// fallback does. An unwrapped header does not identify Babbage versus Conway:
+// its protocol version describes the producer's capabilities, not the era.
+// Try the typed decoders rather than treating this ambiguity as a decoder failure.
+func decodePrimaryBlock(blockCbor []byte) (ledger.Block, error) {
+	block, conwayErr := ledger.NewBlockFromCbor(ledger.BlockTypeConway, blockCbor)
+	if conwayErr == nil {
+		return block, nil
+	}
+	block, babbageErr := ledger.NewBlockFromCbor(ledger.BlockTypeBabbage, blockCbor)
+	if babbageErr == nil {
+		return block, nil
+	}
+	return nil, fmt.Errorf("Conway decoding: %v, Babbage decoding: %w", conwayErr, babbageErr)
 }
 
 // DecodeLedgerHeader decodes the exact signed Praos header used by both
@@ -593,8 +639,12 @@ func extractRawBlockBodyFields(blockCbor []byte) (rawBlockBodyFields, error) {
 
 func rawBlockFields(blockCbor []byte) ([]fxcbor.RawMessage, rawBlockBodyFields, error) {
 	var fields []fxcbor.RawMessage
-	if err := fxcbor.Unmarshal(blockCbor, &fields); err != nil {
+	decodedBytes, err := cbor.Decode(blockCbor, &fields)
+	if err != nil {
 		return nil, rawBlockBodyFields{}, err
+	}
+	if decodedBytes != len(blockCbor) {
+		return nil, rawBlockBodyFields{}, errors.New("unexpected trailing block data")
 	}
 	if len(fields) != 5 {
 		return nil, rawBlockBodyFields{}, fmt.Errorf("expected 5 block fields, got %d", len(fields))
@@ -631,7 +681,7 @@ func decodeRawBabbageBlock(
 	if err != nil {
 		return nil, fmt.Errorf("decode Babbage metadata set: %w", err)
 	}
-	invalidTransactions, err := decodeInvalidTransactions(fields[4])
+	invalidTransactions, err := decodeInvalidTransactions(fields[4], len(transactionBodies))
 	if err != nil {
 		return nil, fmt.Errorf("decode Babbage invalid transactions: %w", err)
 	}
@@ -656,27 +706,27 @@ func decodeRawBabbageBlock(
 
 func extractLegacyInlineDatums(rawBodies []byte) [][]*common.Datum {
 	var bodyMessages []fxcbor.RawMessage
-	if err := fxcbor.Unmarshal(rawBodies, &bodyMessages); err != nil {
+	if err := rawBlockDecMode.Unmarshal(rawBodies, &bodyMessages); err != nil {
 		return nil
 	}
 	result := make([][]*common.Datum, len(bodyMessages))
 	for txIndex, bodyMessage := range bodyMessages {
 		var bodyFields map[uint]fxcbor.RawMessage
-		if fxcbor.Unmarshal(bodyMessage, &bodyFields) != nil {
+		if rawBlockDecMode.Unmarshal(bodyMessage, &bodyFields) != nil {
 			continue
 		}
 		var outputs []fxcbor.RawMessage
-		if fxcbor.Unmarshal(bodyFields[1], &outputs) != nil {
+		if rawBlockDecMode.Unmarshal(bodyFields[1], &outputs) != nil {
 			continue
 		}
 		result[txIndex] = make([]*common.Datum, len(outputs))
 		for outputIndex, outputMessage := range outputs {
 			var outputFields map[uint]fxcbor.RawMessage
-			if fxcbor.Unmarshal(outputMessage, &outputFields) != nil {
+			if rawBlockDecMode.Unmarshal(outputMessage, &outputFields) != nil {
 				continue
 			}
 			var datumOption []fxcbor.RawMessage
-			if fxcbor.Unmarshal(outputFields[2], &datumOption) != nil || len(datumOption) != 2 {
+			if rawBlockDecMode.Unmarshal(outputFields[2], &datumOption) != nil || len(datumOption) != 2 {
 				continue
 			}
 			var wrapped cbor.WrappedCbor
@@ -693,21 +743,21 @@ func extractLegacyInlineDatums(rawBodies []byte) [][]*common.Datum {
 
 func extractLegacyCollateralDatums(rawBodies []byte) []*common.Datum {
 	var bodyMessages []fxcbor.RawMessage
-	if err := fxcbor.Unmarshal(rawBodies, &bodyMessages); err != nil {
+	if err := rawBlockDecMode.Unmarshal(rawBodies, &bodyMessages); err != nil {
 		return nil
 	}
 	result := make([]*common.Datum, len(bodyMessages))
 	for txIndex, bodyMessage := range bodyMessages {
 		var bodyFields map[uint]fxcbor.RawMessage
-		if fxcbor.Unmarshal(bodyMessage, &bodyFields) != nil {
+		if rawBlockDecMode.Unmarshal(bodyMessage, &bodyFields) != nil {
 			continue
 		}
 		var outputFields map[uint]fxcbor.RawMessage
-		if fxcbor.Unmarshal(bodyFields[16], &outputFields) != nil {
+		if rawBlockDecMode.Unmarshal(bodyFields[16], &outputFields) != nil {
 			continue
 		}
 		var datumOption []fxcbor.RawMessage
-		if fxcbor.Unmarshal(outputFields[2], &datumOption) != nil || len(datumOption) != 2 {
+		if rawBlockDecMode.Unmarshal(outputFields[2], &datumOption) != nil || len(datumOption) != 2 {
 			continue
 		}
 		var wrapped cbor.WrappedCbor
@@ -742,7 +792,7 @@ func decodeRawConwayBlock(
 	if err != nil {
 		return nil, fmt.Errorf("decode Conway metadata set: %w", err)
 	}
-	invalidTransactions, err := decodeInvalidTransactions(fields[4])
+	invalidTransactions, err := decodeInvalidTransactions(fields[4], len(transactionBodies))
 	if err != nil {
 		return nil, fmt.Errorf("decode Conway invalid transactions: %w", err)
 	}
@@ -763,7 +813,7 @@ func decodeRawConwayBlock(
 
 func decodeBabbageTransactionBodies(rawBodies []byte) ([]ledger.BabbageTransactionBody, error) {
 	var bodyMessages []fxcbor.RawMessage
-	if err := fxcbor.Unmarshal(rawBodies, &bodyMessages); err != nil {
+	if err := rawBlockDecMode.Unmarshal(rawBodies, &bodyMessages); err != nil {
 		return nil, err
 	}
 
@@ -788,18 +838,18 @@ func decodeBabbageTransactionBodies(rawBodies []byte) ([]ledger.BabbageTransacti
 
 func stripInlineDatumOptions(bodyCbor []byte) ([]byte, bool) {
 	var bodyFields map[uint]fxcbor.RawMessage
-	if err := fxcbor.Unmarshal(bodyCbor, &bodyFields); err != nil {
+	if err := rawBlockDecMode.Unmarshal(bodyCbor, &bodyFields); err != nil {
 		return nil, false
 	}
 	changed := false
 	for _, field := range []uint{1} {
 		var outputs []fxcbor.RawMessage
-		if err := fxcbor.Unmarshal(bodyFields[field], &outputs); err != nil {
+		if err := rawBlockDecMode.Unmarshal(bodyFields[field], &outputs); err != nil {
 			continue
 		}
 		for idx, outputCbor := range outputs {
 			var outputFields map[uint]fxcbor.RawMessage
-			if err := fxcbor.Unmarshal(outputCbor, &outputFields); err != nil {
+			if err := rawBlockDecMode.Unmarshal(outputCbor, &outputFields); err != nil {
 				continue
 			}
 			if _, ok := outputFields[2]; ok {
@@ -822,7 +872,7 @@ func stripInlineDatumOptions(bodyCbor []byte) ([]byte, bool) {
 	}
 	if collateralReturn, ok := bodyFields[16]; ok {
 		var outputFields map[uint]fxcbor.RawMessage
-		if err := fxcbor.Unmarshal(collateralReturn, &outputFields); err == nil {
+		if err := rawBlockDecMode.Unmarshal(collateralReturn, &outputFields); err == nil {
 			if _, ok := outputFields[2]; ok {
 				delete(outputFields, 2)
 				stripped, err := fxcbor.Marshal(outputFields)
@@ -846,7 +896,7 @@ func stripInlineDatumOptions(bodyCbor []byte) ([]byte, bool) {
 
 func decodeConwayTransactionBodies(rawBodies []byte) ([]ledger.ConwayTransactionBody, error) {
 	var bodyMessages []fxcbor.RawMessage
-	if err := fxcbor.Unmarshal(rawBodies, &bodyMessages); err != nil {
+	if err := rawBlockDecMode.Unmarshal(rawBodies, &bodyMessages); err != nil {
 		return nil, err
 	}
 
@@ -875,7 +925,7 @@ func decodeBabbageWitnessSets(rawWitnessSets []byte, txCount int) ([]ledger.Babb
 
 func decodeConwayWitnessSets(rawWitnessSets []byte, txCount int) ([]ledger.ConwayTransactionWitnessSet, error) {
 	var witnessMessages []fxcbor.RawMessage
-	if err := fxcbor.Unmarshal(rawWitnessSets, &witnessMessages); err == nil {
+	if err := rawBlockDecMode.Unmarshal(rawWitnessSets, &witnessMessages); err == nil {
 		if len(witnessMessages) != txCount {
 			return nil, fmt.Errorf("witness array length %d does not match tx count %d", len(witnessMessages), txCount)
 		}
@@ -887,7 +937,7 @@ func decodeConwayWitnessSets(rawWitnessSets []byte, txCount int) ([]ledger.Conwa
 	}
 
 	var witnessMap map[uint]fxcbor.RawMessage
-	if err := fxcbor.Unmarshal(rawWitnessSets, &witnessMap); err != nil {
+	if err := rawBlockDecMode.Unmarshal(rawWitnessSets, &witnessMap); err != nil {
 		return nil, err
 	}
 	witnessSets := make([]ledger.ConwayTransactionWitnessSet, txCount)
@@ -905,7 +955,7 @@ func decodeConwayWitnessSets(rawWitnessSets []byte, txCount int) ([]ledger.Conwa
 
 func decodeBabbageWitnessSetArray(rawWitnessSets []byte, txCount int) ([]ledger.BabbageTransactionWitnessSet, error) {
 	var witnessMessages []fxcbor.RawMessage
-	if err := fxcbor.Unmarshal(rawWitnessSets, &witnessMessages); err != nil {
+	if err := rawBlockDecMode.Unmarshal(rawWitnessSets, &witnessMessages); err != nil {
 		return nil, err
 	}
 	if len(witnessMessages) != txCount {
@@ -925,7 +975,7 @@ func decodeBabbageWitnessSetArray(rawWitnessSets []byte, txCount int) ([]ledger.
 
 func decodeBabbageWitnessSetMap(rawWitnessSets []byte, txCount int) ([]ledger.BabbageTransactionWitnessSet, error) {
 	var witnessMessages map[uint]fxcbor.RawMessage
-	if err := fxcbor.Unmarshal(rawWitnessSets, &witnessMessages); err != nil {
+	if err := rawBlockDecMode.Unmarshal(rawWitnessSets, &witnessMessages); err != nil {
 		return nil, err
 	}
 
@@ -977,7 +1027,7 @@ func transactionMetadataValues(metadataSet common.TransactionMetadataSet, txCoun
 
 func decodeLegacyTransactionMetadataSet(rawMetadataSet []byte) (map[uint]*cbor.LazyValue, error) {
 	var metadataMessages map[uint]fxcbor.RawMessage
-	if err := fxcbor.Unmarshal(rawMetadataSet, &metadataMessages); err == nil {
+	if err := rawBlockDecMode.Unmarshal(rawMetadataSet, &metadataMessages); err == nil {
 		metadataSet := make(map[uint]*cbor.LazyValue, len(metadataMessages))
 		for txIndex, metadataMessage := range metadataMessages {
 			metadata, err := decodeMetadataValue(txIndex, metadataMessage)
@@ -992,7 +1042,7 @@ func decodeLegacyTransactionMetadataSet(rawMetadataSet []byte) (map[uint]*cbor.L
 	}
 
 	var metadataArray []fxcbor.RawMessage
-	if err := fxcbor.Unmarshal(rawMetadataSet, &metadataArray); err != nil {
+	if err := rawBlockDecMode.Unmarshal(rawMetadataSet, &metadataArray); err != nil {
 		return nil, err
 	}
 	metadataSet := make(map[uint]*cbor.LazyValue, len(metadataArray))
@@ -1019,10 +1069,15 @@ func decodeMetadataValue(txIndex uint, metadataMessage []byte) (*cbor.LazyValue,
 	return &metadata, nil
 }
 
-func decodeInvalidTransactions(rawInvalidTransactions []byte) ([]uint, error) {
+func decodeInvalidTransactions(rawInvalidTransactions []byte, txCount int) ([]uint, error) {
 	var invalidTransactions []uint
-	if err := fxcbor.Unmarshal(rawInvalidTransactions, &invalidTransactions); err != nil {
+	if err := rawBlockDecMode.Unmarshal(rawInvalidTransactions, &invalidTransactions); err != nil {
 		return nil, err
+	}
+	for _, index := range invalidTransactions {
+		if index >= uint(txCount) {
+			return nil, fmt.Errorf("invalid transaction index %d outside transaction list length %d", index, txCount)
+		}
 	}
 	return invalidTransactions, nil
 }

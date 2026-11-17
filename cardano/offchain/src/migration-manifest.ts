@@ -61,9 +61,13 @@ export async function assertBaselineAliases(plan: DeploymentPlan) {
     mockToken: "minting_mock_token.mint_mock_token.mint",
     benchmarkVoucher:
       "minting_trace_registry_benchmark_voucher.mint_trace_registry_benchmark_voucher.mint",
+    verifyMembership: "verifying_membership.verify_membership.mint",
   };
   for (const [name, title] of Object.entries(expectedAliases)) {
     const alias = plan[name as keyof DeploymentPlan] as PlannedValidator | null;
+    if (
+      name === "verifyMembership" && !byTitle.has(title) && alias === undefined
+    ) continue;
     if (
       name === "benchmarkVoucher" && !plan.inputs.benchmarkVoucherEnabled &&
       alias === null
@@ -104,6 +108,7 @@ export async function assertRetainedManifest(
     voucherMetadata: plan.voucherMetadata,
     mintTraceRegistryBenchmarkVoucher: plan.benchmarkVoucher,
     verifyProof: plan.verifyProof,
+    verifyMembership: plan.verifyMembership ?? null,
     mintClientStt: plan.mintClient,
     mintConnectionStt: plan.mintConnection,
     mintChannelStt: plan.mintChannel,
@@ -125,7 +130,7 @@ export async function assertRetainedManifest(
       field.scriptHash !== expected.hash ||
       (field.address !== undefined &&
         field.address !==
-          ((name === "recoverClient" || name === "updateClient")
+          (expected.title.endsWith(".withdraw")
             ? validatorToRewardAddress(
               lucid.config().network || "Custom",
               expected.script,
@@ -146,6 +151,29 @@ export async function assertRetainedManifest(
         >[1],
       expected,
     );
+  }
+  if (plan.cacheMint) {
+    if (
+      deployment.cachedTendermint?.format !== "authenticated-validator-cache-v1"
+    ) throw new Error("Missing authenticated cache inventory");
+    const expectedCache = {
+      update: plan.cachedUpdateClient,
+      updateCore: plan.verifyCachedClient,
+      generalUpdateCore: plan.verifyGeneralCachedClient,
+      stagedUpdate: plan.updateClient,
+      cacheSpend: plan.cacheSpend,
+      cacheMint: plan.cacheMint,
+    };
+    for (const [name, expected] of Object.entries(expectedCache)) {
+      check(
+        `cached.${name}`,
+        deployment.cachedTendermint
+          .validators[name as keyof typeof expectedCache],
+        expected,
+      );
+    }
+  } else if (deployment.cachedTendermint) {
+    throw new Error("Substituted authenticated cache inventory");
   }
   const operations = deployment.validators.spendChannel.refValidator;
   if (

@@ -57,6 +57,7 @@ use ibc/core/ics_024_host_requirements/client_keys
 use ibc/core/ics_024_host_requirements/connection_keys as host_connection_keys
 use ibc/core/ics_024_host_requirements/packet_keys
 use ibc/core/ics_024_host_requirements/port_keys.{key_port_prefix}
+use ibc/core/ics_025_handler_interface/heartbeat.{HeartbeatSchedule}
 use ibc/core/ics_025_handler_interface/host_state.{
   Active, HostState, HostStateControl, HostStateDatum, ModuleRegistration,
   ShutdownState, ShuttingDown, empty_ibc_state_root, host_state_token_name,
@@ -659,6 +660,7 @@ fn spend_host_state_with_backup(
     "mock connection policy",
     "mock channel policy",
     backup_operator,
+    HeartbeatSchedule { epoch_origin_ms: 0, epoch_length_ms: 2001 },
     None,
     redeemer,
     test_host_ref(),
@@ -678,7 +680,10 @@ fn spend_host_state_with_backup(
             )
           expect InlineDatum(raw) = output.datum
           expect datum: HostStateDatum = raw
-          interval.between(0, datum.state.last_update_time)
+          interval.between(
+            datum.state.last_update_time - 1,
+            datum.state.last_update_time,
+          )
         }
         _ -> placeholder.validity_range
       },
@@ -782,6 +787,7 @@ fn run_host_case(case: HostCase) -> Bool {
     "mock connection policy",
     "mock channel policy",
     "",
+    HeartbeatSchedule { epoch_origin_ms: 0, epoch_length_ms: 2001 },
     None,
     redeemer,
     test_host_ref(),
@@ -1685,6 +1691,7 @@ test host_update_client_capacity_minimum_history_succeeds() {
     "mock connection policy",
     "mock channel policy",
     "",
+    HeartbeatSchedule { epoch_origin_ms: 0, epoch_length_ms: 2001 },
     None,
     redeemer,
     test_host_ref(),
@@ -1850,6 +1857,7 @@ fn create_connection_thread(token: AuthToken, mint: Value) -> Bool {
     "mock connection policy",
     "mock channel policy",
     "",
+    HeartbeatSchedule { epoch_origin_ms: 0, epoch_length_ms: 2001 },
     None,
     CreateConnection { connection_siblings: siblings },
     test_host_ref(),
@@ -3888,6 +3896,7 @@ test host_state_bind_port_succeeds_with_correct_root_witness() {
     "mock connection policy",
     "mock channel policy",
     "",
+    HeartbeatSchedule { epoch_origin_ms: 0, epoch_length_ms: 2001 },
     None,
     redeemer,
     input_ref,
@@ -3985,6 +3994,7 @@ test host_state_bind_port_fails_with_arbitrary_root() fail {
     "mock connection policy",
     "mock channel policy",
     "",
+    HeartbeatSchedule { epoch_origin_ms: 0, epoch_length_ms: 2001 },
     None,
     redeemer,
     input_ref,
@@ -4103,6 +4113,7 @@ test host_state_cannot_move_nft_to_different_address() fail {
     "mock connection policy",
     "mock channel policy",
     "",
+    HeartbeatSchedule { epoch_origin_ms: 0, epoch_length_ms: 2001 },
     None,
     redeemer,
     input_ref,
@@ -4214,6 +4225,7 @@ test host_state_bind_port_fails_without_required_sibling_hashes() fail {
     "mock connection policy",
     "mock channel policy",
     "",
+    HeartbeatSchedule { epoch_origin_ms: 0, epoch_length_ms: 2001 },
     None,
     redeemer,
     input_ref,
@@ -4287,6 +4299,7 @@ test host_state_bind_port_fails_if_output_missing() fail {
     "mock connection policy",
     "mock channel policy",
     "",
+    HeartbeatSchedule { epoch_origin_ms: 0, epoch_length_ms: 2001 },
     None,
     redeemer,
     input_ref,
@@ -4384,6 +4397,7 @@ fn validate_test_enter_shutdown(
     "mock connection policy",
     "mock channel policy",
     "",
+    HeartbeatSchedule { epoch_origin_ms: 0, epoch_length_ms: 2001 },
     None,
     redeemer,
     input_ref,
@@ -4546,6 +4560,7 @@ fn validate_test_finalize_shutdown_with_input(
     "mock connection policy",
     "mock channel policy",
     "",
+    HeartbeatSchedule { epoch_origin_ms: 0, epoch_length_ms: 2001 },
     None,
     FinalizeShutdown,
     test_host_ref(),
@@ -4643,6 +4658,7 @@ fn validate_test_authorize_finalization(root_present: Bool) -> Bool {
     "mock connection policy",
     "mock channel policy",
     "",
+    HeartbeatSchedule { epoch_origin_ms: 0, epoch_length_ms: 2001 },
     None,
     AuthorizeFinalization,
     test_host_ref(),
@@ -4694,6 +4710,7 @@ test host_state_finalize_shutdown_rejects_registered_transfer_root() fail {
     "mock connection policy",
     "mock channel policy",
     "",
+    HeartbeatSchedule { epoch_origin_ms: 0, epoch_length_ms: 2001 },
     None,
     FinalizeShutdown,
     test_host_ref(),
@@ -4877,6 +4894,7 @@ test host_state_update_channel_rejects_packet_field_changes() fail {
     "mock connection policy",
     "mock channel policy",
     "",
+    HeartbeatSchedule { epoch_origin_ms: 0, epoch_length_ms: 2001 },
     None,
     redeemer,
     host_ref,
@@ -5015,6 +5033,7 @@ test host_state_handle_packet_rejects_channel_only_changes() fail {
     "mock connection policy",
     "mock channel policy",
     "",
+    HeartbeatSchedule { epoch_origin_ms: 0, epoch_length_ms: 2001 },
     None,
     redeemer,
     host_ref,
@@ -5601,6 +5620,7 @@ fn containment_restricted(
     } else {
       1
     },
+    HeartbeatSchedule { epoch_origin_ms: 0, epoch_length_ms: 2001 },
     None,
     raw,
     test_host_ref(),
@@ -5628,6 +5648,7 @@ fn registry_bound_heartbeat(
   migration_host.host_state.spend(
     registry.token.policy_id,
     generation,
+    HeartbeatSchedule { epoch_origin_ms: 0, epoch_length_ms: 2001 },
     None,
     raw,
     own_ref,
@@ -6066,6 +6087,7 @@ fn create_registered_client(
     "mock connection policy",
     "mock channel policy",
     "",
+    HeartbeatSchedule { epoch_origin_ms: 0, epoch_length_ms: 2001 },
     None,
     CreateClient { client_state_siblings, consensus_state_siblings },
     test_host_ref(),
@@ -6140,7 +6162,7 @@ fn test_heartbeat_output(state: HostState) -> Output {
 }
 
 test heartbeat_does_not_depend_on_current_deployer() {
-  let old_state = test_host_state(empty_ibc_state_root, 1)
+  let old_state = test_host_state(empty_ibc_state_root, 1000)
   let new_state =
     HostState {
       ..old_state,

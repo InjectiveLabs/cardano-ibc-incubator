@@ -1,3 +1,4 @@
+import { initializeValidatorCache } from "../tendermint-cache.ts";
 import {
   buildPacketLaneInitialization,
   buildPacketReceive,
@@ -262,14 +263,31 @@ export async function checkShutdownDrain(
     const funding = (await emulator.getUtxos(f.address)).sort((a, b) =>
       a.assets.lovelace > b.assets.lovelace ? -1 : 1
     )[0];
+    const cache = deployment.cachedTendermint
+      ? initializeValidatorCache(
+        {
+          policyId: String(clientToken.fields[0]),
+          name: String(clientToken.fields[1]),
+        },
+        deployment.cachedTendermint.validators.cacheMint.scriptHash,
+        v.spendClient.address,
+      )
+      : undefined;
+    const cacheReserve = cache ? 5_000_000n : 0n;
     const snapshotAda = (mode === "voucher" ? 41_000_000n : 21_000_000n) +
-      2n * amount;
+      2n * amount + cacheReserve;
     assert(funding.assets.lovelace > snapshotAda + 2_000_000n);
     funding.assets.lovelace -= snapshotAda;
     const clientUtxo = snapshot(v.spendClient.address, {
       lovelace: 5_000_000n,
       [unit(clientToken)]: 1n,
     }, encode(record(client.state, clientToken, "00".repeat(32))));
+    if (cache) {
+      snapshot(deployment.cachedTendermint!.validators.cacheSpend.address, {
+        lovelace: cacheReserve,
+        [cache.tokenUnit]: 1n,
+      }, cache.datum);
+    }
     const connectionUtxo = snapshot(v.spendConnection.address, {
       lovelace: 5_000_000n,
       [unit(connectionToken)]: 1n,
@@ -324,6 +342,14 @@ export async function checkShutdownDrain(
         policy: v.verifyProof.scriptHash,
         reference: v.verifyProof.refUtxo,
       },
+      ...(v.verifyMembership
+        ? {
+          membershipVerifier: {
+            policy: v.verifyMembership.scriptHash,
+            reference: v.verifyMembership.refUtxo,
+          },
+        }
+        : {}),
       channel: channelUtxo,
       connection: connectionUtxo,
       client: clientUtxo,
@@ -471,7 +497,7 @@ export async function checkShutdownDrain(
       for (const kind of ["client", "connection", "channel"] as const) {
         await assertRejects(
           async () =>
-            buildReclaimStateTx(
+            (await buildReclaimStateTx(
               lucid,
               deployment,
               await f.host(),
@@ -484,7 +510,7 @@ export async function checkShutdownDrain(
                 deployment,
                 groups.find((g) => g.kind === kind)!,
               ),
-            ).complete({ localUPLCEval: true }),
+            )).complete({ localUPLCEval: true }),
           Error,
           "failed script execution",
         );

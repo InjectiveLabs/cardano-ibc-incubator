@@ -15,6 +15,7 @@
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
+    "./heartbeatSchedule": { "types": "./dist/heartbeatSchedule.d.ts", "default": "./dist/heartbeatSchedule.js" },
     "./yaciRest": { "types": "./dist/yaciRest.d.ts", "default": "./dist/yaciRest.js" },
     "./yaciRestHistory": { "types": "./dist/yaciRestHistory.d.ts", "default": "./dist/yaciRestHistory.js" },
     "./consensusHistoryRest": { "types": "./dist/consensusHistoryRest.d.ts", "default": "./dist/consensusHistoryRest.js" },
@@ -29,10 +30,13 @@
     "./incrementalIbcTree": { "types": "./dist/incrementalIbcTree.d.ts", "default": "./dist/incrementalIbcTree.js" },
     "./plutusSerialise": { "types": "./dist/plutusSerialise.d.ts", "default": "./dist/plutusSerialise.js" },
     "./historyBootstrap": { "types": "./dist/historyBootstrap.d.ts", "default": "./dist/historyBootstrap.js" },
+    "./tendermintCache": { "types": "./dist/tendermintCache.d.ts", "default": "./dist/tendermintCache.js" },
+    "./tendermintCacheRouting": { "types": "./dist/tendermintCacheRouting.d.ts", "default": "./dist/tendermintCacheRouting.js" },
     "./migrationRuntime": { "types": "./dist/migrationRuntime.d.ts", "default": "./dist/migrationRuntime.js" }
   },
   "typesVersions": {
     "*": {
+      "heartbeatSchedule": ["dist/heartbeatSchedule.d.ts"],
       "yaciRest": ["dist/yaciRest.d.ts"],
       "yaciRestHistory": ["dist/yaciRestHistory.d.ts"],
       "consensusHistoryRest": ["dist/consensusHistoryRest.d.ts"],
@@ -46,6 +50,8 @@
       "incrementalIbcTree": ["dist/incrementalIbcTree.d.ts"],
       "plutusSerialise": ["dist/plutusSerialise.d.ts"],
       "historyBootstrap": ["dist/historyBootstrap.d.ts"],
+      "tendermintCache": ["dist/tendermintCache.d.ts"],
+      "tendermintCacheRouting": ["dist/tendermintCacheRouting.d.ts"],
       "migrationRuntime": ["dist/migrationRuntime.d.ts"]
     }
   },

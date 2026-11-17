@@ -1,4 +1,8 @@
 import {
+  deploymentHeartbeatSchedule,
+  heartbeatScheduleData,
+} from "./heartbeat-schedule.ts";
+import {
   Data,
   fromText,
   type LucidEvolution,
@@ -86,6 +90,9 @@ type BasePlan = {
   governanceAuthority: PlannedValidator | null;
   sessionMint: PlannedValidator;
   updateClient: PlannedValidator;
+  cachedUpdateClient?: PlannedValidator;
+  cacheMint?: PlannedValidator;
+  cacheSpend?: PlannedValidator;
   recoverClient: PlannedValidator;
   verifyProof: PlannedValidator;
   mintPort: PlannedValidator;
@@ -228,7 +235,7 @@ export async function loadSuccessorImplementation(
     }
   }
   const validators: PlannedValidator[] = [];
-  const load = (title: string, params: unknown[], schema: unknown) => {
+  const load = (title: string, params: unknown[], schema?: unknown) => {
     const [script, hash, address] = readValidator(
       title,
       lucid,
@@ -241,22 +248,53 @@ export async function loadSuccessorImplementation(
   const base = [registry.token.policy_id, generation];
   load(
     "upgradeable/host_state.host_state.spend",
-    base,
-    Data.Tuple([Data.Bytes(), Data.Integer()]),
+    [
+      ...base,
+      heartbeatScheduleData(
+        deploymentHeartbeatSchedule(lucid, baseline.inputs.heartbeatSchedule),
+      ),
+    ],
+    undefined,
   );
-  load(
-    "upgradeable/client.client.spend",
-    [...base, baseline.hostNft.hash, baseline.updateClient.hash, {
-      Script: [baseline.recoverClient.hash],
-    }],
-    Data.Tuple([
-      Data.Bytes(),
-      Data.Integer(),
-      Data.Bytes(),
-      Data.Bytes(),
-      CredentialSchema,
-    ]),
-  );
+  if (baseline.cacheMint && baseline.cachedUpdateClient) {
+    load(
+      "upgradeable/cached_client.cached_client.spend",
+      [
+        ...base,
+        baseline.hostNft.hash,
+        baseline.updateClient.hash,
+        baseline.cachedUpdateClient.hash,
+        baseline.cacheMint.hash,
+        { Script: [baseline.recoverClient.hash] },
+      ],
+      Data.Tuple([
+        Data.Bytes(),
+        Data.Integer(),
+        Data.Bytes(),
+        Data.Bytes(),
+        Data.Bytes(),
+        Data.Bytes(),
+        CredentialSchema,
+      ]),
+    );
+  } else {
+    load(
+      "upgradeable/client.client.spend",
+      [
+        ...base,
+        baseline.hostNft.hash,
+        baseline.updateClient.hash,
+        { Script: [baseline.recoverClient.hash] },
+      ],
+      Data.Tuple([
+        Data.Bytes(),
+        Data.Integer(),
+        Data.Bytes(),
+        Data.Bytes(),
+        CredentialSchema,
+      ]),
+    );
+  }
   load(
     "upgradeable/connection.connection.spend",
     [

@@ -1,3 +1,4 @@
+import { checkedHeartbeatSchedule, type HeartbeatSchedule } from '@cardano-ibc/tx-builder-runtime/heartbeatSchedule';
 import { checkedDeploymentMode } from '@cardano-ibc/tx-builder-runtime/migrationRuntime';
 import { requireMigrationConfig, type MigrationRuntimeConfig } from '@cardano-ibc/tx-builder-runtime/migrationRuntime';
 import { requireHistoryBootstrap, type HistoryBootstrap } from '@cardano-ibc/tx-builder-runtime/historyBootstrap';
@@ -112,7 +113,20 @@ type PacketStateManifest = {
   guard: BridgeManifestValidator;
 };
 
+const CACHED_TENDERMINT_ROLES = ['update', 'updateCore', 'generalUpdateCore', 'stagedUpdate', 'cacheSpend', 'cacheMint'] as const;
+type CachedTendermintRole = typeof CACHED_TENDERMINT_ROLES[number];
+export type CachedTendermintConfig = {
+  format: 'authenticated-validator-cache-v1';
+  validators: Record<CachedTendermintRole, DeploymentValidator>;
+};
+type CachedTendermintManifest = {
+  format: 'authenticated-validator-cache-v1';
+  validators: Record<CachedTendermintRole, BridgeManifestValidator>;
+};
+
 export type DeploymentConfig = {
+  heartbeatSchedule?: HeartbeatSchedule;
+  cachedTendermint?: CachedTendermintConfig;
   packetState: PacketStateDeployment;
   deploymentMode?: 'upgradeable' | 'legacy';
   migration?: MigrationRuntimeConfig;
@@ -137,6 +151,7 @@ export type DeploymentConfig = {
     spendTransferModule: DeploymentValidator;
     mintIdentifier: DeploymentValidator;
     verifyProof: DeploymentValidator;
+    verifyMembership?: DeploymentValidator;
     mintClientStt: DeploymentValidator;
     mintConnectionStt: DeploymentValidator;
     mintChannelStt: DeploymentValidator;
@@ -211,10 +226,14 @@ type BridgeManifestTraceRegistry = {
   directory: BridgeManifestTraceRegistryShard;
 };
 
+type ManifestHeartbeatSchedule = { epoch_origin_ms: number; epoch_length_ms: number };
+
 // The manifest is the public, deployment-stable bootstrap document we expose to
 // external operators. It intentionally uses snake_case and only includes the
 // on-chain facts another Gateway/relayer stack needs to reconnect to this bridge.
 export type BridgeManifest = {
+  heartbeat_schedule?: ManifestHeartbeatSchedule;
+  cached_tendermint?: CachedTendermintManifest;
   packet_state: PacketStateManifest;
   deploymentMode?: 'upgradeable' | 'legacy';
   migration?: MigrationRuntimeConfig;
@@ -245,6 +264,7 @@ export type BridgeManifest = {
     spend_transfer_module: BridgeManifestValidator;
     mint_identifier: BridgeManifestValidator;
     verify_proof: BridgeManifestValidator;
+    verify_membership?: BridgeManifestValidator;
     mint_client_stt: BridgeManifestValidator;
     mint_connection_stt: BridgeManifestValidator;
     mint_channel_stt: BridgeManifestValidator;
@@ -752,6 +772,39 @@ function packetStateFromManifest(value: unknown): PacketStateDeployment {
   });
 }
 
+function cachedTendermintConfig(value: unknown): CachedTendermintConfig {
+  const cache = requireObject(value, 'cachedTendermint');
+  assert(cache.format === 'authenticated-validator-cache-v1', 'Unsupported validator cache format');
+  const validators = requireObject(cache.validators, 'cachedTendermint.validators');
+  return { format: 'authenticated-validator-cache-v1', validators: Object.fromEntries(
+    CACHED_TENDERMINT_ROLES.map((role) => [role, requireDeploymentValidator(validators[role], `cachedTendermint.validators.${role}`)]),
+  ) as CachedTendermintConfig['validators'] };
+}
+function validateCachedTendermint(cache: CachedTendermintConfig | undefined, update: DeploymentValidator | undefined, hasSessions: boolean): void {
+  if (!cache) return;
+  assert(hasSessions && update, 'Cached Tendermint requires staged fallback');
+  assert(JSON.stringify(cache.validators.stagedUpdate) === JSON.stringify(update), 'Cached Tendermint pins a different staged verifier');
+  for (const role of ['update', 'updateCore', 'generalUpdateCore', 'cacheSpend'] as const) {
+    assert(Boolean(cache.validators[role].address), `Cached Tendermint ${role} address is missing`);
+  }
+}
+function cachedTendermintToManifest(cache: CachedTendermintConfig): CachedTendermintManifest {
+  return { format: cache.format, validators: Object.fromEntries(CACHED_TENDERMINT_ROLES.map((role) => [role, deploymentValidatorToManifest(cache.validators[role])])) as CachedTendermintManifest['validators'] };
+}
+function cachedTendermintFromManifest(value: unknown): CachedTendermintConfig {
+  const cache = requireObject(value, 'cached_tendermint');
+  const validators = requireObject(cache.validators, 'cached_tendermint.validators');
+  return cachedTendermintConfig({ format: cache.format, validators: Object.fromEntries(CACHED_TENDERMINT_ROLES.map((role) => [role, manifestValidatorToDeployment(requireManifestValidator(validators[role], `cached_tendermint.validators.${role}`))])) });
+}
+
+function heartbeatScheduleToManifest(schedule: HeartbeatSchedule): ManifestHeartbeatSchedule {
+  return { epoch_origin_ms: schedule.epochOriginMs, epoch_length_ms: schedule.epochLengthMs };
+}
+function heartbeatScheduleFromManifest(value: unknown): HeartbeatSchedule {
+  const schedule = requireObject(value, 'heartbeat_schedule');
+  return checkedHeartbeatSchedule({ epochOriginMs: schedule.epoch_origin_ms, epochLengthMs: schedule.epoch_length_ms });
+}
+
 export function requireSttDeploymentConfig(deployment: unknown): DeploymentConfig {
   const deploymentAny = requireObject(deployment, 'deployment');
   const validators = requireObject(deploymentAny.validators, 'validators');
@@ -769,8 +822,11 @@ export function requireSttDeploymentConfig(deployment: unknown): DeploymentConfi
     'Invalid bridge config: staged Tendermint spend and mint session validators must be configured together',
   );
   assert(!validators.updateClient || hasSpendSession, 'Ordinary client forwarding requires staged Tendermint sessions');
+  validateCachedTendermint(deploymentAny.cachedTendermint ? cachedTendermintConfig(deploymentAny.cachedTendermint) : undefined, validators.updateClient ? requireDeploymentValidator(validators.updateClient, 'validators.updateClient') : undefined, hasSpendSession);
 
   return {
+    ...(deploymentAny.cachedTendermint ? { cachedTendermint: cachedTendermintConfig(deploymentAny.cachedTendermint) } : {}),
+    ...(deploymentAny.heartbeatSchedule ? { heartbeatSchedule: checkedHeartbeatSchedule(deploymentAny.heartbeatSchedule) } : {}),
     packetState: requirePacketState(deploymentAny.packetState),
     deploymentMode: checkedDeploymentMode(deploymentAny.deploymentMode, deploymentAny.migration),
     deployedAt: requireIsoTimestamp(deploymentAny.deployedAt, 'deployedAt'),
@@ -821,6 +877,9 @@ export function requireSttDeploymentConfig(deployment: unknown): DeploymentConfi
       spendTransferModule: requireDeploymentValidator(validators.spendTransferModule, 'validators.spendTransferModule'),
       mintIdentifier: requireDeploymentValidator(validators.mintIdentifier, 'validators.mintIdentifier'),
       verifyProof: requireDeploymentValidator(validators.verifyProof, 'validators.verifyProof'),
+      ...(validators.verifyMembership !== undefined
+        ? { verifyMembership: requireDeploymentValidator(validators.verifyMembership, 'validators.verifyMembership') }
+        : {}),
       mintClientStt: requireDeploymentValidator(validators.mintClientStt, 'validators.mintClientStt'),
       mintConnectionStt: requireDeploymentValidator(validators.mintConnectionStt, 'validators.mintConnectionStt'),
       mintChannelStt: requireDeploymentValidator(validators.mintChannelStt, 'validators.mintChannelStt'),
@@ -866,6 +925,7 @@ export function normalizeHandlerJsonDeploymentConfig(
     deployment: normalizedDeployment,
     bridgeManifest: {
       schema_version: 6,
+      ...(normalizedDeployment.cachedTendermint ? { cached_tendermint: cachedTendermintToManifest(normalizedDeployment.cachedTendermint) } : {}),
       packet_state: packetStateToManifest(normalizedDeployment.packetState),
       ...(normalizedDeployment.deploymentMode ? { deploymentMode: normalizedDeployment.deploymentMode } : {}),
       ...(normalizedDeployment.migration ? { migration: normalizedDeployment.migration } : {}),
@@ -875,6 +935,7 @@ export function normalizeHandlerJsonDeploymentConfig(
       ...(normalizedDeployment.history ? { history: normalizedDeployment.history } : {}),
       ics20_packet_codec: normalizedDeployment.ics20PacketCodec,
       cardano: normalizedCardano,
+      ...(normalizedDeployment.heartbeatSchedule ? { heartbeat_schedule: heartbeatScheduleToManifest(normalizedDeployment.heartbeatSchedule) } : {}),
       host_state_nft: deploymentAuthTokenToManifest(normalizedDeployment.hostStateNFT),
       validators: {
         host_state_stt: deploymentValidatorToManifest(normalizedDeployment.validators.hostStateStt),
@@ -909,6 +970,9 @@ export function normalizeHandlerJsonDeploymentConfig(
         spend_transfer_module: deploymentValidatorToManifest(normalizedDeployment.validators.spendTransferModule),
         mint_identifier: deploymentValidatorToManifest(normalizedDeployment.validators.mintIdentifier),
         verify_proof: deploymentValidatorToManifest(normalizedDeployment.validators.verifyProof),
+        ...(normalizedDeployment.validators.verifyMembership
+          ? { verify_membership: deploymentValidatorToManifest(normalizedDeployment.validators.verifyMembership) }
+          : {}),
         mint_client_stt: deploymentValidatorToManifest(normalizedDeployment.validators.mintClientStt),
         mint_connection_stt: deploymentValidatorToManifest(normalizedDeployment.validators.mintConnectionStt),
         mint_channel_stt: deploymentValidatorToManifest(normalizedDeployment.validators.mintChannelStt),
@@ -955,6 +1019,7 @@ export function normalizeBridgeManifestConfig(manifest: unknown): LoadedBridgeCo
     'Invalid bridge config: staged Tendermint spend and mint session validators must be configured together',
   );
   assert(!validators.update_client || hasSpendSession, 'Ordinary client forwarding requires staged Tendermint sessions');
+  validateCachedTendermint(manifestAny.cached_tendermint ? cachedTendermintFromManifest(manifestAny.cached_tendermint) : undefined, validators.update_client ? manifestValidatorToDeployment(requireManifestValidator(validators.update_client, 'validators.update_client')) : undefined, hasSpendSession);
 
   // Manifest startup is the inverse path: validate the public document, then
   // rebuild the internal deployment shape so downstream Gateway code stays
@@ -964,6 +1029,7 @@ export function normalizeBridgeManifestConfig(manifest: unknown): LoadedBridgeCo
     packet_state: packetStateToManifest(packetStateFromManifest(manifestAny.packet_state)),
     deploymentMode: checkedDeploymentMode(manifestAny.deploymentMode, manifestAny.migration),
     ...(manifestAny.migration !== undefined ? { migration: requireMigrationConfig(manifestAny.migration) } : {}),
+    ...(manifestAny.cached_tendermint ? { cached_tendermint: cachedTendermintToManifest(cachedTendermintFromManifest(manifestAny.cached_tendermint)) } : {}),
     consensus_history_format: consensusHistoryFormat,
     deployment_id: requireNonEmptyString(manifestAny.deployment_id, 'deployment_id'),
     deployed_at: requireIsoTimestamp(manifestAny.deployed_at, 'deployed_at'),
@@ -976,6 +1042,7 @@ export function normalizeBridgeManifestConfig(manifest: unknown): LoadedBridgeCo
         ? ICS20_PACKET_CODEC.LEGACY
         : requireIcs20PacketCodec(manifestAny.ics20_packet_codec, 'ics20_packet_codec'),
     cardano,
+    ...(manifestAny.heartbeat_schedule ? { heartbeat_schedule: heartbeatScheduleToManifest(heartbeatScheduleFromManifest(manifestAny.heartbeat_schedule)) } : {}),
     host_state_nft: requireManifestAuthToken(manifestAny.host_state_nft, 'host_state_nft'),
     validators: {
       host_state_stt: requireManifestValidator(validators.host_state_stt, 'validators.host_state_stt'),
@@ -1017,6 +1084,9 @@ export function normalizeBridgeManifestConfig(manifest: unknown): LoadedBridgeCo
       ),
       mint_identifier: requireManifestValidator(validators.mint_identifier, 'validators.mint_identifier'),
       verify_proof: requireManifestValidator(validators.verify_proof, 'validators.verify_proof'),
+      ...(validators.verify_membership !== undefined
+        ? { verify_membership: requireManifestValidator(validators.verify_membership, 'validators.verify_membership') }
+        : {}),
       mint_client_stt: requireManifestValidator(validators.mint_client_stt, 'validators.mint_client_stt'),
       mint_connection_stt: requireManifestValidator(validators.mint_connection_stt, 'validators.mint_connection_stt'),
       mint_channel_stt: requireManifestValidator(validators.mint_channel_stt, 'validators.mint_channel_stt'),
@@ -1050,6 +1120,7 @@ export function normalizeBridgeManifestConfig(manifest: unknown): LoadedBridgeCo
   return {
     bridgeManifest,
     deployment: {
+      ...(bridgeManifest.cached_tendermint ? { cachedTendermint: cachedTendermintFromManifest(bridgeManifest.cached_tendermint) } : {}),
       packetState: packetStateFromManifest(bridgeManifest.packet_state),
       deployedAt: bridgeManifest.deployed_at,
       ...(bridgeManifest.deploymentMode ? { deploymentMode: bridgeManifest.deploymentMode } : {}),
@@ -1057,6 +1128,7 @@ export function normalizeBridgeManifestConfig(manifest: unknown): LoadedBridgeCo
       consensusHistoryFormat,
       ...(bridgeManifest.history ? { history: bridgeManifest.history } : {}),
       ics20PacketCodec: bridgeManifest.ics20_packet_codec,
+      ...(bridgeManifest.heartbeat_schedule ? { heartbeatSchedule: heartbeatScheduleFromManifest(bridgeManifest.heartbeat_schedule) } : {}),
       hostStateNFT: manifestAuthTokenToDeployment(bridgeManifest.host_state_nft),
       validators: {
         hostStateStt: manifestValidatorToDeployment(bridgeManifest.validators.host_state_stt),
@@ -1091,6 +1163,9 @@ export function normalizeBridgeManifestConfig(manifest: unknown): LoadedBridgeCo
         spendTransferModule: manifestValidatorToDeployment(bridgeManifest.validators.spend_transfer_module),
         mintIdentifier: manifestValidatorToDeployment(bridgeManifest.validators.mint_identifier),
         verifyProof: manifestValidatorToDeployment(bridgeManifest.validators.verify_proof),
+        ...(bridgeManifest.validators.verify_membership
+          ? { verifyMembership: manifestValidatorToDeployment(bridgeManifest.validators.verify_membership) }
+          : {}),
         mintClientStt: manifestValidatorToDeployment(bridgeManifest.validators.mint_client_stt),
         mintConnectionStt: manifestValidatorToDeployment(bridgeManifest.validators.mint_connection_stt),
         mintChannelStt: manifestValidatorToDeployment(bridgeManifest.validators.mint_channel_stt),

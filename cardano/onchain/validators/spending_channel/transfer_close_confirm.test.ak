@@ -50,6 +50,7 @@ use ibc/core/ics_023_vector_commitments/ics23/proofs.{
 use ibc/core/ics_023_vector_commitments/merkle.{MerkleProof,
   MerkleRoot} as merkle
 use ibc/core/ics_024_host_requirements/channel_keys
+use ibc/core/ics_025_handler_interface/heartbeat.{HeartbeatSchedule}
 use ibc/core/ics_025_handler_interface/host_state.{
   HostState, HostStateControl, HostStateDatum, ModuleRegistration,
 }
@@ -509,6 +510,7 @@ fn check_close(f: Fixture) -> Bool {
       mock.connection_minting_policy_id,
       mock.channel_minting_policy_id,
       "",
+      HeartbeatSchedule { epoch_origin_ms: 0, epoch_length_ms: 2001 },
       None,
       f.host_redeemer,
       host_input.output_reference,
@@ -804,6 +806,7 @@ fn cancel_after_close(authority: Bool) -> Bool {
       mock.connection_minting_policy_id,
       mock.channel_minting_policy_id,
       "",
+      HeartbeatSchedule { epoch_origin_ms: 0, epoch_length_ms: 2001 },
       None,
       UpgradeChannel,
       host_input.output_reference,

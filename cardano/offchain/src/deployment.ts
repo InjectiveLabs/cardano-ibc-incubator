@@ -353,6 +353,8 @@ const buildBindPortHostStateUpdate = async (
 };
 
 export type DeploymentOptions = {
+  heartbeatSchedule?:
+    import("../../../packages/cardano-ibc-tx-builder-runtime/src/heartbeatSchedule.ts").HeartbeatSchedule;
   deploymentMode?: "upgradeable" | "legacy";
   migration?: {
     governance: Governance;
@@ -460,6 +462,7 @@ export const createDeployment = async (
       );
     }
     const plan = await loadDeploymentPlan(lucid, {
+      heartbeatSchedule: options.heartbeatSchedule,
       hostStateNonce: buildOutputReference(nonces[0]),
       transferModuleNonce: buildOutputReference(nonces[1]),
       traceDirectoryNonce: buildOutputReference(
@@ -708,13 +711,28 @@ export const createDeployment = async (
   const mintChannelSttValidator = plan.mintChannel.script;
   const mintChannelSttPolicyId = plan.mintChannel.hash;
 
+  const clientWithdrawalScripts = [
+    plan.recoverClient,
+    plan.updateClient,
+    plan.cachedUpdateClient,
+    plan.verifyCachedClient,
+    plan.verifyGeneralCachedClient,
+  ];
   await submitTx(
-    () =>
-      lucid.newTx().register.Stake(recoverClientAddress).register.Stake(
-        updateClientAddress,
-      ),
+    () => {
+      let tx = lucid.newTx();
+      for (const validator of clientWithdrawalScripts) {
+        tx = tx.register.Stake(
+          validatorToRewardAddress(
+            lucid.config().network || "Custom",
+            validator.script,
+          ),
+        );
+      }
+      return tx;
+    },
     lucid,
-    "RegisterRecoverClient",
+    "RegisterClientVerifiers",
     false,
   );
   reservedDeploymentRefs = await setSpendableWalletUtxos();
@@ -906,7 +924,33 @@ export const createDeployment = async (
     address: planned.address,
     refUtxo: refUtxosInfo[planned.hash],
   });
+  const cachedScript = (validator: typeof plan.updateClient) => ({
+    title: validator.title,
+    script: validator.script.script,
+    scriptHash: validator.hash,
+    address: validator.title.endsWith(".withdraw")
+      ? validatorToRewardAddress(
+        lucid.config().network || "Custom",
+        validator.script,
+      )
+      : validator.title.endsWith(".mint")
+      ? ""
+      : validator.address,
+    refUtxo: refUtxosInfo[validator.hash],
+  });
   const deploymentInfo: DeploymentTemplate = {
+    heartbeatSchedule: plan.inputs.heartbeatSchedule,
+    cachedTendermint: {
+      format: "authenticated-validator-cache-v1",
+      validators: {
+        update: cachedScript(plan.cachedUpdateClient),
+        updateCore: cachedScript(plan.verifyCachedClient),
+        generalUpdateCore: cachedScript(plan.verifyGeneralCachedClient),
+        stagedUpdate: cachedScript(plan.updateClient),
+        cacheSpend: cachedScript(plan.cacheSpend),
+        cacheMint: cachedScript(plan.cacheMint),
+      },
+    },
     packetState: {
       configuration: packetValidator(plan.packetConfig),
       operations: Object.fromEntries(
@@ -935,6 +979,9 @@ export const createDeployment = async (
             plan.registry.token.name,
           registryAddress: plan.implementationRegistry.address,
           registryReference: refUtxosInfo[plan.implementationRegistry.hash],
+          governanceAuthority: plan.governanceAuthority
+            ? cachedScript(plan.governanceAuthority)
+            : undefined,
           registryDatum: Data.to(plan.registry, Registry),
           generation: "1",
           compatibility: plan.registry.current.compatibility,
@@ -1081,6 +1128,13 @@ export const createDeployment = async (
           },
         }
         : {}),
+      verifyMembership: {
+        title: plan.verifyMembership.title,
+        script: plan.verifyMembership.script.script,
+        scriptHash: plan.verifyMembership.hash,
+        address: "",
+        refUtxo: refUtxosInfo[plan.verifyMembership.hash],
+      },
       verifyProof: {
         title: "verifying_proof.verify_proof.mint",
         script: verifyProofValidator.script,

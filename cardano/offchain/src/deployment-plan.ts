@@ -1,4 +1,10 @@
 import {
+  deploymentHeartbeatSchedule,
+  heartbeatScheduleData,
+} from "./heartbeat-schedule.ts";
+import type { HeartbeatSchedule } from "../../../packages/cardano-ibc-tx-builder-runtime/src/heartbeatSchedule.ts";
+import { loadCachedTendermintValidators } from "./tendermint-cache-validators.ts";
+import {
   type ClientRegistration,
   clientRegistryData,
 } from "./client-registry.ts";
@@ -25,7 +31,6 @@ import {
   assertGovernance,
   type Authority,
   AuthoritySchema,
-  CredentialSchema,
   type Governance,
   GovernanceSchema,
   plutusAddress,
@@ -44,6 +49,7 @@ export type PlannedValidator = {
   address: string;
 };
 export type DeploymentPlanInputs = {
+  heartbeatSchedule?: HeartbeatSchedule;
   hostStateNonce: OutputReference;
   transferModuleNonce: OutputReference;
   traceDirectoryNonce: OutputReference;
@@ -57,78 +63,7 @@ export type DeploymentPlanInputs = {
   };
 };
 
-export const loadStagedTendermintValidators = (
-  lucid: LucidEvolution,
-  hostStateNftPolicyId: string,
-  recoveryScriptHash: string,
-) => {
-  const [sessionSpendValidator, sessionSpendScriptHash, sessionSpendAddress] =
-    readValidator(
-      "spending_tendermint_update_session.spend_tendermint_update_session.spend",
-      lucid,
-      [hostStateNftPolicyId],
-      Data.Tuple([Data.Bytes()]) as unknown as [string],
-    );
-
-  const [sessionMintValidator, sessionMintPolicyId, sessionMintAddress] =
-    readValidator(
-      "minting_tendermint_update_session.mint_tendermint_update_session.mint",
-      lucid,
-      [sessionSpendScriptHash],
-      Data.Tuple([Data.Bytes()]) as unknown as [string],
-    );
-
-  const [updateValidator, updateHash, updateAddress] = readValidator(
-    "update_staged_client.update_staged_client.withdraw",
-    lucid,
-    [hostStateNftPolicyId, sessionMintPolicyId, recoveryScriptHash],
-    Data.Tuple([Data.Bytes(), Data.Bytes(), Data.Bytes()]) as unknown as [
-      string,
-      string,
-      string,
-    ],
-  );
-
-  const [clientSpendValidator, clientSpendScriptHash, clientSpendAddress] =
-    readValidator(
-      "spending_multitx_client.spend_multitx_client.spend",
-      lucid,
-      [hostStateNftPolicyId, updateHash, {
-        Script: [recoveryScriptHash],
-      }],
-      Data.Tuple([
-        Data.Bytes(),
-        Data.Bytes(),
-        Data.Enum([
-          Data.Object({ VerificationKey: Data.Tuple([Data.Bytes()]) }),
-          Data.Object({ Script: Data.Tuple([Data.Bytes()]) }),
-        ]),
-      ]) as unknown as [string, string, { Script: [string] }],
-    );
-
-  return {
-    updateClient: {
-      validator: updateValidator,
-      scriptHash: updateHash,
-      address: updateAddress,
-    },
-    sessionSpend: {
-      validator: sessionSpendValidator,
-      scriptHash: sessionSpendScriptHash,
-      address: sessionSpendAddress,
-    },
-    sessionMint: {
-      validator: sessionMintValidator,
-      policyId: sessionMintPolicyId,
-      address: sessionMintAddress,
-    },
-    clientSpend: {
-      validator: clientSpendValidator,
-      scriptHash: clientSpendScriptHash,
-      address: clientSpendAddress,
-    },
-  };
-};
+export { loadStagedTendermintValidators } from "./tendermint-validators.ts";
 
 export const buildChannelValidators = (
   lucid: LucidEvolution,
@@ -187,6 +122,7 @@ export const loadHostStateValidator = (
   connectionMintPolicyId: string,
   channelMintPolicyId: string,
   backupOperatorKeyHash = "",
+  heartbeatSchedule = deploymentHeartbeatSchedule(lucid),
 ) =>
   readValidator(
     "host_state_stt.host_state_stt.spend",
@@ -200,6 +136,7 @@ export const loadHostStateValidator = (
       connectionMintPolicyId,
       channelMintPolicyId,
       backupOperatorKeyHash,
+      heartbeatScheduleData(heartbeatSchedule),
     ],
   );
 
@@ -212,6 +149,11 @@ export const loadDeploymentPlan = async (
   lucid: LucidEvolution,
   inputs: DeploymentPlanInputs,
 ) => {
+  const heartbeatSchedule = deploymentHeartbeatSchedule(
+    lucid,
+    inputs.heartbeatSchedule,
+  );
+  inputs = { ...inputs, heartbeatSchedule };
   const backupOperatorKeyHash =
     inputs.backupOperatorKeyHash?.trim().toLowerCase() ??
       "";
@@ -270,6 +212,10 @@ export const loadDeploymentPlan = async (
     name: fromText("ibc_packet_config"),
   };
   const verifyProof = load("verifying_proof.verify_proof.mint", "runtime");
+  const verifyMembership = load(
+    "verifying_membership.verify_membership.mint",
+    "runtime",
+  );
   const mintPort = load(
     "minting_port.mint_port.mint",
     "bootstrap",
@@ -324,10 +270,39 @@ export const loadDeploymentPlan = async (
       "runtime",
       bytes(hostPolicy, verifyProof.hash),
     );
-  const staged = loadStagedTendermintValidators(
+  const cached = loadCachedTendermintValidators(
     lucid,
     hostPolicy,
     recoverClient.hash,
+    registryPolicy,
+  );
+  const staged = cached.staged;
+  const cacheSpend = register(
+    registryPolicy
+      ? "upgradeable/validator_cache.validator_cache.spend"
+      : "spending_validator_cache.spend_validator_cache.spend",
+    "runtime",
+    cached.cacheSpend,
+  );
+  const cacheMint = register(
+    "minting_validator_cache.mint_validator_cache.mint",
+    "runtime",
+    cached.cacheMint,
+  );
+  const cachedUpdateClient = register(
+    "update_cached_client.update_cached_client.withdraw",
+    "runtime",
+    cached.update,
+  );
+  const verifyCachedClient = register(
+    "verify_cached_client.verify_cached_client.withdraw",
+    "runtime",
+    cached.updateCore,
+  );
+  const verifyGeneralCachedClient = register(
+    "verify_general_cached_client.verify_general_cached_client.withdraw",
+    "runtime",
+    cached.generalUpdateCore,
   );
   const sessionSpend = register(
     "spending_tendermint_update_session.spend_tendermint_update_session.spend",
@@ -356,43 +331,20 @@ export const loadDeploymentPlan = async (
       staged.updateClient.address,
     ],
   );
-  const spendClient = registryPolicy
-    ? load(
-      "upgradeable/client.client.spend",
-      "runtime",
-      [
-        registryPolicy,
-        1n,
-        hostPolicy,
-        updateClient.hash,
-        { Script: [recoverClient.hash] },
-      ],
-      Data.Tuple([
-        Data.Bytes(),
-        Data.Integer(),
-        Data.Bytes(),
-        Data.Bytes(),
-        CredentialSchema,
-      ]),
-    )
-    : register(
-      "spending_multitx_client.spend_multitx_client.spend",
-      "runtime",
-      [
-        staged.clientSpend.validator,
-        staged.clientSpend.scriptHash,
-        staged.clientSpend.address,
-      ],
-    );
-  const mintClient = registryPolicy
-    ? load("upgradeable/mint_client.mint_client.mint", "runtime", [
-      registryPolicy,
-    ])
-    : load(
-      "minting_client_stt.mint_client_stt.mint",
-      "runtime",
-      bytes(spendClient.hash, hostPolicy),
-    );
+  const spendClient = register(
+    registryPolicy
+      ? "upgradeable/cached_client.cached_client.spend"
+      : "spending_cached_client.spend_cached_client.spend",
+    "runtime",
+    cached.clientSpend,
+  );
+  const mintClient = register(
+    registryPolicy
+      ? "upgradeable/mint_cached_client.mint_cached_client.mint"
+      : "minting_cached_client.mint_cached_client.mint",
+    "runtime",
+    cached.clientMint,
+  );
   const clientRegistrations: ClientRegistration[] = [{
     clientType: "07-tendermint",
     implementation: "tendermint",
@@ -491,7 +443,8 @@ export const loadDeploymentPlan = async (
     ? load("upgradeable/host_state.host_state.spend", "bootstrap", [
       registryPolicy,
       1n,
-    ], Data.Tuple([Data.Bytes(), Data.Integer()]))
+      heartbeatScheduleData(heartbeatSchedule),
+    ] as Data[])
     : register(
       "host_state_stt.host_state_stt.spend",
       "bootstrap",
@@ -505,6 +458,7 @@ export const loadDeploymentPlan = async (
         mintConnection.hash,
         mintChannel.hash,
         backupOperatorKeyHash,
+        heartbeatSchedule,
       ),
     );
   const packetLaneCount = 16;
@@ -575,7 +529,13 @@ export const loadDeploymentPlan = async (
         mintConnection.hash,
         BigInt(packetLaneCount),
         mintVoucher.hash,
-        ...(proofs ? [verifyProof.hash] : []),
+        ...(proofs
+          ? [
+            ["receive", "acknowledge"].includes(name)
+              ? verifyMembership.hash
+              : verifyProof.hash,
+          ]
+          : []),
       ],
       Data.Tuple([
         AuthTokenSchema,
@@ -729,9 +689,15 @@ export const loadDeploymentPlan = async (
     packetOperations,
     packetLaneCount,
     verifyProof,
+    verifyMembership,
     mintPort,
     recoverClient,
     updateClient,
+    cachedUpdateClient,
+    verifyCachedClient,
+    verifyGeneralCachedClient,
+    cacheSpend,
+    cacheMint,
     sessionSpend,
     sessionMint,
     spendClient,

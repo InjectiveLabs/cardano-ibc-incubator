@@ -391,12 +391,12 @@ export class ConnectionService {
         connectionId,
         pendingTreeUpdate,
       } = await this.buildUnsignedConnectionOpenTryTx(connectionOpenTryOperator, constructedAddress);
-      const { validToTime } = await this.computeTxValidityWindow();
+      const { validFromTime, validToTime } = await this.computeTxValidityWindow();
       const { unsignedTxBytes: cborHexBytes } = await this.txOperationRunnerService.run({
         operationName: 'connectionOpenTry',
         unsignedTx: unsignedConnectionOpenTryTx,
         validity: {
-          apply: (builder: TxBuilder) => builder.validTo(validToTime),
+          apply: (builder: TxBuilder) => builder.validFrom(validFromTime).validTo(validToTime),
         },
         wallet: {
           mode: 'refresh_from_address',
@@ -607,12 +607,12 @@ export class ConnectionService {
         counterpartyConnectionId,
         pendingTreeUpdate,
       } = await this.buildUnsignedConnectionOpenConfirmTx(connectionOpenConfirmOperator, constructedAddress);
-      const { validToTime } = await this.computeTxValidityWindow();
+      const { validFromTime, validToTime } = await this.computeTxValidityWindow();
       const { unsignedTxBytes: cborHexBytes } = await this.txOperationRunnerService.run({
         operationName: 'connectionOpenConfirm',
         unsignedTx: unsignedConnectionOpenConfirmTx,
         validity: {
-          apply: (builder: TxBuilder) => builder.validTo(validToTime),
+          apply: (builder: TxBuilder) => builder.validFrom(validFromTime).validTo(validToTime),
         },
         wallet: {
           mode: 'refresh_from_address',
@@ -1353,8 +1353,8 @@ export class ConnectionService {
       connectionDatum.state.counterparty.connection_id.length % 2 === 0
         ? convertHex2String(connectionDatum.state.counterparty.connection_id)
         : connectionDatum.state.counterparty.connection_id;
-    if (connectionDatum.state.state !== State.Init) {
-      throw new Error('ConnOpenAck to a Connection not in Init state');
+    if (connectionDatum.state.state !== State.TryOpen) {
+      throw new Error('ConnOpenConfirm requires a connection in TryOpen state');
     }
     const clientSequence = parseClientSequence(convertHex2String(connectionDatum.state.client_id));
     const updatedConnectionDatum: ConnectionDatum = {

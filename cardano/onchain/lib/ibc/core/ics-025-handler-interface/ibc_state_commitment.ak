@@ -104,12 +104,8 @@ fn inner_hash_validated(left: ByteArray, right: ByteArray) -> ByteArray {
   // Special-case an entirely empty subtree.
   //
   // If both children are empty, the parent is empty too.
-  // Both children are known 32-byte hashes. Integer zero identifies exactly
-  // the all-zero digest without repeating its 32-byte literal in the script.
-  if builtin.bytearray_to_integer(True, left) == 0 && builtin.bytearray_to_integer(
-    True,
-    right,
-  ) == 0 {
+  // Both children are known 32-byte hashes. Compare their exact bytes.
+  if left == empty_hash && right == empty_hash {
     builtin.integer_to_bytearray(True, 32, 0)
   } else {
     builtin.cons_bytearray(1, builtin.append_bytearray(left, right))
@@ -168,7 +164,7 @@ fn compute_root_go(
       current
     }
     [sibling, ..rest] -> {
-      expect bytearray.length(sibling) == hash_size_bytes
+      let sibling = checked_sibling(sibling)
       let next =
         if builtin.read_bit(path, depth) {
           inner_hash_validated(sibling, current)
@@ -226,14 +222,27 @@ pub fn apply_update(
 // The existing redeemer list can carry it without changing its constructors.
 fn witnessed_position(key_hash, expected_leaf, siblings) {
   when siblings is {
+    // Collision descriptors are at least 65 bytes. Invalid short siblings
+    // still fail checked_sibling when the root is reconstructed.
     [first, ..rest] ->
-      if bytearray.length(first) == hash_size_bytes {
+      if bytearray.length(first) <= hash_size_bytes {
         (expected_leaf, #"", siblings)
       } else {
         let entries = checked_bucket(first, key_hash, expected_leaf)
         (bucket_hash(entries), entries, rest)
       }
     [] -> fail
+  }
+}
+
+// Empty bytes encode a default sibling without repeating its 32 zero bytes.
+// The path still has exactly 64 positions. Full paths remain accepted.
+fn checked_sibling(sibling: ByteArray) -> ByteArray {
+  if sibling == #"" {
+    builtin.integer_to_bytearray(True, hash_size_bytes, 0)
+  } else {
+    expect bytearray.length(sibling) == hash_size_bytes
+    sibling
   }
 }
 
@@ -333,7 +342,7 @@ fn updated_roots(
       (old, new)
     }
     [sibling, ..rest] -> {
-      expect bytearray.length(sibling) == hash_size_bytes
+      let sibling = checked_sibling(sibling)
       let sibling_on_left = builtin.read_bit(path, depth)
       let next_old =
         if sibling_on_left {
