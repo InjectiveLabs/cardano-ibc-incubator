@@ -63,6 +63,7 @@ if [ -z "${SOURCE_MODULE_PATH}" ]; then
   exit 1
 fi
 
+ANTE_FILE=""
 case "${MODULE_PATH}" in
   github.com/osmosis-labs/osmosis/*)
     if [ "${IBC_GO_MAJOR}" != "8" ]; then
@@ -80,11 +81,13 @@ case "${MODULE_PATH}" in
     fi
     CLIENT_REL_DIR="injective-chain/modules/cardano-probabilistic-light-client"
     APP_FILE="${CHAIN_DIR}/injective-chain/app/app.go"
+    ANTE_FILE="${CHAIN_DIR}/injective-chain/app/ante/ante.go"
     APP_KIND="injective"
     ;;
   github.com/cosmos/ibc-go/v8)
     CLIENT_REL_DIR="testing/simapp/cardano-probabilistic-light-client"
     APP_FILE="${CHAIN_DIR}/testing/simapp/app.go"
+    ANTE_FILE="${CHAIN_DIR}/testing/simapp/ante.go"
     APP_KIND="ibc-go-simapp"
     ;;
   github.com/cosmos/ibc-go/v10)
@@ -159,13 +162,6 @@ elif [ "${APP_KIND}" = "injective" ]; then
     perl -0pi -e 's#(\t\tibctm\.NewAppModule\(\),\n)#${1}\t\tcardanoprobabilistic.NewAppModule(),\n#' "${APP_FILE}"
   fi
 elif [ "${APP_KIND}" = "ibc-go-simapp" ]; then
-  if ! grep -q 'cardanoprobabilistic.InstallHostLiveness(app)' "${APP_FILE}"; then
-    perl -0pi -e 's#(app.SetAnteHandler\(anteHandler\))#${1}\n\tcardanoprobabilistic.InstallHostLiveness(app)#' "${APP_FILE}"
-  fi
-  if ! grep -q 'cardanoprobabilistic.InstallHostLiveness(app)' "${APP_FILE}"; then
-    echo "[cardano-light-client-patch] failed to install host continuity hooks" >&2
-    exit 1
-  fi
   if ! grep -q "${CLIENT_IMPORT}" "${APP_FILE}"; then
     perl -0pi -e "s#(ibctm \"github.com/cosmos/ibc-go/v${IBC_GO_MAJOR}/modules/light-clients/07-tendermint\"\n)#\$1\tcardanoprobabilistic \"${CLIENT_IMPORT}\"\n#" "${APP_FILE}"
   fi
@@ -217,19 +213,45 @@ fi
 
 # Versioned snapshots are part of the application's authenticated state.
 # Store keys must be the exact mounted SDK key objects, not matching names.
-python3 - "${APP_FILE}" "${APP_KIND}" "${IBC_GO_MAJOR}" <<'PY_SHARED_STORE'
+python3 - "${APP_FILE}" "${APP_KIND}" "${IBC_GO_MAJOR}" "${ANTE_FILE}" "${CLIENT_IMPORT}" <<'PY_SHARED_STORE'
 import re
 import sys
 from pathlib import Path
 path = Path(sys.argv[1])
-kind, major = sys.argv[2:]
+kind, major, ante_file, client_import = sys.argv[2:]
 source = path.read_text()
-if kind == "injective" and "cardanoprobabilistic.InstallHostLiveness(app)" not in source:
-    ante = "app.SetAnteHandler(anteHandler)"
-    if ante not in source:
-        raise SystemExit("Cannot identify the Injective host continuity hook")
-    source = source.replace(ante, ante + "\n\t\tcardanoprobabilistic.InstallHostLiveness(app)", 1)
 if kind in ("injective", "ibc-go-simapp"):
+    hook = "cardanoprobabilistic.InstallHostLiveness(app)"
+    if major == "8":
+        begin_hook = "app.SetBeginBlocker(cardanoprobabilistic.HostLivenessBeginBlocker(app.BeginBlocker))"
+        source = source.replace(hook, begin_hook)
+        hook = begin_hook
+
+        ante_path = Path(ante_file)
+        ante = ante_path.read_text()
+        decorator = "cardanoprobabilistic.HostLivenessDecorator{}"
+        if decorator not in ante:
+            if kind == "ibc-go-simapp":
+                inserts = [("ante.NewSetUpContextDecorator(),", decorator + ",")]
+            elif re.search(r"(?m)^\s*lockAndCache,", ante):
+                inserts = [("lockAndCache,", decorator + ",")]
+            else:
+                # Older Injective builds route EVM through ExtraDecorators.
+                inserts = [("wasmkeeper.NewLimitSimulationGasDecorator(", decorator + ","),
+                           ("MaxTxGasWanted:", "ExtraDecorators: []sdk.AnteDecorator{" + decorator + "},")]
+            for anchor, line in inserts:
+                pattern = r"(?m)^([ \t]*)" + re.escape(anchor) + r".*$"
+                ante, count = re.subn(pattern, lambda m: m[0] + "\n" + m[1] + line, ante)
+                if not count:
+                    raise SystemExit(f"Cannot find {anchor} in {ante_path}")
+            ante = ante.replace("import (\n", f'import (\n\tcardanoprobabilistic "{client_import}"\n', 1)
+            ante_path.write_text(ante)
+
+    if hook not in source:
+        pattern = r"(?m)^([ \t]*)app\.SetAnteHandler\(anteHandler\)$"
+        source, count = re.subn(pattern, lambda m: m[0] + "\n" + m[1] + hook, source, count=1)
+        if not count:
+            raise SystemExit("Cannot identify the host continuity hook")
     mounted = re.search(r"\bapp\.MountKVStores\((app\.keys|keys)\)", source)
     if mounted is None:
         raise SystemExit("Cannot identify the destination snapshot store mount")
@@ -273,6 +295,9 @@ PY_SHARED_STORE
 
 if command -v gofmt >/dev/null 2>&1; then
   gofmt -w "${CLIENT_DIR}" "${APP_FILE}"
+  if [ -n "${ANTE_FILE}" ]; then
+    gofmt -w "${ANTE_FILE}"
+  fi
 fi
 
 if command -v go >/dev/null 2>&1; then

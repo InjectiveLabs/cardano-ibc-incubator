@@ -3,7 +3,6 @@ package probabilistic
 import (
 	"encoding/binary"
 
-	storetypes "cosmossdk.io/store/types"
 	state "github.com/cardano-foundation/cardano-ibc-incubator/cosmos/cardano-probabilistic-light-client-core/state"
 	sdk "github.com/cosmos/cosmos-sdk/types"
 )
@@ -14,26 +13,10 @@ var previousHostProgressKey = []byte("snapshots/v2/host/previousContinuity")
 type hostProgressContextKey struct{}
 type hostProgressProvider func(sdk.Context) *state.HostProgress
 
-// HostApplication exposes the existing IBC store and SDK block/transaction hooks.
-// InstallHostLiveness must run after the host sets its ante handler and before sealing.
-type HostApplication interface {
-	GetKey(string) *storetypes.KVStoreKey
-	BeginBlocker(sdk.Context) (sdk.BeginBlock, error)
-	SetBeginBlocker(sdk.BeginBlocker)
-	AnteHandler() sdk.AnteHandler
-	SetAnteHandler(sdk.AnteHandler)
-}
-
-// InstallHostLiveness records every host block before transactions execute.
-// Interrupted intervals do not advance an unfinished stake response window.
-// The ante wrapper only supplies evidence. It never prevents challenges executing.
-func InstallHostLiveness(app HostApplication) {
-	key := SharedStoreKey
-	if app.GetKey("ibc") == nil || app.AnteHandler() == nil {
-		panic("probabilistic host requires IBC store and ante handler")
-	}
-	app.SetBeginBlocker(func(ctx sdk.Context) (sdk.BeginBlock, error) {
-		store := ctx.KVStore(key)
+// HostLivenessBeginBlocker records host progress before the host's block hooks run.
+func HostLivenessBeginBlocker(next sdk.BeginBlocker) sdk.BeginBlocker {
+	return func(ctx sdk.Context) (sdk.BeginBlock, error) {
+		store := ctx.KVStore(SharedStoreKey)
 		previous := store.Get(hostProgressKey)
 		progress, err := state.AdvanceHostProgress(state.Context{Time: ctx.BlockTime(), Height: ctx.BlockHeight()}, decodeHostProgress(previous))
 		if err != nil {
@@ -43,38 +26,23 @@ func InstallHostLiveness(app HostApplication) {
 			store.Set(previousHostProgressKey, previous)
 		}
 		store.Set(hostProgressKey, encodeHostProgress(progress))
-		return app.BeginBlocker(ctx)
-	})
-	ante := app.AnteHandler()
-	app.SetAnteHandler(func(ctx sdk.Context, tx sdk.Tx, simulate bool) (sdk.Context, error) {
-		// Snapshot before IBC ante verification. SDK simulation can keep an
-		// older context while the underlying store advances during verification.
-		store := ctx.MultiStore().GetKVStore(key)
-		currentBytes, previousBytes := store.Get(hostProgressKey), store.Get(previousHostProgressKey)
-		progress := decodeHostProgress(currentBytes)
-		if progress == nil || progress.Height != ctx.BlockHeight() {
-			progress = decodeHostProgress(previousBytes)
-		}
-		charged := false
-		chargeReads := func(current sdk.Context) {
-			if !charged {
-				config := current.KVGasConfig()
-				current.GasMeter().ConsumeGas(2*config.ReadCostFlat+uint64(len(hostProgressKey)+len(previousHostProgressKey)+len(currentBytes)+len(previousBytes))*config.ReadCostPerByte, "probabilistic host continuity reads")
-				charged = true
-			}
-		}
-		// IBC ante decorators can verify proofs. Supply the immutable record
-		// first, then charge the reads with the gas meter installed by the host.
-		ctx = ctx.WithValue(hostProgressContextKey{}, hostProgressProvider(func(current sdk.Context) *state.HostProgress {
-			chargeReads(current)
-			return progress
-		}))
-		result, err := ante(ctx, tx, simulate)
-		if !result.IsZero() {
-			chargeReads(result)
-		}
-		return result, err
-	})
+		return next(ctx)
+	}
+}
+
+// HostLivenessDecorator snapshots host progress after gas setup and before IBC proof verification.
+type HostLivenessDecorator struct{}
+
+func (HostLivenessDecorator) AnteHandle(ctx sdk.Context, tx sdk.Tx, simulate bool, next sdk.AnteHandler) (sdk.Context, error) {
+	store := ctx.KVStore(SharedStoreKey)
+	current, previous := store.Get(hostProgressKey), store.Get(previousHostProgressKey)
+	progress := decodeHostProgress(current)
+	if progress == nil || progress.Height != ctx.BlockHeight() {
+		progress = decodeHostProgress(previous)
+	}
+	// A simulation can keep an older context while the underlying store advances.
+	provider := hostProgressProvider(func(sdk.Context) *state.HostProgress { return progress })
+	return next(ctx.WithValue(hostProgressContextKey{}, provider), tx, simulate)
 }
 
 func encodeHostProgress(p *state.HostProgress) []byte {
