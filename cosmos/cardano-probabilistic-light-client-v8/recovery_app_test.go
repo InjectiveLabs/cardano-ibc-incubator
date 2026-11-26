@@ -2,12 +2,14 @@ package probabilistic
 
 import (
 	"cosmossdk.io/log"
+	circuitante "cosmossdk.io/x/circuit/ante"
 	abci "github.com/cometbft/cometbft/abci/types"
 	cmttypes "github.com/cometbft/cometbft/types"
 	dbm "github.com/cosmos/cosmos-db"
 	"github.com/cosmos/cosmos-sdk/client/flags"
 	"github.com/cosmos/cosmos-sdk/crypto/keys/secp256k1"
 	simtestutil "github.com/cosmos/cosmos-sdk/testutil/sims"
+	authante "github.com/cosmos/cosmos-sdk/x/auth/ante"
 	authtypes "github.com/cosmos/cosmos-sdk/x/auth/types"
 	banktypes "github.com/cosmos/cosmos-sdk/x/bank/types"
 
@@ -21,6 +23,7 @@ import (
 	cmtproto "github.com/cometbft/cometbft/api/cometbft/types/v1"
 	sdk "github.com/cosmos/cosmos-sdk/types"
 
+	ibcante "github.com/cosmos/ibc-go/v8/modules/core/ante"
 	"github.com/cosmos/ibc-go/v8/testing/simapp"
 	"github.com/stretchr/testify/require"
 )
@@ -89,7 +92,26 @@ func nativeSettlementHeaderAtAnchor(t *testing.T, original *ProbabilisticHeader,
 
 // Register the same client route as the compatibility profile's simd.
 func registerCapacityClient(app *simapp.SimApp) {
-	InstallHostLiveness(app)
+	app.SetBeginBlocker(HostLivenessBeginBlocker(app.BeginBlocker))
+	// SimApp exposes its assembled handler. Build the same chain with the
+	// host snapshot inside the SDK gas setup, as in the v8 simd profile.
+	app.SetAnteHandler(sdk.ChainAnteDecorators(
+		authante.NewSetUpContextDecorator(),
+		HostLivenessDecorator{},
+		circuitante.NewCircuitBreakerDecorator(&app.CircuitKeeper),
+		authante.NewExtensionOptionsDecorator(nil),
+		authante.NewValidateBasicDecorator(),
+		authante.NewTxTimeoutHeightDecorator(),
+		authante.NewValidateMemoDecorator(app.AccountKeeper),
+		authante.NewConsumeGasForTxSizeDecorator(app.AccountKeeper),
+		authante.NewDeductFeeDecorator(app.AccountKeeper, app.BankKeeper, app.FeeGrantKeeper, nil),
+		authante.NewSetPubKeyDecorator(app.AccountKeeper),
+		authante.NewValidateSigCountDecorator(app.AccountKeeper),
+		authante.NewSigGasConsumeDecorator(app.AccountKeeper, authante.DefaultSigVerificationGasConsumer),
+		authante.NewSigVerificationDecorator(app.AccountKeeper, app.TxConfig().SignModeHandler()),
+		authante.NewIncrementSequenceDecorator(app.AccountKeeper),
+		ibcante.NewRedundantRelayDecorator(app.IBCKeeper),
+	))
 	RegisterInterfaces(app.InterfaceRegistry())
 }
 

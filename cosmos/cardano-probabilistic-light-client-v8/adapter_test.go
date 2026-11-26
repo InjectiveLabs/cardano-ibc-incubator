@@ -294,7 +294,7 @@ func testAdapterPoolRegistry(epoch uint64, entries []*StakeDistributionEntry) *P
 	return result
 }
 
-// Unit tests advance a virtual uninterrupted clock. Live hosts use InstallHostLiveness.
+// Unit tests advance a virtual uninterrupted clock. Live hosts record progress at BeginBlock.
 func withTestHostProgress(ctx sdk.Context) sdk.Context {
 	return ctx.WithValue(hostProgressContextKey{}, hostProgressProvider(func(current sdk.Context) *state.HostProgress {
 		return &state.HostProgress{Height: current.BlockHeight(), TimeUnixNs: uint64(current.BlockTime().UnixNano()), PreviousTimeUnixNs: uint64(current.BlockTime().UnixNano() - 1), ClockID: 1, ObservationTime: uint64(current.BlockTime().UnixNano()), PreviousObservationTime: uint64(current.BlockTime().UnixNano() - 1)}

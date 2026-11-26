@@ -81,9 +81,8 @@ func TestSnapshotHostReplacementDoesNotStartChallengeWindow(t *testing.T) {
 	store := ctx.KVStore(key)
 	previous := &state.HostProgress{Height: ctx.BlockHeight() - 1, TimeUnixNs: uint64(now.Add(-time.Second).UnixNano()), ClockID: 1}
 	store.Set([]byte("probabilisticHost/continuity"), encodeHostProgress(previous))
-	host := &formatTestHost{key: key, ante: func(ctx sdk.Context, _ sdk.Tx, _ bool) (sdk.Context, error) { return ctx, nil }}
-	InstallHostLiveness(host)
-	_, err := host.begin(ctx)
+	begin := HostLivenessBeginBlocker(func(sdk.Context) (sdk.BeginBlock, error) { return sdk.BeginBlock{}, nil })
+	_, err := begin(ctx)
 	require.NoError(t, err)
 	progress := decodeHostProgress(ctx.KVStore(SharedStoreKey).Get(hostProgressKey))
 	require.NotNil(t, progress)
@@ -102,19 +101,32 @@ func TestSnapshotHostReplacementDoesNotStartChallengeWindow(t *testing.T) {
 	require.NoError(t, state.VerifyHostWindow(later, 1, progress))
 }
 
-type formatTestHost struct {
-	key   *storetypes.KVStoreKey
-	begin sdk.BeginBlocker
-	ante  sdk.AnteHandler
-}
+func TestHostLivenessDecoratorMetersSnapshotBeforeNext(t *testing.T) {
+	for _, height := range []int64{11, 10} {
+		t.Run(fmt.Sprint(height), func(t *testing.T) {
+			ctx, _ := newProbabilisticTestClientStore(t, "ibc")
+			store := ctx.KVStore(SharedStoreKey)
+			current := encodeHostProgress(&state.HostProgress{Height: 11})
+			previous := encodeHostProgress(&state.HostProgress{Height: 10})
+			store.Set(hostProgressKey, current)
+			store.Set(previousHostProgressKey, previous)
 
-func (h *formatTestHost) GetKey(string) *storetypes.KVStoreKey { return h.key }
-func (h *formatTestHost) BeginBlocker(sdk.Context) (sdk.BeginBlock, error) {
-	return sdk.BeginBlock{}, nil
+			cfg := ctx.KVGasConfig()
+			wantGas := 2*cfg.ReadCostFlat + uint64(len(hostProgressKey)+len(previousHostProgressKey)+len(current)+len(previous))*cfg.ReadCostPerByte
+			ctx = ctx.WithBlockHeight(height).WithGasMeter(storetypes.NewGasMeter(wantGas))
+			result, err := (HostLivenessDecorator{}).AnteHandle(ctx, nil, false, func(ctx sdk.Context, _ sdk.Tx, _ bool) (sdk.Context, error) {
+				require.Equal(t, wantGas, ctx.GasMeter().GasConsumed())
+				store.Delete(hostProgressKey)
+				store.Delete(previousHostProgressKey)
+				require.Equal(t, &state.HostProgress{Height: height}, hostProgressEvidence(ctx))
+				return ctx, nil
+			})
+			require.NoError(t, err)
+			require.Equal(t, &state.HostProgress{Height: height}, hostProgressEvidence(result))
+			require.Equal(t, wantGas, result.GasMeter().GasConsumed())
+		})
+	}
 }
-func (h *formatTestHost) SetBeginBlocker(begin sdk.BeginBlocker) { h.begin = begin }
-func (h *formatTestHost) AnteHandler() sdk.AnteHandler           { return h.ante }
-func (h *formatTestHost) SetAnteHandler(ante sdk.AnteHandler)    { h.ante = ante }
 
 func TestInitialRegistryCanRetainZeroStakePoolsBeyondElectionCapacity(t *testing.T) {
 	fixture := capacityEvidence(t, "control")
